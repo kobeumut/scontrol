@@ -32,8 +32,8 @@ use panel_core::adapters::{
 };
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
-    validate, ComposeDeployOutcome, ComposeDomainBinding, ComposeServiceInfo, ComposeSource,
-    DeploymentLogChunk,
+    validate, ApplicationBuild, ApplicationSpec, ComposeDeployOutcome, ComposeDomainBinding,
+    ComposeServiceInfo, ComposeSource, DeploymentLogChunk,
 };
 use serde_yaml::Value as Yaml;
 use std::collections::HashSet;
@@ -43,6 +43,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
+/// Generated Compose file for a Dockerfile application, inside the checkout
+/// so the build context resolves relative to the repository root.
+const APPLICATION_COMPOSE_FILE: &str = ".scontrol-app.yml";
 const ENV_FILE: &str = "env";
 const OVERRIDE_FILE: &str = "scontrol.override.yml";
 const COMPOSE_PATH_MARKER: &str = ".scontrol-compose-path";
@@ -110,7 +113,7 @@ async fn deploy_steps(
     let (compose_path, commit_sha) =
         materialize_source(root, &code_dir, &params.source, log).await?;
     ensure_inside(&code_dir, &compose_path).await?;
-    let compose = validate_compose_file(&compose_path).await?;
+    let compose = validate_compose_file(&compose_path, &code_dir, env_path).await?;
     check_bindings_against_compose(&compose, &params.domains)?;
     persist_compose_path(root, &code_dir, &compose_path).await?;
 
@@ -473,6 +476,9 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
                 ));
             }
         }
+        ComposeSource::Application(spec) => {
+            spec.validate().map_err(CoreError::Validation)?;
+        }
     }
     validate_bindings(&params.domains, params.acme_email.as_deref())
 }
@@ -766,7 +772,173 @@ async fn materialize_source(
             }
             Ok((code_dir.join(compose_path), commit))
         }
+        ComposeSource::Application(spec) => match &spec.build {
+            ApplicationBuild::Image { .. } => {
+                reset_dir(code_dir).await?;
+                let path = code_dir.join(DEFAULT_COMPOSE_FILE);
+                write_generated_file(&path, &render_application(spec, root)?).await?;
+                Ok((path, None))
+            }
+            ApplicationBuild::Dockerfile {
+                repository_url,
+                branch,
+                context_path,
+                dockerfile_path,
+                ..
+            } => {
+                let git = ComposeSource::Git {
+                    repository_url: repository_url.clone(),
+                    branch: branch.clone(),
+                    compose_path: APPLICATION_COMPOSE_FILE.into(),
+                };
+                let (path, commit) =
+                    Box::pin(materialize_source(root, code_dir, &git, log)).await?;
+                let context = code_dir.join(context_path);
+                ensure_inside_named(code_dir, &context, "build context").await?;
+                ensure_inside_named(code_dir, &context.join(dockerfile_path), "Dockerfile").await?;
+                write_generated_file(&path, &render_application(spec, root)?).await?;
+                Ok((path, commit))
+            }
+        },
     }
+}
+
+/// Writes a panel-generated file inside a checkout. Whatever the repository
+/// put at that path (a symlink to a host file, a directory) is removed first
+/// and the file is created fresh, so the write can never follow a link.
+async fn write_generated_file(path: &Path, body: &str) -> CoreResult<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.is_dir() => {
+            return Err(CoreError::Validation(format!(
+                "source tree has a directory at the generated path {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )))
+        }
+        Ok(_) => tokio::fs::remove_file(path)
+            .await
+            .map_err(|e| CoreError::Io(format!("replacing generated Compose file: {e}")))?,
+        Err(_) => {}
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|e| CoreError::Io(format!("writing generated Compose file: {e}")))?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes())
+        .await
+        .map_err(|e| CoreError::Io(format!("writing generated Compose file: {e}")))
+}
+
+/// Renders a single-service application as Compose YAML. Values are placed
+/// through `serde_yaml`, never string-interpolated, so no input can add keys.
+/// The project environment file becomes the container's `env_file`.
+fn render_application(spec: &ApplicationSpec, root: &Path) -> CoreResult<String> {
+    use serde_yaml::{Mapping, Value};
+    fn key(k: &str) -> Value {
+        Value::String(k.into())
+    }
+    let mut service = Mapping::new();
+    match &spec.build {
+        ApplicationBuild::Image { image } => {
+            service.insert(key("image"), Value::String(image.clone()));
+        }
+        ApplicationBuild::Dockerfile {
+            context_path,
+            dockerfile_path,
+            target,
+            ..
+        } => {
+            let mut build = Mapping::new();
+            build.insert(key("context"), Value::String(format!("./{context_path}")));
+            build.insert(key("dockerfile"), Value::String(dockerfile_path.clone()));
+            if let Some(target) = target {
+                build.insert(key("target"), Value::String(target.clone()));
+            }
+            service.insert(key("build"), Value::Mapping(build));
+        }
+    }
+    service.insert(
+        key("restart"),
+        Value::String(spec.restart.as_compose().into()),
+    );
+    service.insert(
+        key("env_file"),
+        Value::Sequence(vec![Value::String(
+            root.join(ENV_FILE).to_string_lossy().into_owned(),
+        )]),
+    );
+    if let Some(port) = spec.container_port {
+        service.insert(
+            key("expose"),
+            Value::Sequence(vec![Value::String(port.to_string())]),
+        );
+    }
+    if let Some(mb) = spec.memory_limit_mb {
+        service.insert(key("mem_limit"), Value::String(format!("{mb}m")));
+    }
+    if let Some(millis) = spec.cpu_limit_millis {
+        service.insert(
+            key("cpus"),
+            Value::String(format!("{}.{:03}", millis / 1000, millis % 1000)),
+        );
+    }
+    if let Some(check) = &spec.health_check {
+        let mut test = vec![Value::String("CMD".into())];
+        test.extend(check.command.iter().cloned().map(Value::String));
+        let mut health = Mapping::new();
+        health.insert(key("test"), Value::Sequence(test));
+        health.insert(
+            key("interval"),
+            Value::String(format!("{}s", check.interval_secs)),
+        );
+        health.insert(
+            key("timeout"),
+            Value::String(format!("{}s", check.timeout_secs)),
+        );
+        health.insert(key("retries"), Value::Number(check.retries.into()));
+        health.insert(
+            key("start_period"),
+            Value::String(format!("{}s", check.start_period_secs)),
+        );
+        service.insert(key("healthcheck"), Value::Mapping(health));
+    }
+    let mut volumes = Mapping::new();
+    if !spec.volumes.is_empty() {
+        let mounts = spec
+            .volumes
+            .iter()
+            .map(|v| {
+                let mut mount = Mapping::new();
+                mount.insert(key("type"), key("volume"));
+                mount.insert(key("source"), Value::String(v.name.clone()));
+                mount.insert(key("target"), Value::String(v.target.clone()));
+                Value::Mapping(mount)
+            })
+            .collect();
+        service.insert(key("volumes"), Value::Sequence(mounts));
+        for v in &spec.volumes {
+            volumes.insert(
+                Value::String(v.name.clone()),
+                Value::Mapping(Mapping::new()),
+            );
+        }
+    }
+    let mut services = Mapping::new();
+    services.insert(
+        Value::String(spec.service_name.clone()),
+        Value::Mapping(service),
+    );
+    let mut doc = Mapping::new();
+    doc.insert(key("services"), Value::Mapping(services));
+    if !volumes.is_empty() {
+        doc.insert(key("volumes"), Value::Mapping(volumes));
+    }
+    let body = serde_yaml::to_string(&Value::Mapping(doc))
+        .map_err(|e| CoreError::External(format!("rendering application Compose: {e}")))?;
+    Ok(format!(
+        "# Generated by scontrol from the application settings; do not edit.\n{body}"
+    ))
 }
 
 /// Shallow-fetches `branch` into an existing checkout and resets to it.
@@ -816,16 +988,20 @@ async fn create_private_dir(dir: &Path) -> CoreResult<()> {
 /// Rejects a Compose path that resolves (e.g. through a symlink committed to
 /// the repository) outside the project's code directory.
 async fn ensure_inside(code_dir: &Path, compose_path: &Path) -> CoreResult<()> {
+    ensure_inside_named(code_dir, compose_path, "Compose file").await
+}
+
+async fn ensure_inside_named(code_dir: &Path, path: &Path, what: &str) -> CoreResult<()> {
     let base = tokio::fs::canonicalize(code_dir)
         .await
         .map_err(|e| CoreError::Io(format!("resolving source directory: {e}")))?;
-    let resolved = tokio::fs::canonicalize(compose_path)
+    let resolved = tokio::fs::canonicalize(path)
         .await
-        .map_err(|_| CoreError::Validation("Compose file not found in source".into()))?;
+        .map_err(|_| CoreError::Validation(format!("{what} not found in source")))?;
     if !resolved.starts_with(&base) {
-        return Err(CoreError::Validation(
-            "Compose path escapes the project source directory".into(),
-        ));
+        return Err(CoreError::Validation(format!(
+            "{what} escapes the project source directory"
+        )));
     }
     Ok(())
 }
@@ -884,7 +1060,17 @@ async fn read_environment(path: &Path) -> CoreResult<Vec<(String, String)>> {
     }
 }
 
-async fn validate_compose_file(path: &Path) -> CoreResult<Yaml> {
+/// Parses and validates the Compose file, then checks that every host path
+/// it names (relative bind mounts, `env_file`, build contexts, secret and
+/// config files) resolves inside the source tree, so a symlink committed to
+/// the repository cannot point Docker at a host file. `allowed_env_file` is
+/// the project's own environment file, which generated application files
+/// reference by absolute path.
+async fn validate_compose_file(
+    path: &Path,
+    code_dir: &Path,
+    allowed_env_file: &Path,
+) -> CoreResult<Yaml> {
     let body = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| CoreError::Validation(format!("cannot read Compose file: {e}")))?;
@@ -899,71 +1085,246 @@ async fn validate_compose_file(path: &Path) -> CoreResult<Yaml> {
             "Compose must define 1..=64 services".into(),
         ));
     }
-    reject_unsafe_compose_features(&yaml)?;
+    let host_paths = compose_policy(&yaml, Some(allowed_env_file))?;
+    for relative in host_paths {
+        ensure_resolves_inside(code_dir, &relative).await?;
+    }
     Ok(yaml)
 }
 
+/// Checks a relative host path the way Docker will use it: the deepest
+/// existing ancestor (Docker creates missing bind directories) must
+/// canonicalize inside the source tree.
+async fn ensure_resolves_inside(code_dir: &Path, relative: &str) -> CoreResult<()> {
+    let base = tokio::fs::canonicalize(code_dir)
+        .await
+        .map_err(|e| CoreError::Io(format!("resolving source directory: {e}")))?;
+    let mut candidate = base.join(relative);
+    loop {
+        match tokio::fs::canonicalize(&candidate).await {
+            Ok(resolved) if resolved.starts_with(&base) => return Ok(()),
+            Ok(_) => {
+                return Err(CoreError::Validation(format!(
+                    "host path {relative} escapes the project source directory"
+                )))
+            }
+            Err(_) => {
+                if !candidate.pop() || !candidate.starts_with(&base) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn reject_unsafe_compose_features(yaml: &Yaml) -> CoreResult<()> {
+    compose_policy(yaml, None).map(|_| ())
+}
+
+/// Capabilities that let a container escape or read the host.
+const FORBIDDEN_CAPABILITIES: [&str; 8] = [
+    "ALL",
+    "SYS_ADMIN",
+    "SYS_MODULE",
+    "SYS_RAWIO",
+    "SYS_PTRACE",
+    "SYS_BOOT",
+    "DAC_READ_SEARCH",
+    "BPF",
+];
+
+/// A host path relative to the project directory: no absolute path, `~`,
+/// `..` segment, or `$` interpolation (which could pull in the agent's own
+/// environment, e.g. `${HOME}`).
+fn safe_relative_host_path(path: &str) -> Option<String> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('~')
+        || path.contains(['$', '\0', '\\'])
+        || path.contains("://")
+        || path.split('/').any(|segment| segment == "..")
+    {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Static Compose policy. Returns the relative host paths the file names so
+/// the caller can check they resolve inside the source tree.
+fn compose_policy(yaml: &Yaml, allowed_env_file: Option<&Path>) -> CoreResult<Vec<String>> {
+    let mut host_paths = Vec::new();
+    let Some(root) = yaml.as_mapping() else {
+        return Err(CoreError::Validation(
+            "Compose file must be a mapping".into(),
+        ));
+    };
+    if root.contains_key("include") {
+        return Err(CoreError::Validation(
+            "Compose `include` is not supported; use a single Compose file".into(),
+        ));
+    }
+    for section in ["secrets", "configs"] {
+        if let Some(entries) = yaml.get(section).and_then(Yaml::as_mapping) {
+            for (name, entry) in entries {
+                if let Some(file) = entry.get("file") {
+                    let path =
+                        file.as_str()
+                            .and_then(safe_relative_host_path)
+                            .ok_or_else(|| {
+                                CoreError::Validation(format!(
+                                    "{section} entry {} must use a file inside the source tree",
+                                    name.as_str().unwrap_or("unknown")
+                                ))
+                            })?;
+                    host_paths.push(path);
+                }
+            }
+        }
+    }
+    if let Some(volumes) = yaml.get("volumes").and_then(Yaml::as_mapping) {
+        for (name, volume) in volumes {
+            if volume.get("driver_opts").is_some() {
+                return Err(CoreError::Validation(format!(
+                    "volume {} sets driver_opts, which can bind host paths",
+                    name.as_str().unwrap_or("unknown")
+                )));
+            }
+        }
+    }
     let Some(services) = yaml.get("services").and_then(Yaml::as_mapping) else {
-        return Ok(());
+        return Ok(host_paths);
     };
     for (name, service) in services {
         let service_name = name.as_str().unwrap_or("unknown");
-        let Some(map) = service.as_mapping() else {
-            return Err(CoreError::Validation(format!(
-                "service {service_name} must be a mapping"
-            )));
+        let forbid = |what: &str| {
+            Err(CoreError::Validation(format!(
+                "service {service_name} {what}"
+            )))
         };
-        let host_namespace = ["network_mode", "pid", "ipc", "uts", "cgroup"]
+        let Some(map) = service.as_mapping() else {
+            return forbid("must be a mapping");
+        };
+        let host_namespace = ["network_mode", "pid", "ipc", "uts", "cgroup", "userns_mode"]
             .iter()
             .any(|key| map.get(*key).and_then(Yaml::as_str) == Some("host"));
-        let sys_admin_capability =
+        let dangerous_capability =
             map.get("cap_add")
                 .and_then(Yaml::as_sequence)
                 .is_some_and(|caps| {
-                    caps.iter()
-                        .any(|cap| matches!(cap.as_str(), Some("SYS_ADMIN") | Some("ALL")))
+                    caps.iter().any(|cap| {
+                        let cap = cap.as_str().unwrap_or("ALL").to_ascii_uppercase();
+                        let cap = cap.strip_prefix("CAP_").unwrap_or(&cap);
+                        FORBIDDEN_CAPABILITIES.contains(&cap)
+                    })
                 });
         let unconfined_security = map
             .get("security_opt")
             .and_then(Yaml::as_sequence)
             .is_some_and(|opts| {
                 opts.iter().any(|opt| {
-                    matches!(
-                        opt.as_str(),
-                        Some("apparmor=unconfined") | Some("seccomp=unconfined")
-                    )
+                    let opt = opt.as_str().unwrap_or("unconfined").replace(':', "=");
+                    opt.ends_with("=unconfined") || opt == "label=disable"
                 })
             });
         if map.get("privileged").and_then(Yaml::as_bool) == Some(true)
             || host_namespace
             || map.get("devices").is_some()
-            || sys_admin_capability
+            || map.get("device_cgroup_rules").is_some()
+            || dangerous_capability
             || unconfined_security
         {
-            return Err(CoreError::Validation(format!(
-                "service {service_name} requests a forbidden host privilege"
-            )));
+            return forbid("requests a forbidden host privilege");
+        }
+        if map.contains_key("label_file") {
+            return forbid("uses label_file, which reads host files");
+        }
+        if map
+            .get("extends")
+            .is_some_and(|extends| extends.get("file").is_some())
+        {
+            return forbid("extends another file; only same-file extends is supported");
+        }
+        if let Some(build) = map.get("build") {
+            let (context, dockerfile) = match build {
+                Yaml::String(context) => (Some(context.as_str()), None),
+                Yaml::Mapping(spec) => {
+                    for key in ["additional_contexts", "secrets", "ssh"] {
+                        if spec.contains_key(key) {
+                            return forbid(&format!("uses build.{key}, which reaches host files"));
+                        }
+                    }
+                    (
+                        spec.get("context").and_then(Yaml::as_str),
+                        spec.get("dockerfile").and_then(Yaml::as_str),
+                    )
+                }
+                _ => return forbid("has an invalid build section"),
+            };
+            let context = context.unwrap_or(".");
+            let Some(context_path) = safe_relative_host_path(context) else {
+                return forbid("has a build context outside the source tree");
+            };
+            if let Some(dockerfile) = dockerfile {
+                let Some(file) = safe_relative_host_path(dockerfile) else {
+                    return forbid("has a Dockerfile outside the source tree");
+                };
+                host_paths.push(format!("{context_path}/{file}"));
+            }
+            host_paths.push(context_path);
+        }
+        if let Some(env_files) = map.get("env_file") {
+            let entries: Vec<&Yaml> = match env_files {
+                Yaml::Sequence(seq) => seq.iter().collect(),
+                other => vec![other],
+            };
+            for entry in entries {
+                let path = entry
+                    .as_str()
+                    .or_else(|| entry.get("path").and_then(Yaml::as_str))
+                    .unwrap_or_default();
+                if allowed_env_file.is_some_and(|allowed| Path::new(path) == allowed) {
+                    continue;
+                }
+                match safe_relative_host_path(path) {
+                    Some(path) => host_paths.push(path),
+                    None => return forbid("reads an env_file outside the source tree"),
+                }
+            }
         }
         if let Some(volumes) = map.get("volumes").and_then(Yaml::as_sequence) {
             for volume in volumes {
-                let unsafe_bind = if let Some(spec) = volume.as_str() {
+                if let Some(spec) = volume.as_str() {
                     let source = spec.split(':').next().unwrap_or_default();
-                    source.starts_with('/') || source.starts_with("../") || source == "."
+                    let is_named = !source.is_empty()
+                        && !source.contains(['/', '~', '$'])
+                        && !source.starts_with('.');
+                    if is_named || !spec.contains(':') {
+                        // `name:/target`, or an anonymous volume `/target`.
+                        continue;
+                    }
+                    match safe_relative_host_path(source) {
+                        Some(path)
+                            if path.trim_start_matches("./") != "."
+                                && !path.trim_start_matches("./").is_empty() =>
+                        {
+                            host_paths.push(path)
+                        }
+                        _ => return forbid("uses a forbidden host bind mount"),
+                    }
                 } else if let Some(spec) = volume.as_mapping() {
-                    spec.get("type").and_then(Yaml::as_str) == Some("bind")
+                    if spec.get("type").and_then(Yaml::as_str) != Some("volume")
+                        && spec.get("type").and_then(Yaml::as_str) != Some("tmpfs")
+                    {
+                        return forbid("uses a forbidden host bind mount");
+                    }
                 } else {
-                    true
-                };
-                if unsafe_bind {
-                    return Err(CoreError::Validation(format!(
-                        "service {service_name} uses a forbidden host bind mount"
-                    )));
+                    return forbid("uses a forbidden host bind mount");
                 }
             }
         }
     }
-    Ok(())
+    Ok(host_paths)
 }
 
 struct ProjectPaths {
@@ -1145,6 +1506,214 @@ mod tests {
         assert!(reject_unsafe_compose_features(&safe).is_ok());
         let unsafe_yaml: Yaml = serde_yaml::from_str("services:\n  app:\n    image: nginx\n    volumes: [/var/run/docker.sock:/var/run/docker.sock]").unwrap();
         assert!(reject_unsafe_compose_features(&unsafe_yaml).is_err());
+    }
+
+    fn policy(yaml: &str) -> CoreResult<Vec<String>> {
+        compose_policy(&serde_yaml::from_str(yaml).unwrap(), None)
+    }
+
+    #[test]
+    fn rejects_compose_features_that_read_host_files() {
+        for (case, yaml) in [
+            ("abs context", "services:\n  a:\n    build: /\n"),
+            ("parent context", "services:\n  a:\n    build:\n      context: ../..\n"),
+            ("url context", "services:\n  a:\n    build: https://example.com/r.git\n"),
+            ("dockerfile escape", "services:\n  a:\n    build:\n      context: .\n      dockerfile: ../../etc/x\n"),
+            ("additional ctx", "services:\n  a:\n    build:\n      context: .\n      additional_contexts:\n        etc: /etc\n"),
+            ("build secrets", "services:\n  a:\n    build:\n      context: .\n      secrets: [s]\n"),
+            ("build ssh", "services:\n  a:\n    build:\n      context: .\n      ssh: [default]\n"),
+            ("abs env_file", "services:\n  a:\n    image: x\n    env_file: /etc/shadow\n"),
+            ("env_file map", "services:\n  a:\n    image: x\n    env_file:\n      - path: /root/.env\n"),
+            ("label_file", "services:\n  a:\n    image: x\n    label_file: ./l\n"),
+            ("extends file", "services:\n  a:\n    extends:\n      file: /etc/x.yml\n      service: b\n"),
+            ("include", "include: [/etc/x.yml]\nservices:\n  a:\n    image: x\n"),
+            ("secret file", "services:\n  a:\n    image: x\nsecrets:\n  s:\n    file: /etc/shadow\n"),
+            ("config file", "services:\n  a:\n    image: x\nconfigs:\n  c:\n    file: ../x\n"),
+            ("driver_opts bind", "services:\n  a:\n    image: x\nvolumes:\n  v:\n    driver_opts:\n      type: none\n      o: bind\n      device: /etc\n"),
+            ("traversal bind", "services:\n  a:\n    image: x\n    volumes: ['./data/../../..:/h']\n"),
+            ("home bind", "services:\n  a:\n    image: x\n    volumes: ['~/.ssh:/h']\n"),
+            ("interpolated bind", "services:\n  a:\n    image: x\n    volumes: ['${HOME}:/h']\n"),
+            ("whole tree bind", "services:\n  a:\n    image: x\n    volumes: ['./:/h']\n"),
+            ("dac_read_search", "services:\n  a:\n    image: x\n    cap_add: [CAP_DAC_READ_SEARCH]\n"),
+            ("sys_module", "services:\n  a:\n    image: x\n    cap_add: [sys_module]\n"),
+            ("userns host", "services:\n  a:\n    image: x\n    userns_mode: host\n"),
+            ("apparmor colon", "services:\n  a:\n    image: x\n    security_opt: ['apparmor:unconfined']\n"),
+            ("systempaths", "services:\n  a:\n    image: x\n    security_opt: [systempaths=unconfined]\n"),
+            ("device rules", "services:\n  a:\n    image: x\n    device_cgroup_rules: ['c 1:3 mr']\n"),
+        ] {
+            assert!(policy(yaml).is_err(), "{case} should be rejected");
+        }
+    }
+
+    #[test]
+    fn collects_relative_host_paths_for_resolution() {
+        let paths = policy(
+            "services:\n  a:\n    build:\n      context: ./web\n      dockerfile: docker/Dockerfile\n    env_file: [.env.app]\n    volumes: ['./data:/data', 'named:/n', '/anon']\n    cap_add: [NET_ADMIN]\nsecrets:\n  s:\n    file: ./secret.txt\n",
+        )
+        .unwrap();
+        for expected in [
+            "./web",
+            "./web/docker/Dockerfile",
+            ".env.app",
+            "./data",
+            "./secret.txt",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == expected),
+                "{expected} in {paths:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_paths_through_symlinks_must_stay_in_the_source() {
+        let tmp = std::env::temp_dir().join(format!("scontrol-bind-{}", uuid::Uuid::new_v4()));
+        let code = tmp.join("code");
+        std::fs::create_dir_all(code.join("real")).unwrap();
+        std::os::unix::fs::symlink("/etc", code.join("etc-link")).unwrap();
+        std::os::unix::fs::symlink("real", code.join("inner-link")).unwrap();
+        assert!(ensure_resolves_inside(&code, "./real").await.is_ok());
+        assert!(ensure_resolves_inside(&code, "./inner-link/x")
+            .await
+            .is_ok());
+        assert!(ensure_resolves_inside(&code, "./missing/deeper")
+            .await
+            .is_ok());
+        assert!(ensure_resolves_inside(&code, "./etc-link").await.is_err());
+        assert!(ensure_resolves_inside(&code, "etc-link/not-yet-there")
+            .await
+            .is_err());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    fn application(build: ApplicationBuild) -> ApplicationSpec {
+        ApplicationSpec {
+            build,
+            service_name: "web".into(),
+            container_port: Some(8080),
+            restart: panel_core::types::RestartPolicy::Always,
+            memory_limit_mb: Some(512),
+            cpu_limit_millis: Some(1500),
+            health_check: Some(panel_core::types::ApplicationHealthCheck {
+                command: vec![
+                    "curl".into(),
+                    "-f".into(),
+                    "http://localhost:8080/ $(id)".into(),
+                ],
+                interval_secs: 15,
+                timeout_secs: 5,
+                retries: 4,
+                start_period_secs: 10,
+            }),
+            volumes: vec![panel_core::types::ApplicationVolume {
+                name: "uploads".into(),
+                target: "/srv/uploads".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn renders_application_into_a_policy_clean_compose_file() {
+        let root = Path::new("/var/lib/scontrol/docker/shop");
+        let spec = application(ApplicationBuild::Image {
+            image: "ghcr.io/acme/shop:1.2".into(),
+        });
+        spec.validate().unwrap();
+        let body = render_application(&spec, root).unwrap();
+        let yaml: Yaml = serde_yaml::from_str(&body).unwrap();
+        let env_file = root.join(ENV_FILE);
+        assert!(compose_policy(&yaml, Some(&env_file)).unwrap().is_empty());
+        // Without the project env file allowed, the absolute path is refused.
+        assert!(compose_policy(&yaml, None).is_err());
+        let web = &yaml["services"]["web"];
+        assert_eq!(web["image"].as_str(), Some("ghcr.io/acme/shop:1.2"));
+        assert_eq!(web["restart"].as_str(), Some("always"));
+        assert_eq!(web["mem_limit"].as_str(), Some("512m"));
+        assert_eq!(web["cpus"].as_str(), Some("1.500"));
+        assert_eq!(web["expose"][0].as_str(), Some("8080"));
+        assert_eq!(
+            web["env_file"][0].as_str(),
+            Some("/var/lib/scontrol/docker/shop/env")
+        );
+        // Exec-form health check: the hostile-looking argument stays one
+        // argument and no shell form (`CMD-SHELL`) is produced.
+        let test = web["healthcheck"]["test"].as_sequence().unwrap();
+        assert_eq!(test[0].as_str(), Some("CMD"));
+        assert_eq!(test[3].as_str(), Some("http://localhost:8080/ $(id)"));
+        assert_eq!(web["volumes"][0]["type"].as_str(), Some("volume"));
+        assert!(yaml["volumes"]["uploads"].is_mapping());
+        assert_eq!(
+            web.as_mapping().unwrap().len(),
+            8,
+            "unexpected keys in {body}"
+        );
+
+        let built = application(ApplicationBuild::Dockerfile {
+            repository_url: "https://github.com/acme/shop.git".into(),
+            branch: "main".into(),
+            context_path: "services/web".into(),
+            dockerfile_path: "Dockerfile.prod".into(),
+            target: Some("runtime".into()),
+        });
+        let yaml: Yaml = serde_yaml::from_str(&render_application(&built, root).unwrap()).unwrap();
+        let build = &yaml["services"]["web"]["build"];
+        assert_eq!(build["context"].as_str(), Some("./services/web"));
+        assert_eq!(build["dockerfile"].as_str(), Some("Dockerfile.prod"));
+        assert_eq!(build["target"].as_str(), Some("runtime"));
+        let paths = compose_policy(&yaml, Some(&env_file)).unwrap();
+        assert!(paths.contains(&"./services/web/Dockerfile.prod".to_string()));
+    }
+
+    #[test]
+    fn application_validation_rejects_hostile_values() {
+        let mut spec = application(ApplicationBuild::Image {
+            image: "nginx\nprivileged: true".into(),
+        });
+        assert!(spec.validate().is_err());
+        spec.build = ApplicationBuild::Image {
+            image: "nginx".into(),
+        };
+        spec.validate().unwrap();
+        spec.service_name = "web\n    privileged: true".into();
+        assert!(spec.validate().is_err());
+        spec.service_name = "web".into();
+        spec.volumes[0].target = "/data:/etc".into();
+        assert!(spec.validate().is_err());
+        spec.volumes[0].target = "/data".into();
+        spec.health_check.as_mut().unwrap().command = vec![];
+        assert!(spec.validate().is_err());
+        spec.health_check = None;
+        spec.build = ApplicationBuild::Dockerfile {
+            repository_url: "https://github.com/acme/shop.git".into(),
+            branch: "main".into(),
+            context_path: "../..".into(),
+            dockerfile_path: "Dockerfile".into(),
+            target: None,
+        };
+        assert!(spec.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn generated_file_replaces_a_symlink_instead_of_following_it() {
+        let tmp = std::env::temp_dir().join(format!("scontrol-gen-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let victim = tmp.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let generated = tmp.join(APPLICATION_COMPOSE_FILE);
+        std::os::unix::fs::symlink(&victim, &generated).unwrap();
+        write_generated_file(&generated, "services: {}\n")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(!std::fs::symlink_metadata(&generated)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::create_dir(tmp.join("dir.yml")).unwrap();
+        assert!(write_generated_file(&tmp.join("dir.yml"), "x")
+            .await
+            .is_err());
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     fn binding(domain: &str, service: &str, host_port: u16, https: bool) -> ComposeDomainBinding {

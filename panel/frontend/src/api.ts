@@ -4,9 +4,40 @@ export type Capability = { docker: boolean; mail: boolean; antivirus: boolean; v
 export type User = { id: string; username: string; email: string; is_admin: boolean; totp_enabled: boolean };
 export type Site = { id: string; domain: string; status: string; ssl_enabled: boolean; runtime: { kind: string } };
 
+export type ApplicationBuild =
+  | { type: 'image'; image: string }
+  | { type: 'dockerfile'; repository_url: string; branch: string; context_path: string; dockerfile_path: string; target?: string | null };
+
+export type RestartPolicy = 'no' | 'always' | 'unless-stopped' | 'on-failure';
+
+export type ApplicationSpec = {
+  build: ApplicationBuild;
+  service_name: string;
+  container_port?: number | null;
+  restart: RestartPolicy;
+  memory_limit_mb?: number | null;
+  cpu_limit_millis?: number | null;
+  health_check?: { command: string[]; interval_secs: number; timeout_secs: number; retries: number; start_period_secs: number } | null;
+  volumes: { name: string; target: string }[];
+};
+
 export type ComposeSource =
   | { kind: 'git'; repository_url: string; branch: string; compose_path: string }
-  | { kind: 'raw'; compose_yaml: string };
+  | { kind: 'raw'; compose_yaml: string }
+  | ({ kind: 'application' } & ApplicationSpec);
+
+/** Repository and branch for sources that deploy from Git. */
+export function gitCheckout(source: ComposeSource): { repository_url: string; branch: string } | null {
+  if (source.kind === 'git') return source;
+  if (source.kind === 'application' && source.build.type === 'dockerfile') return source.build;
+  return null;
+}
+
+export function sourceLabel(source: ComposeSource): string {
+  if (source.kind === 'git') return `git · ${source.branch}`;
+  if (source.kind === 'raw') return 'raw';
+  return source.build.type === 'image' ? 'app · image' : `app · Dockerfile · ${source.build.branch}`;
+}
 
 export type DeploymentStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'stopped' | 'cancelled';
 

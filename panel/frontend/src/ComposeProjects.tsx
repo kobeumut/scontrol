@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import {
-  api, ApiState, ComposeProject, ComposeSource, Deployment, Domain, duration, formatTime, GitAccess,
-  gitTransport, isActive, LogChunk, ServiceInfo, useApi,
+  api, ApiState, ApplicationBuild, ApplicationSpec, ComposeProject, ComposeSource, Deployment, Domain, duration,
+  formatTime, GitAccess, gitCheckout, gitTransport, isActive, LogChunk, RestartPolicy, ServiceInfo, sourceLabel, useApi,
 } from './api';
 
 type EnvRow = { key: string; value: string };
@@ -24,7 +24,7 @@ function useAction() {
     setBusy(true); setError(undefined);
     try { await action(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
-  return { busy, error, run };
+  return { busy, error, run, fail: setError };
 }
 
 /**
@@ -63,7 +63,7 @@ function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
       <h2>Compose projects</h2>
       <button className="action" onClick={() => setCreating((c) => !c)}>{creating ? 'Close' : 'New project'}</button>
     </div>
-    <p className="hint">Git or raw Compose deployments with a durable queue, write-only environment and streamed logs.</p>
+    <p className="hint">Compose projects (Git or raw) and single-service applications (image or Dockerfile) with a durable queue, write-only environment and streamed logs.</p>
     {creating && <CreateProjectForm onCreated={(id) => { setCreating(false); onOpen(id); }} />}
     <StateView state={projects} />
     {projects.data && <table><thead><tr><th>Project</th><th>Slug</th><th>Source</th><th>Status</th></tr></thead><tbody>
@@ -72,7 +72,7 @@ function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
         : projects.data.map((project) => <tr key={project.id} className="clickable" onClick={() => onOpen(project.id)}>
           <td><button className="link strong" onClick={() => onOpen(project.id)}>{project.name}</button></td>
           <td className="mono">{project.slug}</td>
-          <td>{project.source.kind === 'git' ? `git · ${project.source.branch}` : 'raw'}</td>
+          <td>{sourceLabel(project.source)}</td>
           <td><span className={`badge ${project.status}`}>{project.status}</span></td>
         </tr>)}
     </tbody></table>}
@@ -84,26 +84,38 @@ const SAMPLE_COMPOSE = 'services:\n  web:\n    image: traefik/whoami:v1.10\n';
 function CreateProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
-  const [kind, setKind] = useState<'git' | 'raw'>('git');
+  const [kind, setKind] = useState<SourceChoice>('git');
   const [repo, setRepo] = useState('');
   const [branch, setBranch] = useState('main');
   const [composePath, setComposePath] = useState('docker-compose.yml');
   const [yaml, setYaml] = useState(SAMPLE_COMPOSE);
+  const [image, setImage] = useState('');
+  const [contextPath, setContextPath] = useState('.');
+  const [dockerfilePath, setDockerfilePath] = useState('Dockerfile');
+  const [app, setApp] = useState<AppSettings>(DEFAULT_APP);
   const [env, setEnv] = useState<EnvRow[]>([]);
   const [tokenUser, setTokenUser] = useState('x-access-token');
   const [token, setToken] = useState('');
   const [deployNow, setDeployNow] = useState<boolean>();
   const action = useAction();
-  const transport = kind === 'git' ? gitTransport(repo.trim()) : null;
+  const fromGit = kind === 'git' || kind === 'dockerfile';
+  const transport = fromGit ? gitTransport(repo.trim()) : null;
   // A private SSH repository needs its deploy key registered first, and the
   // key exists only once the project does.
   const deploy = deployNow ?? transport !== 'ssh';
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const source: ComposeSource = kind === 'git'
-      ? { kind, repository_url: repo.trim(), branch: branch.trim(), compose_path: composePath.trim() }
-      : { kind, compose_yaml: yaml };
+    let source: ComposeSource;
+    if (kind === 'git') source = { kind, repository_url: repo.trim(), branch: branch.trim(), compose_path: composePath.trim() };
+    else if (kind === 'raw') source = { kind, compose_yaml: yaml };
+    else {
+      const spec = toApplicationSpec(app, kind === 'image'
+        ? { type: 'image', image: image.trim() }
+        : { type: 'dockerfile', repository_url: repo.trim(), branch: branch.trim(), context_path: contextPath.trim() || '.', dockerfile_path: dockerfilePath.trim() || 'Dockerfile' });
+      if (typeof spec === 'string') { action.fail(spec); return; }
+      source = { kind: 'application', ...spec };
+    }
     const git_credentials = transport === 'https' && token ? { username: tokenUser.trim(), token } : undefined;
     action.run(async () => {
       const created = await api<{ project: ComposeProject }>('/compose-projects', {
@@ -125,14 +137,22 @@ function CreateProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
         onChange={(e) => setSlug(e.target.value)} /></label>
     </div>
     <div className="segmented" role="radiogroup" aria-label="Source">
-      {(['git', 'raw'] as const).map((k) => <button type="button" key={k} role="radio" aria-checked={kind === k}
-        className={kind === k ? 'selected' : ''} onClick={() => setKind(k)}>{k === 'git' ? 'Git repository' : 'Raw Compose'}</button>)}
+      {SOURCE_CHOICES.map(([k, label]) => <button type="button" key={k} role="radio" aria-checked={kind === k}
+        className={kind === k ? 'selected' : ''} onClick={() => setKind(k)}>{label}</button>)}
     </div>
-    {kind === 'git' ? <div className="grid3">
+    {fromGit && <div className="grid3">
       <label>Repository URL<input required placeholder="https://github.com/org/app.git or git@github.com:org/app.git" value={repo} onChange={(e) => setRepo(e.target.value)} /></label>
       <label>Branch<input required value={branch} onChange={(e) => setBranch(e.target.value)} /></label>
-      <label>Compose path<input required className="mono" value={composePath} onChange={(e) => setComposePath(e.target.value)} /></label>
-    </div> : <label>Compose YAML<textarea required rows={8} className="mono" value={yaml} onChange={(e) => setYaml(e.target.value)} /></label>}
+      {kind === 'git'
+        ? <label>Compose path<input required className="mono" value={composePath} onChange={(e) => setComposePath(e.target.value)} /></label>
+        : <div className="grid2">
+          <label>Build context<input required className="mono" value={contextPath} onChange={(e) => setContextPath(e.target.value)} /></label>
+          <label>Dockerfile<input required className="mono" value={dockerfilePath} onChange={(e) => setDockerfilePath(e.target.value)} /></label>
+        </div>}
+    </div>}
+    {kind === 'raw' && <label>Compose YAML<textarea required rows={8} className="mono" value={yaml} onChange={(e) => setYaml(e.target.value)} /></label>}
+    {kind === 'image' && <label>Image<input required className="mono" placeholder="ghcr.io/org/app:1.0" value={image} onChange={(e) => setImage(e.target.value)} /></label>}
+    {(kind === 'image' || kind === 'dockerfile') && <ApplicationFields value={app} onChange={setApp} />}
     {transport === 'https' && <fieldset><legend>Private repository token (optional, write-only)</legend>
       <div className="grid2">
         <label>Username<input className="mono" value={tokenUser} onChange={(e) => setTokenUser(e.target.value)} /></label>
@@ -147,6 +167,92 @@ function CreateProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
     <ErrorLine error={action.error} />
     <button className="action" disabled={action.busy}>{action.busy ? 'Creating…' : deploy ? 'Create and deploy' : 'Create'}</button>
   </form>;
+}
+
+type SourceChoice = 'git' | 'raw' | 'image' | 'dockerfile';
+
+const SOURCE_CHOICES: [SourceChoice, string][] = [
+  ['git', 'Compose from Git'], ['raw', 'Raw Compose'], ['image', 'App: image'], ['dockerfile', 'App: Dockerfile'],
+];
+
+type AppSettings = {
+  serviceName: string; port: string; restart: RestartPolicy; memoryMb: string; cpus: string;
+  healthCommand: string; volumes: string;
+};
+
+const DEFAULT_APP: AppSettings = {
+  serviceName: 'app', port: '', restart: 'unless-stopped', memoryMb: '', cpus: '', healthCommand: '', volumes: '',
+};
+
+/** Builds the API spec from form fields, or returns a message to show. */
+function toApplicationSpec(app: AppSettings, build: ApplicationBuild): ApplicationSpec | string {
+  const optionalInt = (value: string) => (value.trim() === '' ? null : Number(value));
+  const port = optionalInt(app.port);
+  if (port !== null && !(Number.isInteger(port) && port >= 1 && port <= 65535)) return 'Container port must be 1–65535.';
+  const memory = optionalInt(app.memoryMb);
+  if (memory !== null && !(Number.isInteger(memory) && memory >= 6)) return 'Memory limit is a whole number of MiB, at least 6.';
+  const cpus = app.cpus.trim() === '' ? null : Math.round(Number(app.cpus) * 1000);
+  if (cpus !== null && !(Number.isFinite(cpus) && cpus >= 10)) return 'CPU limit must be at least 0.01.';
+  // One argument per line: the command runs in exec form, never in a shell.
+  const command = app.healthCommand.split('\n').map((arg) => arg.trim()).filter(Boolean);
+  const volumes = [];
+  for (const line of app.volumes.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const at = line.indexOf(':');
+    if (at < 1) return `Volume "${line}" must be name:/container/path.`;
+    volumes.push({ name: line.slice(0, at), target: line.slice(at + 1) });
+  }
+  return {
+    build,
+    service_name: app.serviceName.trim() || 'app',
+    container_port: port,
+    restart: app.restart,
+    memory_limit_mb: memory,
+    cpu_limit_millis: cpus,
+    health_check: command.length
+      ? { command, interval_secs: 30, timeout_secs: 10, retries: 3, start_period_secs: 0 }
+      : null,
+    volumes,
+  };
+}
+
+function ApplicationFields({ value, onChange }: { value: AppSettings; onChange: (v: AppSettings) => void }) {
+  const set = (key: keyof AppSettings) => (e: { target: { value: string } }) => onChange({ ...value, [key]: e.target.value });
+  return <fieldset><legend>Application</legend>
+    <div className="grid3">
+      <label>Service name<input className="mono" pattern="[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,62}" value={value.serviceName} onChange={set('serviceName')} /></label>
+      <label>Container port<input inputMode="numeric" placeholder="e.g. 3000" value={value.port} onChange={set('port')} /></label>
+      <label>Restart<select value={value.restart} onChange={set('restart')}>
+        {(['unless-stopped', 'always', 'on-failure', 'no'] as const).map((r) => <option key={r} value={r}>{r}</option>)}
+      </select></label>
+      <label>Memory limit (MiB)<input inputMode="numeric" placeholder="none" value={value.memoryMb} onChange={set('memoryMb')} /></label>
+      <label>CPU limit (cores)<input inputMode="decimal" placeholder="none" value={value.cpus} onChange={set('cpus')} /></label>
+    </div>
+    <div className="grid2">
+      <label>Health check command (one argument per line, no shell)<textarea rows={3} className="mono"
+        placeholder={'wget\n-qO-\nhttp://127.0.0.1:3000/health'} value={value.healthCommand} onChange={set('healthCommand')} /></label>
+      <label>Named volumes (name:/container/path per line)<textarea rows={3} className="mono"
+        placeholder="uploads:/app/uploads" value={value.volumes} onChange={set('volumes')} /></label>
+    </div>
+    <p className="hint">The environment below reaches the container through the project's write-only env file. Bind a domain to the service name and container port after creating.</p>
+  </fieldset>;
+}
+
+function SourceSummary({ source }: { source: ComposeSource }) {
+  if (source.kind === 'git') {
+    return <>Git <span className="mono">{source.repository_url}</span> · branch <span className="mono">{source.branch}</span> · <span className="mono">{source.compose_path}</span></>;
+  }
+  if (source.kind === 'raw') return <>Raw Compose YAML</>;
+  const limits = [
+    source.container_port ? `port ${source.container_port}` : null,
+    source.memory_limit_mb ? `${source.memory_limit_mb} MiB` : null,
+    source.cpu_limit_millis ? `${source.cpu_limit_millis / 1000} CPU` : null,
+    source.restart,
+  ].filter(Boolean).join(' · ');
+  const build = source.build;
+  return <>Application <span className="mono">{source.service_name}</span> · {build.type === 'image'
+    ? <>image <span className="mono">{build.image}</span></>
+    : <>Dockerfile <span className="mono">{build.dockerfile_path}</span> in <span className="mono">{build.context_path}</span> from <span className="mono">{build.repository_url}</span> · branch <span className="mono">{build.branch}</span></>}
+    {' · '}{limits}</>;
 }
 
 function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
@@ -181,9 +287,7 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <h2>{project.data.name} <span className="mono muted">{project.data.slug}</span></h2>
         <span className={`badge ${project.data.status}`}>{project.data.status}</span>
       </div>
-      <p className="hint">{project.data.source.kind === 'git'
-        ? <>Git <span className="mono">{project.data.source.repository_url}</span> · branch <span className="mono">{project.data.source.branch}</span> · <span className="mono">{project.data.source.compose_path}</span></>
-        : 'Raw Compose YAML'}</p>
+      <p className="hint"><SourceSummary source={project.data.source} /></p>
       <div className="toolbar">
         <button className="action" disabled={action.busy} onClick={deploy}>Deploy</button>
         <label className="check"><input type="checkbox" checked={pull} onChange={(e) => setPull(e.target.checked)} /> pull images</label>
@@ -203,8 +307,8 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <ContainerLogs projectId={id} />
       <Domains projectId={id} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
       <Environment projectId={id} />
-      {project.data.source.kind === 'git' && <GitAccessPanel projectId={id} />}
-      {project.data.source.kind === 'git' && <Webhook projectId={id} />}
+      {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
+      {gitCheckout(project.data.source) && <Webhook projectId={id} />}
     </>}
   </section>;
 }

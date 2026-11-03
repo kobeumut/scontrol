@@ -229,6 +229,255 @@ pub enum ComposeSource {
     Raw {
         compose_yaml: String,
     },
+    /// A single-service application. The agent renders it into a generated
+    /// Compose file, so applications share the Compose deploy engine
+    /// (queue, logs, environment, domains, webhooks).
+    Application(Box<ApplicationSpec>),
+}
+
+impl ComposeSource {
+    /// Repository URL and branch for sources that deploy from Git.
+    pub fn git_checkout(&self) -> Option<(&str, &str)> {
+        match self {
+            ComposeSource::Git {
+                repository_url,
+                branch,
+                ..
+            } => Some((repository_url, branch)),
+            ComposeSource::Application(spec) => match &spec.build {
+                ApplicationBuild::Dockerfile {
+                    repository_url,
+                    branch,
+                    ..
+                } => Some((repository_url, branch)),
+                ApplicationBuild::Image { .. } => None,
+            },
+            ComposeSource::Raw { .. } => None,
+        }
+    }
+
+    /// Short label for audit records and listings.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ComposeSource::Git { .. } => "git",
+            ComposeSource::Raw { .. } => "raw",
+            ComposeSource::Application(spec) => match spec.build {
+                ApplicationBuild::Image { .. } => "image",
+                ApplicationBuild::Dockerfile { .. } => "dockerfile",
+            },
+        }
+    }
+}
+
+/// Where an application's container image comes from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApplicationBuild {
+    /// A published image, pulled by `docker compose up` (`--pull always` when
+    /// the deployment asks for fresh images).
+    Image { image: String },
+    /// `docker build` of a Dockerfile in a Git checkout. The context and
+    /// Dockerfile are relative to the repository root and must resolve
+    /// inside it.
+    Dockerfile {
+        repository_url: String,
+        branch: String,
+        #[serde(default = "default_build_context")]
+        context_path: String,
+        #[serde(default = "default_dockerfile")]
+        dockerfile_path: String,
+        /// Multi-stage build target.
+        #[serde(default)]
+        target: Option<String>,
+    },
+}
+
+fn default_build_context() -> String {
+    ".".into()
+}
+
+fn default_dockerfile() -> String {
+    "Dockerfile".into()
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    No,
+    Always,
+    #[default]
+    UnlessStopped,
+    OnFailure,
+}
+
+impl RestartPolicy {
+    pub fn as_compose(self) -> &'static str {
+        match self {
+            RestartPolicy::No => "no",
+            RestartPolicy::Always => "always",
+            RestartPolicy::UnlessStopped => "unless-stopped",
+            RestartPolicy::OnFailure => "on-failure",
+        }
+    }
+}
+
+/// Container health check. The command runs inside the application's own
+/// container as an exec-form argv (`CMD`), never through a shell.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ApplicationHealthCheck {
+    pub command: Vec<String>,
+    #[serde(default = "default_health_interval")]
+    pub interval_secs: u32,
+    #[serde(default = "default_health_timeout")]
+    pub timeout_secs: u32,
+    #[serde(default = "default_health_retries")]
+    pub retries: u32,
+    #[serde(default)]
+    pub start_period_secs: u32,
+}
+
+fn default_health_interval() -> u32 {
+    30
+}
+
+fn default_health_timeout() -> u32 {
+    10
+}
+
+fn default_health_retries() -> u32 {
+    3
+}
+
+/// A Docker named volume mounted into the application. Host bind mounts are
+/// not offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ApplicationVolume {
+    pub name: String,
+    /// Absolute path inside the container.
+    pub target: String,
+}
+
+/// A single-service application (Dokploy's "application"), rendered by the
+/// agent into a generated Compose project. The project environment file is
+/// passed to the container as `env_file`, so environment values stay
+/// write-only exactly as for Compose projects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ApplicationSpec {
+    pub build: ApplicationBuild,
+    /// Compose service name; domain bindings target it.
+    #[serde(default = "default_application_service")]
+    pub service_name: String,
+    /// Port the application listens on inside the container (documentation
+    /// for domain bindings; nothing is published by it).
+    #[serde(default)]
+    pub container_port: Option<u16>,
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    /// Memory limit in MiB.
+    #[serde(default)]
+    pub memory_limit_mb: Option<u32>,
+    /// CPU limit in thousandths of a CPU (`500` = half a CPU).
+    #[serde(default)]
+    pub cpu_limit_millis: Option<u32>,
+    #[serde(default)]
+    pub health_check: Option<ApplicationHealthCheck>,
+    #[serde(default)]
+    pub volumes: Vec<ApplicationVolume>,
+}
+
+fn default_application_service() -> String {
+    "app".into()
+}
+
+impl ApplicationSpec {
+    /// Shared validation for panel-api and the agent. Returns a message
+    /// that is safe to show to the user.
+    pub fn validate(&self) -> Result<(), String> {
+        match &self.build {
+            ApplicationBuild::Image { image } => {
+                if !validate::is_valid_image_reference(image) {
+                    return Err("invalid image reference".into());
+                }
+            }
+            ApplicationBuild::Dockerfile {
+                repository_url,
+                branch,
+                context_path,
+                dockerfile_path,
+                target,
+            } => {
+                if !validate::is_valid_git_url(repository_url) {
+                    return Err("invalid Git repository URL".into());
+                }
+                if !validate::is_valid_git_branch(branch) {
+                    return Err("invalid Git branch".into());
+                }
+                if !validate::is_valid_relative_path(context_path, true) {
+                    return Err("invalid build context path".into());
+                }
+                if !validate::is_valid_relative_path(dockerfile_path, false) {
+                    return Err("invalid Dockerfile path".into());
+                }
+                if target
+                    .as_deref()
+                    .is_some_and(|t| !validate::is_valid_service_name(t))
+                {
+                    return Err("invalid build target".into());
+                }
+            }
+        }
+        if !validate::is_valid_service_name(&self.service_name) {
+            return Err("invalid service name".into());
+        }
+        if self.container_port == Some(0) {
+            return Err("container port must be 1..=65535".into());
+        }
+        if self
+            .memory_limit_mb
+            .is_some_and(|mb| !(6..=1024 * 1024).contains(&mb))
+        {
+            return Err("memory limit must be 6 MiB..=1 TiB".into());
+        }
+        if self
+            .cpu_limit_millis
+            .is_some_and(|m| !(10..=512_000).contains(&m))
+        {
+            return Err("CPU limit must be 10..=512000 millicpus".into());
+        }
+        if let Some(check) = &self.health_check {
+            if check.command.is_empty()
+                || check.command.len() > 32
+                || check
+                    .command
+                    .iter()
+                    .any(|arg| arg.is_empty() || arg.len() > 1024 || arg.contains(['\0', '\n']))
+            {
+                return Err("health check command must be 1..=32 non-empty arguments".into());
+            }
+            if !(1..=3600).contains(&check.interval_secs)
+                || !(1..=3600).contains(&check.timeout_secs)
+                || !(1..=100).contains(&check.retries)
+                || check.start_period_secs > 3600
+            {
+                return Err("health check timings out of range".into());
+            }
+        }
+        if self.volumes.len() > 16 {
+            return Err("at most 16 volumes".into());
+        }
+        let mut targets = std::collections::HashSet::new();
+        for volume in &self.volumes {
+            if !validate::is_valid_volume_name(&volume.name)
+                || !validate::is_valid_container_path(&volume.target)
+                || !targets.insert(volume.target.as_str())
+            {
+                return Err(format!("invalid volume {}", volume.name));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -460,6 +709,58 @@ pub mod validate {
         SERVICE_NAME_RE.is_match(name)
     }
 
+    /// A Docker image reference: `[registry[:port]/]path[:tag][@sha256:digest]`
+    /// with lowercase path components. No option-looking or whitespace input.
+    pub fn is_valid_image_reference(image: &str) -> bool {
+        image.len() <= 255 && IMAGE_REF_RE.is_match(image)
+    }
+
+    static IMAGE_REF_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(concat!(
+            r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*(?::[0-9]{1,5})?/)?",
+            r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*",
+            r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[a-f0-9]{64})?$"
+        ))
+        .unwrap()
+    });
+
+    /// A path relative to a source tree: no leading `/`, no empty, `.` or
+    /// `..` segments. `allow_root` additionally accepts `.` for the tree
+    /// itself (a build context).
+    pub fn is_valid_relative_path(path: &str, allow_root: bool) -> bool {
+        if allow_root && path == "." {
+            return true;
+        }
+        !path.is_empty()
+            && path.len() <= 256
+            && !path.starts_with('/')
+            && !path.starts_with('-')
+            && !path.contains(['\0', '\n', '\\'])
+            && !path
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    }
+
+    /// Docker named volume name.
+    pub fn is_valid_volume_name(name: &str) -> bool {
+        VOLUME_NAME_RE.is_match(name)
+    }
+
+    static VOLUME_NAME_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$").unwrap());
+
+    /// Absolute path inside a container (a mount target). Rejects `:` so a
+    /// value can never smuggle a mount mode or second path.
+    pub fn is_valid_container_path(path: &str) -> bool {
+        path.len() > 1
+            && path.len() <= 256
+            && path.starts_with('/')
+            && !path.contains([':', '\0', '\n', '\\', ','])
+            && !path[1..]
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    }
+
     pub fn is_valid_env_key(key: &str) -> bool {
         ENV_KEY_RE.is_match(key)
     }
@@ -623,6 +924,52 @@ pub mod validate {
                 "git@a@host:repo",
             ] {
                 assert!(!is_valid_git_url(url), "{url}");
+            }
+        }
+
+        #[test]
+        fn image_references() {
+            for image in [
+                "nginx",
+                "nginx:1.27-alpine",
+                "library/redis:7",
+                "ghcr.io/org/app:v1.2.3",
+                "registry.example.com:5000/team/app",
+                "localhost:5000/app:latest",
+                "my_org/my-app__x:tag",
+                "postgres@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ] {
+                assert!(is_valid_image_reference(image), "{image}");
+            }
+            for image in [
+                "",
+                "-v",
+                "--privileged",
+                "Nginx",
+                "nginx:latest --rm",
+                "nginx;id",
+                "nginx:-x",
+                "nginx:$(id)",
+                "/nginx",
+                "nginx/",
+                "a//b",
+                "nginx@sha256:short",
+            ] {
+                assert!(!is_valid_image_reference(image), "{image}");
+            }
+        }
+
+        #[test]
+        fn relative_and_container_paths() {
+            assert!(is_valid_relative_path(".", true));
+            assert!(!is_valid_relative_path(".", false));
+            assert!(is_valid_relative_path("docker/web.Dockerfile", false));
+            for bad in ["", "/etc", "../x", "a/../b", "a//b", "-f", "a/./b", "a\\b"] {
+                assert!(!is_valid_relative_path(bad, true), "{bad}");
+            }
+            assert!(is_valid_container_path("/var/lib/data"));
+            for bad in ["/", "data", "/a/../b", "/a:/b", "/a,ro", "/a//b"] {
+                assert!(!is_valid_container_path(bad), "{bad}");
             }
         }
 

@@ -69,8 +69,8 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Notifications | `reqwest` (rustls, no redirects) for Slack, Discord, Telegram, ntfy, Gotify, and HMAC-signed generic webhooks; `lettre` for SMTP. Per-channel deploy event flags; one AES-GCM-sealed, write-only secret per channel (`PANEL_SECRET_KEY`) | D1 | ✅ (deploy events only; real-service E2E pending) |
 | Deploy UI | React: create/deploy form, write-only env editor, deployment history with cancel, live log viewer (offset polling), service status, domain editor, webhook panel | D1 | ✅ |
 | Private Git | Deploy keys per project, generated on the agent (0600, only the public key leaves the host). Git reaches `ssh` through `GIT_SSH` pointing at the agent binary, which `exec`s `ssh` with a fixed argv, a per-project `known_hosts`, and no access to root's keys (`GIT_SSH_COMMAND` would go through `sh -c`). HTTPS tokens are write-only, kept by the agent, and answered by the agent binary as `GIT_ASKPASS` for the remote's host only, never argv. GitHub App installation tokens are minted in panel-api | D2 | 🟡 (deploy keys and HTTPS tokens done; GitHub App pending) |
-| Applications (single service) | `applications` table: Dockerfile build (`docker build` argv, context and Dockerfile validated inside the source), image source (`docker pull`), resources, replicas, health check. Rendered into a generated Compose project so one deploy engine serves both | D2 | ⬜ |
-| Build types | Dockerfile (core). Nixpacks, Railpack, and buildpacks as opt-in pinned binaries. Static apps served by Nginx directly from a release directory, with no container | D2 | ⬜ |
+| Applications (single service) | `ComposeSource::Application` (stored in the project's `source` JSONB, no extra table): Dockerfile build from Git (context and Dockerfile validated and symlink-checked inside the checkout, optional target) or a validated image reference; memory/CPU limits, restart policy, exec-form health check, named volumes. Rendered by the agent into a generated Compose file, so one deploy engine serves both. Replicas are not offered (one loopback port per domain) | D2 | ✅ |
+| Build types | Dockerfile (core). Nixpacks, Railpack, and buildpacks as opt-in pinned binaries. Static apps served by Nginx directly from a release directory, with no container | D2 | 🟡 (Dockerfile done) |
 | Registries | Per-project `DOCKER_CONFIG` directory; credentials encrypted at rest | D2 | ⬜ |
 | Projects, environments, env layering | `projects → environments → services`, merged project → environment → service at deploy time, by the agent | D2 | ⬜ |
 | Databases as services | Postgres, MySQL, MariaDB, Mongo, and Redis containers bound to `127.0.0.1` with persistent named volumes. An external port only through an explicit firewall rule | D3 | ⬜ |
@@ -119,8 +119,9 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 - Webhooks with HMAC, and notifications.
 - Done when an operator can go from a Git push to a live HTTPS domain with no CLI.
 
-**D2: Applications and builds.**
+**D2: Applications and builds (in progress).**
 - Application model, Dockerfile and image sources, private git, registries, environments, and encrypted secrets at rest.
+- Done: application model with image and Dockerfile sources, deploy keys, and HTTPS tokens. Open: GitHub App tokens, Nixpacks/Railpack/buildpacks, static apps, registries, environments with env layering.
 
 **D3: Data.**
 - Database services, S3 backups and restore, volume backups, and systemd-timer schedules.
@@ -138,6 +139,7 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 
 These are deliberate, not just parity:
 - No user-supplied Compose command override. Dokploy instead allows one, guarded by a regex blocklist.
+- Compose files cannot read host files: build contexts, `env_file`, secret and config files, and bind mounts must resolve inside the checkout (symlinks included), and `include`, cross-file `extends`, `label_file`, and volume `driver_opts` are refused.
 - Git and S3 credentials never go on argv.
 - Rollback snapshots never contain credentials.
 - Webhooks require HMAC, not only a URL token.

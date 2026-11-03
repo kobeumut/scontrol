@@ -12,7 +12,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
-use panel_core::types::ComposeSource;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -45,7 +44,7 @@ async fn compose_push(
         return Err(not_found());
     }
 
-    let ComposeSource::Git { branch, .. } = &project.source else {
+    let Some((_, branch)) = project.source.git_checkout() else {
         return Ok(ignored("project does not deploy from Git"));
     };
     let (pushed_branch, commit, changed_paths) = match webhook::interpret(&headers, &body)
@@ -59,7 +58,7 @@ async fn compose_push(
             changed_paths,
         } => (branch, commit, changed_paths),
     };
-    if &pushed_branch != branch {
+    if pushed_branch != branch {
         return Ok(ignored("push is not to the deployed branch"));
     }
     // A payload that does not list every changed file cannot prove the push
