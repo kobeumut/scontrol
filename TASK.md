@@ -89,7 +89,12 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 
 ### D2: Applications and builds
 
-- [ ] Application model (single service) rendered into a generated Compose project, so a single deploy engine serves both applications and Compose projects.
+- [x] Application model (single service) rendered into a generated Compose project, so a single deploy engine serves both applications and Compose projects. Done 2026-11-03.
+  - `ComposeSource::Application(ApplicationSpec)` (`kind: "application"`), stored in the existing `compose_projects.source` JSONB, so no migration was needed. Queue, logs, write-only environment, domains, webhooks, deploy keys, and HTTPS tokens apply unchanged.
+  - Spec: `build` (image or Dockerfile), `service_name` (default `app`), `container_port` (rendered as `expose`), `restart`, `memory_limit_mb` (`mem_limit`), `cpu_limit_millis` (`cpus`), `health_check` (exec-form `CMD` argv, never `CMD-SHELL`), and named `volumes` (no host binds). Validated by `ApplicationSpec::validate` in panel-core, shared by panel-api and the agent.
+  - The agent renders the file with `serde_yaml` values (no string templating). The project's 0600 `env` file becomes the container's `env_file`, so environment values reach the container without passing through PostgreSQL, argv, or the rendered file.
+  - Replicas are not offered: a domain publishes one loopback port, which only one container can bind.
+  - UI: "App: image" and "App: Dockerfile" create modes with application settings; the project header summarises the spec; Git access and webhook panels show for Dockerfile apps.
 - [x] Private Git (migration `0007`, `adapters/git_auth.rs`, `GET /:id/git-access`, UI "Git access" panel). Done 2026-11-03.
   - Git URLs: HTTPS without a user part, `ssh://[user@]host[:port]/path`, and `user@host:path`. Hosts and users never start with `-`.
   - SSH deploy key: `POST/DELETE /:id/git-access/deploy-key`. The agent runs `ssh-keygen -t ed25519`; only the public key leaves the host (stored in `compose_projects.deploy_public_key`). SSH remotes only.
@@ -97,9 +102,12 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
   - HTTPS token: `PUT/DELETE /:id/git-access/token`, or `git_credentials` on create. Write-only; the agent keeps host, username, and token in a 0600 `git-credentials` file. Git asks for it through `GIT_ASKPASS` = the agent binary, which answers only prompts for the remote's host (taken from the project, not the request). The token is never on argv, in Git's environment, in `.git/config`, or in a credential helper (`credential.helper` is reset through `GIT_CONFIG_*`), and it is masked in deployment logs. PostgreSQL stores only `git_token_host`.
   - Removing a never-deployed project now deletes its directory too (environment file, keys), so a reused slug cannot inherit them.
   - The installer adds `openssh-client` (`ssh`, `ssh-keygen`) with Docker support, since `git` is installed without recommends.
-- [ ] Docker image source (`docker pull` of a validated reference).
+- [x] Docker image source. The reference is allow-listed (`validate::is_valid_image_reference`: `[registry[:port]/]path[:tag][@sha256:…]`, lowercase path, nothing option-like) and pulled by `docker compose up` (`--pull always` with "pull images").
 - [ ] GitHub App installation tokens minted in panel-api and passed per deployment.
-- [ ] Build types: Dockerfile (core). Nixpacks, Railpack, and buildpacks as opt-in pinned binaries. Static apps served by Nginx from a release directory, with no container.
+- [-] Build types.
+  - [x] Dockerfile (core): Git checkout (same clone/fetch, deploy key, and token path as Compose), `context_path` and `dockerfile_path` relative to the repository root, optional multi-stage `target`. Both must canonicalize inside the checkout (symlink escape check). The generated `.scontrol-app.yml` is written with `create_new` after removing whatever the repository put at that path, so a committed symlink cannot redirect the write.
+  - [ ] Nixpacks, Railpack, and buildpacks as opt-in pinned binaries.
+  - [ ] Static apps served by Nginx from a release directory, with no container.
 - [ ] Registries with a per-project `DOCKER_CONFIG`.
 - [ ] Projects → environments → services with env layering.
 - [ ] AES-GCM encryption at rest for every secret panel-api stores (registry, S3, GitHub App keys). Notification credentials are done; Git deploy keys and tokens stay on the agent instead (see `MEMORY.md`).
@@ -127,6 +135,14 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 - [ ] Remote agents (mTLS or SSH-forwarded socket), RBAC, and API keys.
 
 ### Security fixes found during D1
+- [x] Compose policy closed host-file reads (found and fixed 2026-11-03, D2). Compose runs as root, so these let a Compose file read or mount any host file:
+  - `build` contexts and Dockerfiles that are absolute, contain `..`, use `~` or `$` interpolation, or are remote URLs; `build.additional_contexts`, `build.secrets`, and `build.ssh`;
+  - absolute or escaping `env_file` (string, list, or `path:` form), `label_file`, `extends.file`, and top-level `include`;
+  - top-level `secrets`/`configs` with an escaping `file:`; volume `driver_opts` (a `local` volume with `o: bind` mounts a host path);
+  - short-form binds with `..` anywhere (`./data/../../..` slipped past the old `../` prefix check), `~`, or `$`; long-form mounts other than `volume`/`tmpfs`.
+  - Every remaining relative host path (binds, env files, build contexts, Dockerfiles, secret/config files) is resolved after checkout: the deepest existing ancestor must canonicalize inside `code/`, so a symlink committed to the repository cannot point Docker at a host path.
+  - Also refused now: `userns_mode: host`, `device_cgroup_rules`, `apparmor:unconfined` (colon form), `systempaths=unconfined`, `label=disable`, and the capabilities `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_BOOT`, `DAC_READ_SEARCH`, and `BPF` (with or without a `CAP_` prefix, any case).
+- [x] `agent.toml` without a `[runtime_features]` section disabled Docker, Mail, and Antivirus, because a derived `Default` ignored the per-field `default_true`. `RuntimeFeatures` now implements `Default` explicitly. Installer-written configs always had the section, so installs were unaffected. Found during the D2 E2E run.
 
 - [x] Database passwords no longer ride on argv: `CREATE ROLE ... PASSWORD` (psql) and `CREATE USER ... IDENTIFIED BY` (mysql) are sent on stdin via `exec::run_with_stdin`. Found and fixed 2026-11-03.
 
@@ -156,7 +172,21 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 
 ## Validation
 
-Latest run, 2026-11-03, D2 private Git plus the mail and legacy-container argv fixes:
+Latest run, 2026-11-03, D2 applications (image and Dockerfile) plus Compose policy hardening (Linux x86_64, Rust 1.99.1 in a container, PostgreSQL 16):
+
+- [x] `cargo test --workspace` with all agent features against PostgreSQL: 75 tests passed (agent 39, api 25, core 11). Default-feature agent build: 10 passed.
+  - New tests: image reference, relative path, and container path rules; application spec validation (hostile image, service name, mount target, empty health check, escaping build context); rendered application YAML (exact keys, exec-form health check keeps a hostile argument as one argument, absolute `env_file` only allowed for the project's own file); 25 Compose policy rejections; host-path collection; symlink resolution of host paths; the generated file replaces a planted symlink without writing through it; `RuntimeFeatures` defaults; an API test covering application validation errors, defaults, webhook refusal for image apps, and Git access/webhooks for Dockerfile apps.
+- [x] `SQLX_OFFLINE=true cargo clippy --workspace --all-targets -- -D warnings`, with default and with all optional agent features. `cargo fmt --all -- --check` clean. No SQL changed, so `.sqlx` is unchanged.
+- [x] `SQLX_OFFLINE=true cargo build --release --workspace` with all agent features. Binaries: agent 7.8 MB, api 19.8 MB, cli 7.4 MB (Linux; the earlier figures were macOS).
+- [x] Frontend `npm run build`.
+- [x] Local E2E (Ubuntu, real Docker and Compose v5.0.1, release agent over its socket, run as a docker-group user):
+  - image app (`redis:alpine`): container healthy through the exec-form health check; `mem_limit` 64 MiB, 0.25 CPU, and restart policy applied; the env value reached the container and appears in neither the deployment log nor the agent log; `env` 0600 and the project directory 0700;
+  - Dockerfile app (`github.com/docker/welcome-to-docker`): cloned, built, healthy, commit SHA recorded; the redeploy took the shallow-fetch path and regenerated `.scontrol-app.yml` after `git clean`;
+  - raw Compose with `env_file: /etc/shadow` or `build: /` was refused before Docker ran;
+  - both projects removed through the agent.
+- [ ] Not run: the new UI forms in a browser; a Dockerfile app from a private repository.
+
+Previous run, 2026-11-03, D2 private Git plus the mail and legacy-container argv fixes:
 
 - [x] `cargo test --workspace` with all agent features against temporary PostgreSQL: 65 tests passed (agent 32, api 24, core 9). Default-feature agent build: 9 tests passed.
   - New tests: Git URL acceptance and rejection (option-looking hosts, credentials in HTTPS URLs, `ext::`, `file://`), askpass answers only for the stored host, ssh helper argv, 0600 credential file and token absent from Git's environment, deploy key generation and rotation with real `ssh-keygen`, in-process SHA512-CRYPT, and an API test that tokens never reach responses, audit rows, or project rows.

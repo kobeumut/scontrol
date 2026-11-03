@@ -767,7 +767,7 @@ async fn rotate_webhook(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<WebhookCredentials>> {
     let project = find_project(&state, id).await?;
-    if !matches!(project.source, ComposeSource::Git { .. }) {
+    if project.source.git_checkout().is_none() {
         return Err(ApiError::BadRequest(
             "webhooks need a Git-sourced project".into(),
         ));
@@ -832,10 +832,10 @@ async fn git_access(
 }
 
 async fn git_access_of(state: &AppState, project: &ComposeProject) -> ApiResult<GitAccess> {
-    let remote = match &project.source {
-        ComposeSource::Git { repository_url, .. } => validate::git_remote(repository_url),
-        ComposeSource::Raw { .. } => None,
-    };
+    let remote = project
+        .source
+        .git_checkout()
+        .and_then(|(repository_url, _)| validate::git_remote(repository_url));
     let record = db::compose_projects::git_access(&state.db, project.id).await?;
     Ok(GitAccess {
         transport: remote.as_ref().map(|(transport, _)| match transport {
@@ -856,15 +856,15 @@ async fn generate_deploy_key(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<GitAccess>> {
     let project = find_project(&state, id).await?;
-    let is_ssh = match &project.source {
-        ComposeSource::Git { repository_url, .. } => {
+    let is_ssh = project
+        .source
+        .git_checkout()
+        .is_some_and(|(repository_url, _)| {
             matches!(
                 validate::git_remote(repository_url),
                 Some((GitTransport::Ssh, _))
             )
-        }
-        ComposeSource::Raw { .. } => false,
-    };
+        });
     if !is_ssh {
         return Err(ApiError::BadRequest(
             "deploy keys need an SSH remote such as git@github.com:org/repo.git".into(),
@@ -987,14 +987,14 @@ async fn write_git_token(
 
 /// The host of an HTTPS Git source; tokens apply to nothing else.
 fn https_host(source: &ComposeSource) -> ApiResult<String> {
-    match source {
-        ComposeSource::Git { repository_url, .. } => match validate::git_remote(repository_url) {
+    match source.git_checkout() {
+        Some((repository_url, _)) => match validate::git_remote(repository_url) {
             Some((GitTransport::Https, host)) => Ok(host),
             _ => Err(ApiError::BadRequest(
                 "HTTPS tokens need an https:// remote; use a deploy key for SSH remotes".into(),
             )),
         },
-        ComposeSource::Raw { .. } => Err(ApiError::BadRequest(
+        None => Err(ApiError::BadRequest(
             "Git credentials need a Git-sourced project".into(),
         )),
     }
@@ -1091,6 +1091,9 @@ fn validate_source(source: &ComposeSource) -> ApiResult<()> {
         ComposeSource::Raw { compose_yaml } => {
             !compose_yaml.is_empty() && compose_yaml.len() <= 512 * 1024
         }
+        ComposeSource::Application(spec) => {
+            return spec.validate().map_err(ApiError::BadRequest);
+        }
     };
     if valid {
         Ok(())
@@ -1114,10 +1117,7 @@ fn validate_environment(environment: &[(String, String)]) -> ApiResult<()> {
 }
 
 fn source_kind(source: &ComposeSource) -> &'static str {
-    match source {
-        ComposeSource::Git { .. } => "git",
-        ComposeSource::Raw { .. } => "raw",
-    }
+    source.kind()
 }
 
 #[cfg(test)]
@@ -1154,6 +1154,112 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn application_sources_are_validated_and_queued_like_compose() {
+        let pool = test_support::test_pool().await;
+        let adapter = Arc::new(MockAdapter::new());
+        let state = test_support::app_state(pool.clone(), adapter.clone());
+        let admin = test_support::user(&pool, true).await;
+        let cookie = test_support::session_cookie(&state, admin.id).await;
+        let router = crate::routes::build_router(state);
+        let slug = |p: &str| format!("{p}{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+
+        for bad in [
+            json!({ "kind": "application", "build": { "type": "image", "image": "nginx --privileged" } }),
+            json!({ "kind": "application", "build": { "type": "image", "image": "nginx" }, "service_name": "a b" }),
+            json!({ "kind": "application", "build": { "type": "image", "image": "nginx" },
+                    "volumes": [{ "name": "data", "target": "/data:/etc" }] }),
+            json!({ "kind": "application", "build": { "type": "dockerfile",
+                    "repository_url": "https://github.com/acme/app.git", "branch": "main",
+                    "context_path": "../.." } }),
+        ] {
+            let (status, body) = call(
+                &router,
+                &cookie,
+                Method::POST,
+                "/api/compose-projects",
+                Some(json!({ "name": "Bad app", "slug": slug("bad"), "source": bad })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/compose-projects",
+            Some(json!({
+                "name": "Image app",
+                "slug": slug("img"),
+                "source": { "kind": "application",
+                            "build": { "type": "image", "image": "ghcr.io/acme/app:1.0" },
+                            "container_port": 8080, "memory_limit_mb": 256 },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let project = &serde_json::from_str::<Value>(&body).unwrap()["project"];
+        assert_eq!(project["source"]["build"]["image"], "ghcr.io/acme/app:1.0");
+        assert_eq!(project["source"]["service_name"], "app");
+        assert_eq!(project["source"]["restart"], "unless-stopped");
+        // An image application has no Git remote, so no webhook.
+        let id = project["id"].as_str().unwrap();
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            &format!("/api/compose-projects/{id}/webhook"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/compose-projects",
+            Some(json!({
+                "name": "Built app",
+                "slug": slug("built"),
+                "source": { "kind": "application",
+                            "build": { "type": "dockerfile",
+                                       "repository_url": "git@github.com:acme/app.git",
+                                       "branch": "main" } },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let project = &serde_json::from_str::<Value>(&body).unwrap()["project"];
+        assert_eq!(project["source"]["build"]["context_path"], ".");
+        assert_eq!(project["source"]["build"]["dockerfile_path"], "Dockerfile");
+        // A Dockerfile application deploys from Git: webhooks and deploy
+        // keys apply to it.
+        let id = project["id"].as_str().unwrap();
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::GET,
+            &format!("/api/compose-projects/{id}/git-access"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let access: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(access["transport"], "ssh");
+        assert_eq!(access["host"], "github.com");
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            &format!("/api/compose-projects/{id}/webhook"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

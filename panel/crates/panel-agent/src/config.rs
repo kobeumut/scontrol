@@ -65,7 +65,7 @@ pub struct AgentConfig {
     pub runtime_features: RuntimeFeatures,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RuntimeFeatures {
     #[serde(default = "default_true")]
     pub docker: bool,
@@ -73,6 +73,19 @@ pub struct RuntimeFeatures {
     pub mail: bool,
     #[serde(default = "default_true")]
     pub antivirus: bool,
+}
+
+/// Matches the per-field serde defaults, so an `agent.toml` without a
+/// `[runtime_features]` section keeps compiled-in features enabled. (A
+/// derived `Default` would turn every feature off in that case.)
+impl Default for RuntimeFeatures {
+    fn default() -> Self {
+        Self {
+            docker: true,
+            mail: true,
+            antivirus: true,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -167,5 +180,19 @@ impl AgentConfig {
 
     pub fn antivirus_enabled(&self) -> bool {
         cfg!(feature = "antivirus") && self.runtime_features.antivirus
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_features_default_on_with_or_without_the_section() {
+        let cfg: AgentConfig = toml::from_str("").unwrap();
+        assert!(cfg.runtime_features.docker && cfg.runtime_features.mail);
+        assert!(cfg.runtime_features.antivirus);
+        let cfg: AgentConfig = toml::from_str("[runtime_features]\nmail = false\n").unwrap();
+        assert!(cfg.runtime_features.docker && !cfg.runtime_features.mail);
     }
 }
