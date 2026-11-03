@@ -3,6 +3,7 @@ pub mod compose_projects;
 pub mod cron;
 pub mod databases;
 pub mod firewall;
+pub mod github_apps;
 pub mod notifications;
 pub mod projects;
 pub mod registries;

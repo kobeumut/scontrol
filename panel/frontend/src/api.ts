@@ -1,12 +1,25 @@
 import { useCallback, useEffect, useState } from 'react';
 
-export type Capability = { docker: boolean; mail: boolean; antivirus: boolean; version: string };
+export type BuildTool = 'nixpacks' | 'railpack' | 'buildpacks';
+
+export type Capability = { docker: boolean; mail: boolean; antivirus: boolean; version: string; build_tools?: BuildTool[] };
 export type User = { id: string; username: string; email: string; is_admin: boolean; totp_enabled: boolean };
 export type Site = { id: string; domain: string; status: string; ssl_enabled: boolean; runtime: { kind: string } };
 
 export type ApplicationBuild =
   | { type: 'image'; image: string }
-  | { type: 'dockerfile'; repository_url: string; branch: string; context_path: string; dockerfile_path: string; target?: string | null };
+  | { type: 'dockerfile'; repository_url: string; branch: string; context_path: string; dockerfile_path: string; target?: string | null }
+  | { type: 'builder'; builder: BuildTool; repository_url: string; branch: string; context_path: string };
+
+export const BUILD_TOOL_LABELS: Record<BuildTool, string> = {
+  nixpacks: 'Nixpacks', railpack: 'Railpack', buildpacks: 'Buildpacks',
+};
+
+/** Static files served by the host Nginx; `build` runs in a throwaway container. */
+export type StaticSiteSpec = {
+  repository_url: string; branch: string; publish_path: string; spa: boolean;
+  build?: { image: string; commands: string[][] } | null;
+};
 
 export type RestartPolicy = 'no' | 'always' | 'unless-stopped' | 'on-failure';
 
@@ -24,18 +37,21 @@ export type ApplicationSpec = {
 export type ComposeSource =
   | { kind: 'git'; repository_url: string; branch: string; compose_path: string }
   | { kind: 'raw'; compose_yaml: string }
-  | ({ kind: 'application' } & ApplicationSpec);
+  | ({ kind: 'application' } & ApplicationSpec)
+  | ({ kind: 'static' } & StaticSiteSpec);
 
 /** Repository and branch for sources that deploy from Git. */
 export function gitCheckout(source: ComposeSource): { repository_url: string; branch: string } | null {
-  if (source.kind === 'git') return source;
-  if (source.kind === 'application' && source.build.type === 'dockerfile') return source.build;
+  if (source.kind === 'git' || source.kind === 'static') return source;
+  if (source.kind === 'application' && source.build.type !== 'image') return source.build;
   return null;
 }
 
 export function sourceLabel(source: ComposeSource): string {
   if (source.kind === 'git') return `git · ${source.branch}`;
   if (source.kind === 'raw') return 'raw';
+  if (source.kind === 'static') return `static · ${source.branch}`;
+  if (source.build.type === 'builder') return `app · ${BUILD_TOOL_LABELS[source.build.builder]} · ${source.build.branch}`;
   return source.build.type === 'image' ? 'app · image' : `app · Dockerfile · ${source.build.branch}`;
 }
 
@@ -89,7 +105,14 @@ export type Domain = {
 export type GitAccess = {
   transport: 'ssh' | 'https' | null; host: string | null;
   deploy_public_key: string | null; token_host: string | null;
+  github_app: { id: string; name: string; app_id: number; installation_id: number } | null;
 };
+
+/** A registered GitHub App; its private key is write-only. */
+export type GitHubApp = { id: string; name: string; app_id: number; created_at: string };
+
+/** GitHub App tokens apply only to https://github.com/<owner>/<repo> remotes. */
+export const isGitHubHttps = (url: string) => /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+?(\.git)?\/?$/i.test(url.trim());
 
 /** Mirrors the API's transport check closely enough to pick the right form. */
 export const gitTransport = (url: string): 'ssh' | 'https' | null =>

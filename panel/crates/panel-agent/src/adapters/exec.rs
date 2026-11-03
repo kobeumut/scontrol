@@ -23,7 +23,10 @@ const ALLOWED_PROGRAMS: &[&str] = &[
     "kill",
     "mysql",
     "nginx",
+    "nixpacks",
+    "pack",
     "postmap",
+    "railpack",
     "ssh",
     "ssh-keygen",
     "sudo",
@@ -35,6 +38,12 @@ const ALLOWED_PROGRAMS: &[&str] = &[
 
 /// Harmless programs that tests may also spawn.
 const TEST_PROGRAMS: &[&str] = &["sleep", "printf"];
+
+/// Whether `program` is on the allow-list.
+#[cfg(all(test, feature = "builders"))]
+pub fn is_allowed_program(program: &str) -> bool {
+    ALLOWED_PROGRAMS.contains(&program)
+}
 
 fn check_program(program: &str) -> CoreResult<()> {
     if ALLOWED_PROGRAMS.contains(&program) || (cfg!(test) && TEST_PROGRAMS.contains(&program)) {

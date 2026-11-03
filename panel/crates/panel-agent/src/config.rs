@@ -61,6 +61,25 @@ pub struct AgentConfig {
     #[serde(default = "default_deployment_logs_retained")]
     pub deployment_logs_retained: usize,
 
+    /// Release directories of static sites, served by Nginx directly
+    /// (`<root>/<slug>/releases/<deployment>/`). Every ancestor must be
+    /// traversable by the Nginx worker user, so this lives under `/srv`
+    /// rather than the private `/var/lib/scontrol`.
+    #[allow(dead_code)]
+    #[serde(default = "default_static_sites_root")]
+    pub static_sites_root: PathBuf,
+
+    /// Pinned Railpack BuildKit frontend image (`BUILDKIT_SYNTAX`). The
+    /// installer writes the tag matching the installed `railpack` binary.
+    #[allow(dead_code)]
+    #[serde(default = "default_railpack_frontend")]
+    pub railpack_frontend: String,
+
+    /// Cloud Native Buildpacks builder image for `pack build`.
+    #[allow(dead_code)]
+    #[serde(default = "default_buildpacks_builder")]
+    pub buildpacks_builder: String,
+
     #[serde(default)]
     pub runtime_features: RuntimeFeatures,
 }
@@ -136,6 +155,18 @@ fn default_deployment_logs_retained() -> usize {
     20
 }
 
+fn default_static_sites_root() -> PathBuf {
+    PathBuf::from("/srv/scontrol/static")
+}
+
+fn default_railpack_frontend() -> String {
+    "ghcr.io/railwayapp/railpack-frontend:v0.43.0".into()
+}
+
+fn default_buildpacks_builder() -> String {
+    "paketobuildpacks/builder-jammy-base".into()
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -150,6 +181,9 @@ impl Default for AgentConfig {
             deploy_timeout_secs: default_deploy_timeout_secs(),
             deployment_log_max_bytes: default_deployment_log_max_bytes(),
             deployment_logs_retained: default_deployment_logs_retained(),
+            static_sites_root: default_static_sites_root(),
+            railpack_frontend: default_railpack_frontend(),
+            buildpacks_builder: default_buildpacks_builder(),
             runtime_features: RuntimeFeatures {
                 docker: true,
                 mail: true,

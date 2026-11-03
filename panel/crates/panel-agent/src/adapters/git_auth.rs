@@ -19,11 +19,16 @@
 //! deploy_key.pub    public half, added by the operator on the Git host
 //! known_hosts       per-project SSH host keys, trusted on first use
 //! git-credentials   0600 HTTPS credentials: host, username, token (one per line)
+//! git-ephemeral-credentials
+//!                   0600 per-deployment credentials (a GitHub App installation
+//!                   token), same format; deleted when the deployment ends
 //! ```
 
 use super::exec::{exec_replace, run};
 use crate::config::AgentConfig;
-use panel_core::adapters::{ComposeProjectActionParams, WriteGitCredentialsParams};
+use panel_core::adapters::{
+    ComposeProjectActionParams, GitHttpCredentials, WriteGitCredentialsParams,
+};
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::validate::{self, GitTransport};
 use std::path::{Path, PathBuf};
@@ -31,6 +36,7 @@ use std::path::{Path, PathBuf};
 const DEPLOY_KEY: &str = "deploy_key";
 const KNOWN_HOSTS: &str = "known_hosts";
 const CREDENTIALS: &str = "git-credentials";
+const EPHEMERAL_CREDENTIALS: &str = "git-ephemeral-credentials";
 const MAX_TOKEN_LEN: usize = 4096;
 
 /// Set by the agent on Git's environment; selects the helper this binary
@@ -149,8 +155,14 @@ impl GitAuth {
 
 /// Picks the deploy key or the HTTPS token for `repository_url`, whichever
 /// matches its transport, and returns the environment that makes Git use
-/// it through this binary's helper mode.
-pub async fn for_remote(root: &Path, repository_url: &str) -> CoreResult<GitAuth> {
+/// it through this binary's helper mode. `ephemeral` credentials (minted
+/// for this deployment) win over a stored token for HTTPS remotes; they are
+/// written to a 0600 file that [`clear_ephemeral`] removes afterwards.
+pub async fn for_remote(
+    root: &Path,
+    repository_url: &str,
+    ephemeral: Option<&GitHttpCredentials>,
+) -> CoreResult<GitAuth> {
     let (transport, host) = validate::git_remote(repository_url)
         .ok_or_else(|| CoreError::Validation("invalid Git repository URL".into()))?;
     let mut env = base_env();
@@ -169,6 +181,23 @@ pub async fn for_remote(root: &Path, repository_url: &str) -> CoreResult<GitAuth
             } else {
                 "no deploy key; connecting without an SSH identity".to_string()
             }
+        }
+        GitTransport::Https if ephemeral.is_some() => {
+            let credentials = ephemeral.expect("checked by the guard");
+            if !validate::is_valid_git_username(&credentials.username)
+                || !is_valid_token(&credentials.token)
+            {
+                return Err(CoreError::Validation(
+                    "invalid per-deployment Git credentials".into(),
+                ));
+            }
+            let path = root.join(EPHEMERAL_CREDENTIALS);
+            let body = format!("{host}\n{}\n{}\n", credentials.username, credentials.token);
+            write_private(&path, body.as_bytes()).await?;
+            env.push(("GIT_ASKPASS", helper_program()?));
+            env.push((HELPER_ENV, "askpass".into()));
+            env.push((CREDENTIALS_ENV, path_string(&path)));
+            format!("using a short-lived GitHub App installation token for {host}")
         }
         GitTransport::Https => {
             let path = root.join(CREDENTIALS);
@@ -191,6 +220,13 @@ pub async fn for_remote(root: &Path, repository_url: &str) -> CoreResult<GitAuth
         }
     };
     Ok(GitAuth { env, description })
+}
+
+/// Deletes per-deployment credentials written by [`for_remote`].
+pub async fn clear_ephemeral(root: &Path) {
+    remove_if_present(&root.join(EPHEMERAL_CREDENTIALS))
+        .await
+        .ok();
 }
 
 /// Environment for every Git command: never prompt on a terminal, and
@@ -460,7 +496,7 @@ mod tests {
         }
         assert_eq!(stored_secrets(&root).await, ["ghp_s3cret"]);
 
-        let auth = for_remote(&root, "https://github.com/org/app.git")
+        let auth = for_remote(&root, "https://github.com/org/app.git", None)
             .await
             .unwrap();
         let env = auth.env();
@@ -472,7 +508,7 @@ mod tests {
         assert!(env.iter().all(|(_, v)| !v.contains("ghp_s3cret")));
         assert!(!auth.description.contains("ghp_s3cret"));
 
-        let other = for_remote(&root, "https://gitlab.com/org/app.git")
+        let other = for_remote(&root, "https://gitlab.com/org/app.git", None)
             .await
             .unwrap();
         assert!(other.env().iter().all(|(k, _)| *k != "GIT_ASKPASS"));
@@ -519,7 +555,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let url = "git@github.com:org/app.git";
 
-        let auth = for_remote(&root, url).await.unwrap();
+        let auth = for_remote(&root, url, None).await.unwrap();
         let env = auth.env();
         assert!(env.contains(&(HELPER_ENV, "ssh")));
         assert!(env.contains(&("GIT_SSH_VARIANT", "ssh")));
@@ -527,10 +563,63 @@ mod tests {
         assert!(env.iter().all(|(k, _)| *k != "GIT_SSH_COMMAND"));
 
         std::fs::write(root.join(DEPLOY_KEY), "key").unwrap();
-        let auth = for_remote(&root, url).await.unwrap();
+        let auth = for_remote(&root, url, None).await.unwrap();
         let key = root.join(DEPLOY_KEY).to_string_lossy().into_owned();
         assert!(auth.env().contains(&(SSH_KEY_ENV, key.as_str())));
-        assert!(for_remote(&root, "file:///etc").await.is_err());
+        assert!(for_remote(&root, "file:///etc", None).await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ephemeral_credentials_win_and_are_cleared() {
+        let dir = std::env::temp_dir().join(format!("scontrol-git-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(CREDENTIALS),
+            "github.com\nx-access-token\nghp_stored\n",
+        )
+        .unwrap();
+        let minted = GitHttpCredentials {
+            username: "x-access-token".into(),
+            token: "ghs_minted".into(),
+        };
+        let auth = for_remote(&root, "https://github.com/org/app.git", Some(&minted))
+            .await
+            .unwrap();
+        let path = root.join(EPHEMERAL_CREDENTIALS);
+        let path_str = path.to_string_lossy().into_owned();
+        assert!(auth.env().contains(&(CREDENTIALS_ENV, path_str.as_str())));
+        assert!(auth.env().iter().all(|(_, v)| !v.contains("ghs_minted")));
+        assert!(!auth.description.contains("ghs_minted"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            askpass_answer("Password for 'https://x-access-token@github.com': ", &body),
+            Some("ghs_minted")
+        );
+        assert_eq!(
+            askpass_answer("Password for 'https://evil.example': ", &body),
+            None
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        clear_ephemeral(&root).await;
+        assert!(!path.exists());
+        // A hostile token is refused before anything is written.
+        let bad = GitHttpCredentials {
+            username: "x-access-token".into(),
+            token: "two words".into(),
+        };
+        assert!(
+            for_remote(&root, "https://github.com/org/app.git", Some(&bad))
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

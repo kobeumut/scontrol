@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE compose_projects SET github_app_id = $1, github_installation_id = $2, updated_at = now()\n         WHERE id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bf63054b0d7702be2c8d00e9752815967d583226475519a7f810036596e6487c"
+}

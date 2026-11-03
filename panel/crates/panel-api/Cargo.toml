@@ -33,6 +33,7 @@ schemars = { workspace = true }
 regex = { workspace = true }
 once_cell = { workspace = true }
 aes-gcm = { workspace = true }
+ring = { workspace = true }
 totp-rs = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }

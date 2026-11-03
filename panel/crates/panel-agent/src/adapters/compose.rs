@@ -19,13 +19,19 @@
 //! logs/<deployment>.log     streamed, redacted, bounded deployment logs
 //! deploy_key, known_hosts,  private Git access (see `git_auth`)
 //! git-credentials
+//! build/                    builder output that is not an image (Railpack plan)
+//! static-release            static sites only: the release being served
 //! ```
+//!
+//! A static site (`ComposeSource::Static`) runs no container: its files are
+//! copied into `<static_sites_root>/<slug>/releases/<deployment>/`, which the
+//! generated Nginx vhost serves directly.
 
 use super::deploy_log::{self, maskable_secrets, redact, DeployLog};
 use super::docker_config;
 use super::exec::{follow_lines, run, run_allow_nonzero, run_streamed};
 use super::git_auth;
-use super::nginx;
+use super::nginx::{self, VhostTarget};
 use crate::config::AgentConfig;
 use panel_core::adapters::{
     ComposeProjectActionParams, ComposeProjectLogsParams, DeployComposeProjectParams,
@@ -35,7 +41,7 @@ use panel_core::adapters::{
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
     validate, ApplicationBuild, ApplicationSpec, ComposeDeployOutcome, ComposeDomainBinding,
-    ComposeServiceInfo, ComposeSource, DeploymentLogChunk, MAX_MERGED_ENV_VARS,
+    ComposeServiceInfo, ComposeSource, DeploymentLogChunk, StaticSiteSpec, MAX_MERGED_ENV_VARS,
 };
 use serde_yaml::Value as Yaml;
 use std::collections::HashSet;
@@ -54,6 +60,10 @@ const MASKED_VALUES_FILE: &str = "env.masked";
 const OVERRIDE_FILE: &str = "scontrol.override.yml";
 const COMPOSE_PATH_MARKER: &str = ".scontrol-compose-path";
 const DOMAINS_FILE: &str = "domains.json";
+/// Present only for static sites; holds the deployment ID being served.
+const STATIC_MARKER: &str = "static-release";
+/// Static releases kept per site, the served one included.
+const STATIC_RELEASES_RETAINED: usize = 3;
 const MAX_DOMAIN_BINDINGS: usize = 32;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CERTBOT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -72,6 +82,7 @@ pub async fn deploy(
     let mut secrets = environment_secrets(&root).await?;
     secrets.extend(git_auth::stored_secrets(&root).await);
     secrets.extend(docker_config::stored_secrets(&root).await);
+    secrets.extend(params.git_credentials.iter().map(|c| c.token.clone()));
     let mut log = DeployLog::create(
         &root.join("logs"),
         params.deployment_id,
@@ -81,11 +92,15 @@ pub async fn deploy(
     )
     .await?;
 
-    let result = deploy_steps(cfg, &params, &root, &env_path, &mut log).await;
+    let result = match &params.source {
+        ComposeSource::Static(spec) => deploy_static(cfg, &params, spec, &root, &mut log).await,
+        _ => deploy_steps(cfg, &params, &root, &env_path, &mut log).await,
+    };
     // Registry logins live only for the deployment, whatever its outcome.
     tokio::fs::remove_dir_all(docker_config::config_dir(&root))
         .await
         .ok();
+    git_auth::clear_ephemeral(&root).await;
     match &result {
         Ok(outcome) => {
             for warning in &outcome.warnings {
@@ -115,8 +130,7 @@ async fn deploy_steps(
 ) -> CoreResult<ComposeDeployOutcome> {
     let code_dir = root.join("code");
     log.step("preparing source").await?;
-    let (compose_path, commit_sha) =
-        materialize_source(root, &code_dir, &params.source, log).await?;
+    let (compose_path, commit_sha) = materialize_source(cfg, params, root, &code_dir, log).await?;
     ensure_inside(&code_dir, &compose_path).await?;
     let compose = validate_compose_file(&compose_path, &code_dir, env_path).await?;
     check_bindings_against_compose(&compose, &params.domains)?;
@@ -137,7 +151,16 @@ async fn deploy_steps(
         env: Some(env_path.to_path_buf()),
         override_file: (!params.domains.is_empty()).then_some(override_path),
     };
-    let args = compose_up_args(&params.project_slug, &paths, params.pull_images);
+    // A builder's image exists only locally; there is nothing to pull.
+    let builds_locally = matches!(
+        &params.source,
+        ComposeSource::Application(spec) if matches!(spec.build, ApplicationBuild::Builder { .. })
+    );
+    let args = compose_up_args(
+        &params.project_slug,
+        &paths,
+        params.pull_images && !builds_locally,
+    );
     log.step("starting services with docker compose").await?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let timeout = Duration::from_secs(cfg.deploy_timeout_secs.max(60));
@@ -159,6 +182,7 @@ async fn deploy_steps(
         root,
         &params.domains,
         params.acme_email.as_deref(),
+        None,
         log,
     )
     .await?;
@@ -225,6 +249,13 @@ fn validate_masked_values(values: &[String]) -> CoreResult<()> {
 }
 
 pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
+    if validate::is_valid_project_slug(&params.project_slug)
+        && static_release(cfg, &params.project_slug).is_some()
+    {
+        return Err(CoreError::Validation(
+            "a static site runs no containers; remove its domains to stop serving it".into(),
+        ));
+    }
     let paths = existing_project_paths(cfg, &params.project_slug)?;
     let mut args = compose_args(&params.project_slug, &paths);
     args.extend(["stop".into()]);
@@ -240,7 +271,32 @@ pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Core
 }
 
 pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
+    if !validate::is_valid_project_slug(&params.project_slug) {
+        return Err(CoreError::Validation(format!(
+            "invalid project slug: {}",
+            params.project_slug
+        )));
+    }
     let root = project_root(cfg, &params.project_slug);
+    let static_dir = static_site_dir(cfg, &params.project_slug);
+    if root.join(STATIC_MARKER).exists() || static_dir.exists() {
+        // A static site: no containers, only vhosts and release files.
+        let owned = read_owned_domains(&root).await;
+        for domain in &owned {
+            nginx::remove_compose_vhost(cfg, domain).await?;
+        }
+        if !owned.is_empty() {
+            nginx::test_and_reload().await?;
+        }
+        for dir in [&static_dir, &root] {
+            if dir.exists() {
+                tokio::fs::remove_dir_all(dir)
+                    .await
+                    .map_err(|e| CoreError::Io(format!("removing project files: {e}")))?;
+            }
+        }
+        return Ok(());
+    }
     let paths = match existing_project_paths(cfg, &params.project_slug) {
         Ok(paths) => paths,
         // Never deployed: nothing runs, but the environment file or Git
@@ -284,6 +340,11 @@ pub async fn list_services_for(
     cfg: &AgentConfig,
     project_slug: &str,
 ) -> CoreResult<Vec<ComposeServiceInfo>> {
+    if validate::is_valid_project_slug(project_slug) {
+        if let Some(release) = static_release(cfg, project_slug) {
+            return Ok(vec![static_service_info(&release)]);
+        }
+    }
     let paths = existing_project_paths(cfg, project_slug)?;
     let mut args = compose_args(project_slug, &paths);
     args.extend([
@@ -388,6 +449,15 @@ fn parse_ps_json(output: &str) -> CoreResult<Vec<ComposeServiceInfo>> {
 }
 
 pub async fn logs(cfg: &AgentConfig, params: ComposeProjectLogsParams) -> CoreResult<String> {
+    if validate::is_valid_project_slug(&params.project_slug)
+        && static_release(cfg, &params.project_slug).is_some()
+    {
+        return Ok(
+            "A static site runs no container, so it has no container logs; see the deployment log.
+"
+            .into(),
+        );
+    }
     let paths = existing_project_paths(cfg, &params.project_slug)?;
     let tail = params.tail_lines.clamp(1, 2_000).to_string();
     let mut args = compose_args(&params.project_slug, &paths);
@@ -417,6 +487,13 @@ pub async fn follow_logs(
     cfg: &AgentConfig,
     params: FollowComposeLogsParams,
 ) -> CoreResult<LogLines> {
+    if validate::is_valid_project_slug(&params.project_slug)
+        && static_release(cfg, &params.project_slug).is_some()
+    {
+        return Err(CoreError::Validation(
+            "a static site runs no container, so there are no live logs".into(),
+        ));
+    }
     let paths = existing_project_paths(cfg, &params.project_slug)?;
     if let Some(service) = &params.service {
         if !validate::is_valid_service_name(service) {
@@ -524,6 +601,9 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
             }
         }
         ComposeSource::Application(spec) => {
+            spec.validate().map_err(CoreError::Validation)?;
+        }
+        ComposeSource::Static(spec) => {
             spec.validate().map_err(CoreError::Validation)?;
         }
     }
@@ -653,14 +733,21 @@ fn render_override(bindings: &[ComposeDomainBinding]) -> CoreResult<String> {
 /// `nginx -t` is rolled back to the previous files. Certificates are then
 /// requested for HTTPS bindings that lack one; a failed request is a warning,
 /// not a failed deployment, and the domain keeps serving plain HTTP.
+/// `static_site` is the release directory (and SPA flag) of a static site;
+/// otherwise each binding proxies to its loopback port.
 async fn apply_domains(
     cfg: &AgentConfig,
     project_slug: &str,
     root: &Path,
     bindings: &[ComposeDomainBinding],
     acme_email: Option<&str>,
+    static_site: Option<(&Path, bool)>,
     log: &mut DeployLog,
 ) -> CoreResult<Vec<String>> {
+    let target = |binding: &ComposeDomainBinding| match static_site {
+        Some((root, spa)) => VhostTarget::Static { root, spa },
+        None => VhostTarget::Proxy(binding.host_port),
+    };
     let previous = read_owned_domains(root).await;
     if bindings.is_empty() && previous.is_empty() {
         return Ok(Vec::new());
@@ -675,7 +762,7 @@ async fn apply_domains(
         ));
         let tls = binding.https && nginx::certificate_exists(cfg, &binding.domain);
         let content =
-            nginx::render_compose_vhost(cfg, project_slug, &binding.domain, binding.host_port, tls);
+            nginx::render_compose_vhost(cfg, project_slug, &binding.domain, &target(binding), tls);
         nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
     }
     for stale in previous
@@ -724,7 +811,7 @@ async fn apply_domains(
                 cfg,
                 project_slug,
                 &binding.domain,
-                binding.host_port,
+                &target(binding),
                 true,
             );
             nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
@@ -740,6 +827,346 @@ async fn apply_domains(
         nginx::test_and_reload().await?;
     }
     Ok(warnings)
+}
+
+/// Deploys a static site: checkout, optional containerised build, a copy of
+/// the publish directory into a fresh release, then the Nginx vhosts. The
+/// previous release keeps serving until the new vhosts pass `nginx -t`.
+async fn deploy_static(
+    cfg: &AgentConfig,
+    params: &DeployComposeProjectParams,
+    spec: &StaticSiteSpec,
+    root: &Path,
+    log: &mut DeployLog,
+) -> CoreResult<ComposeDeployOutcome> {
+    let slug = &params.project_slug;
+    let code_dir = root.join("code");
+    log.step("preparing source").await?;
+    let commit = checkout(
+        root,
+        &code_dir,
+        &spec.repository_url,
+        &spec.branch,
+        params.git_credentials.as_ref(),
+        log,
+    )
+    .await?;
+    if let Some(build) = &spec.build {
+        run_static_build(cfg, slug, root, &code_dir, build, log).await?;
+    }
+
+    let publish = code_dir.join(&spec.publish_path);
+    ensure_inside_named(&code_dir, &publish, "publish directory").await?;
+    let publish = tokio::fs::canonicalize(&publish)
+        .await
+        .map_err(|e| CoreError::Io(format!("resolving publish directory: {e}")))?;
+    if !publish.is_dir() {
+        return Err(CoreError::Validation(format!(
+            "publish path {} is not a directory",
+            spec.publish_path
+        )));
+    }
+
+    let releases = static_site_dir(cfg, slug).join("releases");
+    create_public_dirs(&cfg.static_sites_root, &releases).await?;
+    let release = releases.join(params.deployment_id.to_string());
+    log.step("publishing static files").await?;
+    let stats = {
+        let (from, to) = (publish.clone(), release.clone());
+        tokio::task::spawn_blocking(move || publish_tree(&from, &to))
+            .await
+            .map_err(|e| CoreError::Io(format!("publishing static files: {e}")))?
+    };
+    let stats = match stats {
+        Ok(stats) => stats,
+        Err(error) => {
+            tokio::fs::remove_dir_all(&release).await.ok();
+            return Err(error);
+        }
+    };
+    log.step(&format!(
+        "published {} files ({} bytes) to release {}",
+        stats.files, stats.bytes, params.deployment_id
+    ))
+    .await?;
+    if !stats.skipped.is_empty() {
+        log.step(&format!(
+            "skipped {} symlinks or special files (only regular files are published): {}",
+            stats.skipped_total,
+            stats.skipped.join(", ")
+        ))
+        .await?;
+    }
+
+    let mut warnings = match apply_domains(
+        cfg,
+        slug,
+        root,
+        &params.domains,
+        params.acme_email.as_deref(),
+        Some((&release, spec.spa)),
+        log,
+    )
+    .await
+    {
+        Ok(warnings) => warnings,
+        Err(error) => {
+            tokio::fs::remove_dir_all(&release).await.ok();
+            return Err(error);
+        }
+    };
+    if params.domains.is_empty() {
+        warnings.push("the site has no domain yet; add one to serve it".into());
+    }
+    tokio::fs::write(root.join(STATIC_MARKER), params.deployment_id.to_string())
+        .await
+        .map_err(|e| CoreError::Io(format!("recording static release: {e}")))?;
+    prune_static_releases(&releases, &params.deployment_id.to_string()).await;
+    Ok(ComposeDeployOutcome {
+        services: vec![static_service_info(&params.deployment_id.to_string())],
+        commit_sha: commit,
+        warnings,
+    })
+}
+
+/// Runs each build command in a throwaway container with the checkout at
+/// `/workspace`. Exec form only, all capabilities dropped, no new
+/// privileges; the project environment file is passed by path, so build
+/// tools (e.g. Vite) can read public settings without values on argv.
+async fn run_static_build(
+    cfg: &AgentConfig,
+    slug: &str,
+    root: &Path,
+    code_dir: &Path,
+    build: &panel_core::types::StaticBuild,
+    log: &mut DeployLog,
+) -> CoreResult<()> {
+    let name = format!("scontrol-static-build-{slug}");
+    // A container left behind by a killed deployment would block the name.
+    let _ = run_allow_nonzero("docker", &["rm", "-f", &name]).await;
+    let timeout = Duration::from_secs(cfg.deploy_timeout_secs.max(60));
+    let (code, env) = (
+        code_dir.to_string_lossy().into_owned(),
+        root.join(ENV_FILE).to_string_lossy().into_owned(),
+    );
+    let total = build.commands.len();
+    for (index, command) in build.commands.iter().enumerate() {
+        log.step(&format!(
+            "build step {}/{total} in {}: {}",
+            index + 1,
+            build.image,
+            command.join(" ")
+        ))
+        .await?;
+        let args = static_build_args(&name, &code, &env, &build.image, command);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = run_streamed("docker", &refs, &[], log, timeout).await;
+        let failure = match result {
+            Ok(0) => continue,
+            Ok(exit) => CoreError::External(format!(
+                "static build step {} failed (exit code {exit}); see the deployment log",
+                index + 1
+            )),
+            Err(error) => error,
+        };
+        // Cancellation stops the `docker run` client; make sure the
+        // container itself goes too.
+        let _ = run_allow_nonzero("docker", &["rm", "-f", &name]).await;
+        return Err(failure);
+    }
+    Ok(())
+}
+
+fn static_build_args(
+    name: &str,
+    code_dir: &str,
+    env_file: &str,
+    image: &str,
+    command: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "run",
+        "--rm",
+        "--name",
+        name,
+        "--pull",
+        "missing",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--env-file",
+        env_file,
+        "--mount",
+    ]
+    .map(String::from)
+    .into();
+    // The source path is agent-built (configured root + validated slug).
+    args.push(format!("type=bind,source={code_dir},target=/workspace"));
+    // `image` is a validated reference, which never starts with `-`; the
+    // command follows it, so Docker passes it to the container untouched.
+    args.extend(["--workdir".into(), "/workspace".into(), image.into()]);
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// Static releases are read by the Nginx worker, so unlike the private
+/// project directory they are world-readable.
+fn static_site_dir(cfg: &AgentConfig, slug: &str) -> PathBuf {
+    cfg.static_sites_root.join(slug)
+}
+
+async fn create_public_dirs(base: &Path, dir: &Path) -> CoreResult<()> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| CoreError::Io(format!("creating release directory: {e}")))?;
+    let mut current = dir.to_path_buf();
+    loop {
+        tokio::fs::set_permissions(
+            &current,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .await
+        .map_err(|e| CoreError::Io(format!("setting release directory mode: {e}")))?;
+        if current == base || !current.pop() || !current.starts_with(base) {
+            return Ok(());
+        }
+    }
+}
+
+/// Files and bytes a single static release may hold.
+const MAX_PUBLISH_FILES: u64 = 100_000;
+const MAX_PUBLISH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_PUBLISH_DEPTH: usize = 64;
+
+#[derive(Debug, Default)]
+struct PublishStats {
+    files: u64,
+    bytes: u64,
+    skipped_total: u64,
+    /// First few skipped paths, for the deployment log.
+    skipped: Vec<String>,
+}
+
+/// Copies regular files and directories from `from` into the new directory
+/// `to`. Symlinks, devices, sockets, and FIFOs are skipped, never followed,
+/// so a link planted in the repository or by the build cannot publish a
+/// host file. `.git` directories are skipped so repository history never
+/// becomes public. Files get mode 0644, directories 0755.
+fn publish_tree(from: &Path, to: &Path) -> CoreResult<PublishStats> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let io = |what: &str, e: std::io::Error| CoreError::Io(format!("{what}: {e}"));
+    std::fs::create_dir(to).map_err(|e| io("creating release", e))?;
+    std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| io("setting release mode", e))?;
+    let mut stats = PublishStats::default();
+    let mut pending = vec![(from.to_path_buf(), to.to_path_buf(), String::new(), 0usize)];
+    while let Some((src_dir, dst_dir, prefix, depth)) = pending.pop() {
+        if depth > MAX_PUBLISH_DEPTH {
+            return Err(CoreError::Validation(
+                "publish directory is nested too deeply".into(),
+            ));
+        }
+        let entries =
+            std::fs::read_dir(&src_dir).map_err(|e| io("reading publish directory", e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io("reading publish directory", e))?;
+            let name = entry.file_name();
+            let relative = format!("{prefix}{}", name.to_string_lossy());
+            if name == ".git" {
+                continue;
+            }
+            let (src, dst) = (entry.path(), dst_dir.join(&name));
+            // lstat: a symlink is reported as a symlink, not its target.
+            let meta = std::fs::symlink_metadata(&src).map_err(|e| io("inspecting file", e))?;
+            let kind = meta.file_type();
+            if kind.is_dir() {
+                std::fs::create_dir(&dst).map_err(|e| io("creating release directory", e))?;
+                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| io("setting release directory mode", e))?;
+                pending.push((src, dst, format!("{relative}/"), depth + 1));
+            } else if kind.is_file() {
+                stats.files += 1;
+                stats.bytes += meta.len();
+                if stats.files > MAX_PUBLISH_FILES || stats.bytes > MAX_PUBLISH_BYTES {
+                    return Err(CoreError::Validation(format!(
+                        "publish directory exceeds {MAX_PUBLISH_FILES} files or {} GiB",
+                        MAX_PUBLISH_BYTES >> 30
+                    )));
+                }
+                let mut input = std::fs::File::open(&src).map_err(|e| io("reading file", e))?;
+                // The opened file must be the regular file inspected above,
+                // not something swapped in for it since.
+                let opened = input.metadata().map_err(|e| io("reading file", e))?;
+                if opened.dev() != meta.dev() || opened.ino() != meta.ino() || !opened.is_file() {
+                    return Err(CoreError::Validation(format!(
+                        "{relative} changed while publishing"
+                    )));
+                }
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o644)
+                    .open(&dst)
+                    .map_err(|e| io("writing release file", e))?;
+                std::io::copy(&mut input, &mut output).map_err(|e| io("copying file", e))?;
+                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644))
+                    .map_err(|e| io("setting release file mode", e))?;
+            } else {
+                stats.skipped_total += 1;
+                if stats.skipped.len() < 10 {
+                    stats.skipped.push(relative);
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// Keeps the served release and the newest others, up to
+/// [`STATIC_RELEASES_RETAINED`]. Only UUID-named directories are touched.
+async fn prune_static_releases(releases: &Path, current: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(releases).await else {
+        return;
+    };
+    let mut others = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == current || uuid::Uuid::parse_str(&name).is_err() {
+            continue;
+        }
+        if let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await {
+            if meta.is_dir() {
+                others.push((meta.modified().ok(), entry.path()));
+            }
+        }
+    }
+    others.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in others.into_iter().skip(STATIC_RELEASES_RETAINED - 1) {
+        tokio::fs::remove_dir_all(path).await.ok();
+    }
+}
+
+/// The release a static site serves, if it was deployed.
+fn static_release(cfg: &AgentConfig, slug: &str) -> Option<String> {
+    std::fs::read_to_string(project_root(cfg, slug).join(STATIC_MARKER))
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+fn static_service_info(release: &str) -> ComposeServiceInfo {
+    ComposeServiceInfo {
+        name: panel_core::types::STATIC_SERVICE_NAME.into(),
+        container: String::new(),
+        image: "nginx (static files)".into(),
+        state: "running".into(),
+        status: format!("serving release {release}"),
+        health: String::new(),
+        exit_code: 0,
+        ports: Vec::new(),
+    }
 }
 
 async fn read_owned_domains(root: &Path) -> Vec<String> {
@@ -767,12 +1194,14 @@ async fn write_owned_domains(root: &Path, bindings: &[ComposeDomainBinding]) -> 
 /// plus, for Git, the deployed commit. An existing checkout of the same
 /// remote is updated in place with a shallow fetch instead of a fresh clone.
 async fn materialize_source(
+    cfg: &AgentConfig,
+    params: &DeployComposeProjectParams,
     root: &Path,
     code_dir: &Path,
-    source: &ComposeSource,
     log: &mut DeployLog,
 ) -> CoreResult<(PathBuf, Option<String>)> {
-    match source {
+    let credentials = params.git_credentials.as_ref();
+    match &params.source {
         ComposeSource::Raw { compose_yaml } => {
             reset_dir(code_dir).await?;
             let path = code_dir.join(DEFAULT_COMPOSE_FILE);
@@ -786,44 +1215,15 @@ async fn materialize_source(
             branch,
             compose_path,
         } => {
-            let auth = git_auth::for_remote(root, repository_url).await?;
-            log.step(&format!("Git access: {}", auth.description))
-                .await?;
-            let env = auth.env();
-            let dir = code_dir.to_string_lossy().into_owned();
-            let reusable = code_dir.join(".git").is_dir()
-                && run("git", &["-C", &dir, "remote", "get-url", "origin"])
-                    .await
-                    .is_ok_and(|url| url.trim() == repository_url);
-            let fetched = reusable && update_checkout(&dir, branch, &env, log).await?;
-            if !fetched {
-                reset_dir(code_dir).await?;
-                tokio::fs::remove_dir(code_dir).await.ok();
-                log.step(&format!("cloning {repository_url} ({branch})"))
-                    .await?;
-                let args = git_clone_args(branch, repository_url, &dir);
-                let code = run_streamed("git", &args, &env, log, GIT_TIMEOUT).await?;
-                if code != 0 {
-                    return Err(CoreError::External(format!(
-                        "Git clone failed (exit code {code}); see the deployment log"
-                    )));
-                }
-            }
-            let commit = run("git", &["-C", &dir, "rev-parse", "HEAD"])
-                .await
-                .ok()
-                .map(|sha| sha.trim().to_string())
-                .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
-            if let Some(sha) = &commit {
-                log.step(&format!("source at commit {sha}")).await?;
-            }
+            let commit = checkout(root, code_dir, repository_url, branch, credentials, log).await?;
             Ok((code_dir.join(compose_path), commit))
         }
         ComposeSource::Application(spec) => match &spec.build {
             ApplicationBuild::Image { .. } => {
                 reset_dir(code_dir).await?;
                 let path = code_dir.join(DEFAULT_COMPOSE_FILE);
-                write_generated_file(&path, &render_application(spec, root)?).await?;
+                let body = render_application(spec, root, &params.project_slug)?;
+                write_generated_file(&path, &body).await?;
                 Ok((path, None))
             }
             ApplicationBuild::Dockerfile {
@@ -833,21 +1233,115 @@ async fn materialize_source(
                 dockerfile_path,
                 ..
             } => {
-                let git = ComposeSource::Git {
-                    repository_url: repository_url.clone(),
-                    branch: branch.clone(),
-                    compose_path: APPLICATION_COMPOSE_FILE.into(),
-                };
-                let (path, commit) =
-                    Box::pin(materialize_source(root, code_dir, &git, log)).await?;
+                let commit =
+                    checkout(root, code_dir, repository_url, branch, credentials, log).await?;
                 let context = code_dir.join(context_path);
                 ensure_inside_named(code_dir, &context, "build context").await?;
                 ensure_inside_named(code_dir, &context.join(dockerfile_path), "Dockerfile").await?;
-                write_generated_file(&path, &render_application(spec, root)?).await?;
+                let path = code_dir.join(APPLICATION_COMPOSE_FILE);
+                let body = render_application(spec, root, &params.project_slug)?;
+                write_generated_file(&path, &body).await?;
+                Ok((path, commit))
+            }
+            ApplicationBuild::Builder {
+                builder,
+                repository_url,
+                branch,
+                context_path,
+            } => {
+                let commit =
+                    checkout(root, code_dir, repository_url, branch, credentials, log).await?;
+                let context = code_dir.join(context_path);
+                ensure_inside_named(code_dir, &context, "build context").await?;
+                // Builders follow the path they are given, so hand them the
+                // resolved directory rather than one that crosses a link.
+                let context = tokio::fs::canonicalize(&context)
+                    .await
+                    .map_err(|e| CoreError::Io(format!("resolving build context: {e}")))?;
+                build_with(cfg, *builder, &context, root, &params.project_slug, log).await?;
+                let path = code_dir.join(APPLICATION_COMPOSE_FILE);
+                let body = render_application(spec, root, &params.project_slug)?;
+                write_generated_file(&path, &body).await?;
                 Ok((path, commit))
             }
         },
+        ComposeSource::Static(_) => Err(CoreError::Validation(
+            "static sites are not deployed through Compose".into(),
+        )),
     }
+}
+
+#[cfg(feature = "builders")]
+async fn build_with(
+    cfg: &AgentConfig,
+    builder: panel_core::types::BuildTool,
+    context: &Path,
+    root: &Path,
+    slug: &str,
+    log: &mut DeployLog,
+) -> CoreResult<()> {
+    let image = panel_core::types::built_image_tag(slug);
+    super::builders::build_image(cfg, builder, context, &root.join("build"), &image, log).await
+}
+
+#[cfg(not(feature = "builders"))]
+async fn build_with(
+    _cfg: &AgentConfig,
+    builder: panel_core::types::BuildTool,
+    _context: &Path,
+    _root: &Path,
+    _slug: &str,
+    _log: &mut DeployLog,
+) -> CoreResult<()> {
+    Err(CoreError::PermissionDenied(format!(
+        "this agent was built without application builders, so {} is unavailable; \
+         re-run the installer and enable them",
+        builder.as_str()
+    )))
+}
+
+/// Clones `repository_url` into `code_dir`, or updates an existing checkout
+/// of the same remote in place. Returns the checked-out commit.
+async fn checkout(
+    root: &Path,
+    code_dir: &Path,
+    repository_url: &str,
+    branch: &str,
+    credentials: Option<&panel_core::adapters::GitHttpCredentials>,
+    log: &mut DeployLog,
+) -> CoreResult<Option<String>> {
+    let auth = git_auth::for_remote(root, repository_url, credentials).await?;
+    log.step(&format!("Git access: {}", auth.description))
+        .await?;
+    let env = auth.env();
+    let dir = code_dir.to_string_lossy().into_owned();
+    let reusable = code_dir.join(".git").is_dir()
+        && run("git", &["-C", &dir, "remote", "get-url", "origin"])
+            .await
+            .is_ok_and(|url| url.trim() == repository_url);
+    let fetched = reusable && update_checkout(&dir, branch, &env, log).await?;
+    if !fetched {
+        reset_dir(code_dir).await?;
+        tokio::fs::remove_dir(code_dir).await.ok();
+        log.step(&format!("cloning {repository_url} ({branch})"))
+            .await?;
+        let args = git_clone_args(branch, repository_url, &dir);
+        let code = run_streamed("git", &args, &env, log, GIT_TIMEOUT).await?;
+        if code != 0 {
+            return Err(CoreError::External(format!(
+                "Git clone failed (exit code {code}); see the deployment log"
+            )));
+        }
+    }
+    let commit = run("git", &["-C", &dir, "rev-parse", "HEAD"])
+        .await
+        .ok()
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+    if let Some(sha) = &commit {
+        log.step(&format!("source at commit {sha}")).await?;
+    }
+    Ok(commit)
 }
 
 /// Writes a panel-generated file inside a checkout. Whatever the repository
@@ -880,7 +1374,7 @@ async fn write_generated_file(path: &Path, body: &str) -> CoreResult<()> {
 /// Renders a single-service application as Compose YAML. Values are placed
 /// through `serde_yaml`, never string-interpolated, so no input can add keys.
 /// The project environment file becomes the container's `env_file`.
-fn render_application(spec: &ApplicationSpec, root: &Path) -> CoreResult<String> {
+fn render_application(spec: &ApplicationSpec, root: &Path, slug: &str) -> CoreResult<String> {
     use serde_yaml::{Mapping, Value};
     fn key(k: &str) -> Value {
         Value::String(k.into())
@@ -903,6 +1397,14 @@ fn render_application(spec: &ApplicationSpec, root: &Path) -> CoreResult<String>
                 build.insert(key("target"), Value::String(target.clone()));
             }
             service.insert(key("build"), Value::Mapping(build));
+        }
+        ApplicationBuild::Builder { .. } => {
+            // Built by `builders` into the local image store before `up`.
+            service.insert(
+                key("image"),
+                Value::String(panel_core::types::built_image_tag(slug)),
+            );
+            service.insert(key("pull_policy"), key("never"));
         }
     }
     service.insert(
@@ -1671,7 +2173,7 @@ mod tests {
             image: "ghcr.io/acme/shop:1.2".into(),
         });
         spec.validate().unwrap();
-        let body = render_application(&spec, root).unwrap();
+        let body = render_application(&spec, root, "shop").unwrap();
         let yaml: Yaml = serde_yaml::from_str(&body).unwrap();
         let env_file = root.join(ENV_FILE);
         assert!(compose_policy(&yaml, Some(&env_file)).unwrap().is_empty());
@@ -1707,7 +2209,8 @@ mod tests {
             dockerfile_path: "Dockerfile.prod".into(),
             target: Some("runtime".into()),
         });
-        let yaml: Yaml = serde_yaml::from_str(&render_application(&built, root).unwrap()).unwrap();
+        let yaml: Yaml =
+            serde_yaml::from_str(&render_application(&built, root, "shop").unwrap()).unwrap();
         let build = &yaml["services"]["web"]["build"];
         assert_eq!(build["context"].as_str(), Some("./services/web"));
         assert_eq!(build["dockerfile"].as_str(), Some("Dockerfile.prod"));
@@ -1766,6 +2269,199 @@ mod tests {
             .await
             .is_err());
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn builder_applications_run_the_locally_built_image_without_pulling() {
+        let root = Path::new("/var/lib/scontrol/docker/shop");
+        let spec = application(ApplicationBuild::Builder {
+            builder: panel_core::types::BuildTool::Nixpacks,
+            repository_url: "https://github.com/acme/shop.git".into(),
+            branch: "main".into(),
+            context_path: ".".into(),
+        });
+        spec.validate().unwrap();
+        let yaml: Yaml =
+            serde_yaml::from_str(&render_application(&spec, root, "shop").unwrap()).unwrap();
+        let web = &yaml["services"]["web"];
+        assert_eq!(web["image"].as_str(), Some("scontrol-app/shop:latest"));
+        assert_eq!(web["pull_policy"].as_str(), Some("never"));
+        assert!(web.get("build").is_none());
+        assert!(compose_policy(&yaml, Some(&root.join(ENV_FILE)))
+            .unwrap()
+            .is_empty());
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn static_publish_directory_must_resolve_inside_the_checkout() {
+        let tmp = temp_dir("scontrol-static-escape");
+        let code = tmp.join("code");
+        std::fs::create_dir_all(code.join("dist")).unwrap();
+        std::fs::create_dir_all(tmp.join("outside")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("outside"), code.join("escape")).unwrap();
+        std::os::unix::fs::symlink("/etc", code.join("etc")).unwrap();
+        assert!(
+            ensure_inside_named(&code, &code.join("dist"), "publish directory")
+                .await
+                .is_ok()
+        );
+        for escaping in ["escape", "etc"] {
+            let error = ensure_inside_named(&code, &code.join(escaping), "publish directory")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("escapes"), "{error}");
+        }
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn static_publish_copies_regular_files_only_and_never_follows_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = temp_dir("scontrol-publish");
+        let dist = tmp.join("dist");
+        std::fs::create_dir_all(dist.join("assets/js")).unwrap();
+        std::fs::create_dir_all(dist.join(".git")).unwrap();
+        std::fs::write(dist.join("index.html"), "<h1>hi</h1>").unwrap();
+        std::fs::write(dist.join("assets/js/app.js"), "console.log(1)").unwrap();
+        std::fs::write(dist.join(".git/config"), "[remote]").unwrap();
+        std::fs::write(tmp.join("secret"), "host file").unwrap();
+        std::fs::set_permissions(
+            dist.join("index.html"),
+            std::fs::Permissions::from_mode(0o4755),
+        )
+        .unwrap();
+        // Links a hostile repository or build could plant.
+        std::os::unix::fs::symlink(tmp.join("secret"), dist.join("leak.txt")).unwrap();
+        std::os::unix::fs::symlink("/etc", dist.join("assets/etc")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dist.join("passwd")).unwrap();
+
+        let release = tmp.join("release");
+        let stats = publish_tree(&dist, &release).unwrap();
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.skipped_total, 3);
+        assert_eq!(
+            std::fs::read_to_string(release.join("index.html")).unwrap(),
+            "<h1>hi</h1>"
+        );
+        assert!(release.join("assets/js/app.js").is_file());
+        for absent in ["leak.txt", "assets/etc", "passwd", ".git"] {
+            assert!(
+                std::fs::symlink_metadata(release.join(absent)).is_err(),
+                "{absent} was published"
+            );
+        }
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&release.join("index.html")), 0o644, "setuid bit kept");
+        assert_eq!(mode(&release.join("assets")), 0o755);
+        // A release is always fresh: publishing into an existing one fails.
+        assert!(publish_tree(&dist, &release).is_err());
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn old_static_releases_are_pruned_but_the_served_one_stays() {
+        let releases = temp_dir("scontrol-releases");
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let id = uuid::Uuid::new_v4().to_string();
+            std::fs::create_dir(releases.join(&id)).unwrap();
+            ids.push(id);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::create_dir(releases.join("not-a-release")).unwrap();
+        prune_static_releases(&releases, &ids[0]).await;
+        let left: HashSet<String> = std::fs::read_dir(&releases)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let expected: HashSet<String> = [&ids[0], &ids[3], &ids[4]]
+            .into_iter()
+            .cloned()
+            .chain(["not-a-release".to_string()])
+            .collect();
+        assert_eq!(left, expected);
+        std::fs::remove_dir_all(releases).ok();
+    }
+
+    #[tokio::test]
+    async fn static_sites_report_their_release_and_remove_their_files() {
+        let tmp = temp_dir("scontrol-static-site");
+        let cfg = AgentConfig {
+            docker_projects_root: tmp.join("docker"),
+            static_sites_root: tmp.join("static"),
+            ..Default::default()
+        };
+        let release = uuid::Uuid::new_v4().to_string();
+        let root = project_root(&cfg, "site");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(
+            static_site_dir(&cfg, "site")
+                .join("releases")
+                .join(&release),
+        )
+        .unwrap();
+        std::fs::write(root.join(STATIC_MARKER), &release).unwrap();
+
+        let services = list_services_for(&cfg, "site").await.unwrap();
+        assert_eq!(services.len(), 1);
+        assert!(services[0].status.contains(&release));
+        let action = || ComposeProjectActionParams {
+            project_slug: "site".into(),
+        };
+        assert!(matches!(
+            stop(&cfg, action()).await,
+            Err(CoreError::Validation(_))
+        ));
+        let logs = logs(
+            &cfg,
+            ComposeProjectLogsParams {
+                project_slug: "site".into(),
+                tail_lines: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(logs.contains("no container"));
+        remove(&cfg, action()).await.unwrap();
+        assert!(!root.exists());
+        assert!(!static_site_dir(&cfg, "site").exists());
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn static_build_runs_exec_form_without_privileges() {
+        let command = vec![
+            "npm".to_string(),
+            "run".into(),
+            "build; id $(whoami)".into(),
+        ];
+        let args = static_build_args(
+            "scontrol-static-build-site",
+            "/var/lib/scontrol/docker/site/code",
+            "/var/lib/scontrol/docker/site/env",
+            "node:22-alpine",
+            &command,
+        );
+        assert_eq!(&args[..2], &["run", "--rm"]);
+        let after = |flag: &str| args[args.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(after("--cap-drop"), "ALL");
+        assert_eq!(after("--security-opt"), "no-new-privileges");
+        assert_eq!(after("--env-file"), "/var/lib/scontrol/docker/site/env");
+        assert_eq!(
+            after("--mount"),
+            "type=bind,source=/var/lib/scontrol/docker/site/code,target=/workspace"
+        );
+        let image = args.iter().position(|a| a == "node:22-alpine").unwrap();
+        assert_eq!(&args[image + 1..], command.as_slice());
+        for forbidden in ["--privileged", "sh", "-c", "--network=host", "-v"] {
+            assert!(!args.iter().any(|a| a == forbidden), "{forbidden}");
+        }
     }
 
     fn binding(domain: &str, service: &str, host_port: u16, https: bool) -> ComposeDomainBinding {

@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         state.agent.clone(),
         state.notifier.clone(),
         state.secret_box.clone(),
+        state.github_apps.clone(),
         config.deploy_workers,
     );
     tracing::info!(

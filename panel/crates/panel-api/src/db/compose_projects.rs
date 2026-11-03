@@ -549,25 +549,46 @@ pub async fn find_queued_deployment(
     record.map(DeploymentRecord::into_info).transpose()
 }
 
-/// Non-secret Git access state: the deploy key's public half and the host a
-/// write-only HTTPS token was saved for.
+/// Non-secret Git access state: the deploy key's public half, the host a
+/// write-only HTTPS token was saved for, and the linked GitHub App
+/// installation.
+#[derive(Default)]
 pub struct GitAccessRecord {
     pub deploy_public_key: Option<String>,
     pub git_token_host: Option<String>,
+    pub github_app_id: Option<Uuid>,
+    pub github_installation_id: Option<i64>,
 }
 
 pub async fn git_access(pool: &PgPool, project_id: Uuid) -> sqlx::Result<GitAccessRecord> {
     let record = sqlx::query_as!(
         GitAccessRecord,
-        "SELECT deploy_public_key, git_token_host FROM compose_projects WHERE id = $1",
+        "SELECT deploy_public_key, git_token_host, github_app_id, github_installation_id
+         FROM compose_projects WHERE id = $1",
         project_id
     )
     .fetch_optional(pool)
     .await?;
-    Ok(record.unwrap_or(GitAccessRecord {
-        deploy_public_key: None,
-        git_token_host: None,
-    }))
+    Ok(record.unwrap_or_default())
+}
+
+/// Links (`Some((app, installation))`) or unlinks a GitHub App installation.
+pub async fn set_github_app(
+    pool: &PgPool,
+    project_id: Uuid,
+    link: Option<(Uuid, i64)>,
+) -> sqlx::Result<()> {
+    let (app, installation) = link.unzip();
+    sqlx::query!(
+        "UPDATE compose_projects SET github_app_id = $1, github_installation_id = $2, updated_at = now()
+         WHERE id = $3",
+        app,
+        installation,
+        project_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn set_deploy_public_key(

@@ -12,18 +12,21 @@
 //! Job rows never contain environment values. Right before a deployment
 //! the worker merges the service's sealed variable layers (project →
 //! environment → service, see `services::env_layers`) and writes the result
-//! to the agent with `write_compose_environment`.
+//! to the agent with `write_compose_environment`. A GitHub App installation token is
+//! minted when the job starts and sent to the agent with that deployment
+//! only, so it never reaches the queue either.
 
 use crate::db;
 use crate::db::compose_projects::ClaimedDeployment;
 use crate::error::ApiResult;
 use crate::services::env_layers;
+use crate::services::github_app::{self, GitHubApps};
 use crate::services::notifications::Notifier;
 use crate::services::registries;
 use crate::services::secret_box::SecretBox;
 use panel_core::adapters::{
-    AdapterPort, DeployComposeProjectParams, DockerRegistryAuth, WriteComposeEnvironmentParams,
-    WriteDockerConfigParams,
+    AdapterPort, DeployComposeProjectParams, DockerRegistryAuth, GitHttpCredentials,
+    WriteComposeEnvironmentParams, WriteDockerConfigParams,
 };
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
@@ -56,14 +59,15 @@ impl DeployQueue {
         agent: Arc<dyn AdapterPort>,
         notifier: Notifier,
         secrets: SecretBox,
+        github: GitHubApps,
         workers: usize,
     ) {
         for worker in 0..workers.max(1) {
             let (db, agent, wake) = (db.clone(), agent.clone(), self.wake.clone());
-            let (notifier, secrets) = (notifier.clone(), secrets.clone());
-            tokio::spawn(
-                async move { worker_loop(worker, db, agent, notifier, secrets, wake).await },
-            );
+            let (notifier, secrets, github) = (notifier.clone(), secrets.clone(), github.clone());
+            tokio::spawn(async move {
+                worker_loop(worker, db, agent, notifier, secrets, github, wake).await
+            });
         }
     }
 
@@ -108,6 +112,7 @@ async fn worker_loop(
     agent: Arc<dyn AdapterPort>,
     notifier: Notifier,
     secrets: SecretBox,
+    github: GitHubApps,
     wake: Arc<Notify>,
 ) {
     loop {
@@ -115,7 +120,7 @@ async fn worker_loop(
             Ok(Some(job)) => {
                 tracing::info!(worker, deployment_id = %job.id, project_id = %job.project_id, "deployment started");
                 let (project_id, deployment_id) = (job.project_id, job.id);
-                run_job(&db, agent.as_ref(), &secrets, job).await;
+                run_job(&db, agent.as_ref(), &secrets, &github, job).await;
                 notifier.deployment_finished(db.clone(), project_id, deployment_id);
                 continue;
             }
@@ -133,9 +138,10 @@ pub(crate) async fn run_job(
     db: &PgPool,
     agent: &dyn AdapterPort,
     secrets: &SecretBox,
+    github: &GitHubApps,
     job: ClaimedDeployment,
 ) {
-    let result = execute(db, agent, secrets, &job).await;
+    let result = execute(db, agent, secrets, github, &job).await;
     let message = result.as_ref().err().map(ToString::to_string);
     let (status, commit) = match &result {
         Ok(outcome) => (DeploymentStatus::Succeeded, outcome.commit_sha.as_deref()),
@@ -155,6 +161,7 @@ async fn execute(
     db: &PgPool,
     agent: &dyn AdapterPort,
     secrets: &SecretBox,
+    github: &GitHubApps,
     job: &ClaimedDeployment,
 ) -> CoreResult<ComposeDeployOutcome> {
     let project = db::compose_projects::find_by_id(db, job.project_id)
@@ -201,6 +208,7 @@ async fn execute(
             })
             .await?;
     }
+    let git_credentials = github_app_credentials(db, github, &project).await?;
     let result = agent
         .deploy_compose_project(DeployComposeProjectParams {
             project_id: project.id,
@@ -219,6 +227,7 @@ async fn execute(
                 })
                 .collect(),
             acme_email,
+            git_credentials,
         })
         .await;
     if has_registry {
@@ -257,6 +266,45 @@ async fn registry_login(
         .map_err(|e| CoreError::External(format!("unsealing registry credential: {e}")))
 }
 
+/// Mints a GitHub App installation token for a linked project. The token
+/// lives for one deployment: it goes to the agent with the request and is
+/// never stored here.
+async fn github_app_credentials(
+    db: &PgPool,
+    github: &GitHubApps,
+    project: &panel_core::types::ComposeProject,
+) -> CoreResult<Option<GitHttpCredentials>> {
+    let access = db::compose_projects::git_access(db, project.id)
+        .await
+        .map_err(|e| CoreError::External(format!("loading Git access: {e}")))?;
+    let (Some(app_id), Some(installation_id)) =
+        (access.github_app_id, access.github_installation_id)
+    else {
+        return Ok(None);
+    };
+    let repository = project
+        .source
+        .git_checkout()
+        .and_then(|(url, _)| github_app::github_repository(url))
+        .ok_or_else(|| {
+            CoreError::Validation(
+                "GitHub App tokens need an https://github.com/<owner>/<repo> remote".into(),
+            )
+        })?;
+    let app = db::github_apps::find_sealed(db, app_id)
+        .await
+        .map_err(|e| CoreError::External(format!("loading GitHub App: {e}")))?
+        .ok_or_else(|| CoreError::NotFound("the project's GitHub App no longer exists".into()))?;
+    let token = github
+        .installation_token(&app, installation_id, &repository)
+        .await
+        .map_err(|e| CoreError::External(format!("GitHub App installation token: {e}")))?;
+    Ok(Some(GitHttpCredentials {
+        username: github_app::TOKEN_USERNAME.into(),
+        token,
+    }))
+}
+
 /// Truncates on a character boundary (slicing bytes could panic).
 fn truncate(message: &str, max: usize) -> &str {
     match message.char_indices().nth(max) {
@@ -272,7 +320,7 @@ mod tests {
     use panel_core::adapters::mock::MockAdapter;
     use panel_core::types::ComposeSource;
 
-    use crate::test_support::QUEUE_TESTS;
+    use crate::test_support::{self, QUEUE_TESTS};
 
     use crate::test_support::test_pool;
 
@@ -340,7 +388,14 @@ mod tests {
         // The second job must wait while the first one runs.
         assert!(claim_for(&pool, project.id).await.is_none());
 
-        run_job(&pool, &MockAdapter::new(), &test_secrets(), claimed).await;
+        run_job(
+            &pool,
+            &MockAdapter::new(),
+            &test_secrets(),
+            &test_support::github_apps(),
+            claimed,
+        )
+        .await;
         let done = compose_projects::find_deployment(&pool, project.id, first.id)
             .await
             .unwrap()
@@ -358,6 +413,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_app_tokens_are_minted_per_deployment_and_never_stored() {
+        use crate::services::github_app::{tests::mock_github, TEST_KEY_PKCS1};
+        use crate::services::secret_box::SecretBox;
+
+        let _serial = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let owner = test_support::user(&pool, true).await;
+        let slug = format!("gh{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let project = compose_projects::create(
+            &pool,
+            Uuid::new_v4(),
+            "Private",
+            &slug,
+            owner.id,
+            None,
+            &ComposeSource::Git {
+                repository_url: "https://github.com/acme/private-shop.git".into(),
+                branch: "main".into(),
+                compose_path: "docker-compose.yml".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let github =
+            GitHubApps::with_api_base(SecretBox::derive(&[42u8; 32]), &mock_github(99).await);
+        let app = Uuid::new_v4();
+        let sealed = github.seal_private_key(app, TEST_KEY_PKCS1);
+        db::github_apps::create(&pool, app, &format!("app-{slug}"), 1234, &sealed, owner.id)
+            .await
+            .unwrap();
+        compose_projects::set_github_app(&pool, project.id, Some((app, 99)))
+            .await
+            .unwrap();
+
+        let queue = DeployQueue::new();
+        let queued = queue
+            .enqueue(&pool, project.id, &project.slug, false, "manual")
+            .await
+            .unwrap();
+        let job = claim_for(&pool, project.id).await.unwrap();
+        let adapter = MockAdapter::new();
+        run_job(&pool, &adapter, &test_secrets(), &github, job).await;
+        let sent = adapter
+            .deploys
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("agent was called");
+        let credentials = sent
+            .git_credentials
+            .clone()
+            .expect("token sent with the job");
+        assert_eq!(credentials.username, "x-access-token");
+        assert_eq!(credentials.token, "ghs_minted_for_private-shop");
+        assert!(
+            !format!("{sent:?}").contains("ghs_"),
+            "Debug must mask the token"
+        );
+        for table in ["compose_deployments", "compose_projects", "audit_log"] {
+            let rows: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT row_to_json(t)::text FROM {table} t"))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(rows.iter().all(|r| !r.contains("ghs_minted")), "{table}");
+        }
+        let done = compose_projects::find_deployment(&pool, project.id, queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, DeploymentStatus::Succeeded);
+
+        // An installation GitHub refuses fails the job before the agent runs.
+        compose_projects::set_github_app(&pool, project.id, Some((app, 98)))
+            .await
+            .unwrap();
+        let queued = queue
+            .enqueue(&pool, project.id, &project.slug, false, "manual")
+            .await
+            .unwrap();
+        let job = claim_for(&pool, project.id).await.unwrap();
+        let adapter = MockAdapter::new();
+        run_job(&pool, &adapter, &test_secrets(), &github, job).await;
+        assert!(adapter.deploys.lock().unwrap().is_empty());
+        let failed = compose_projects::find_deployment(&pool, project.id, queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, DeploymentStatus::Failed);
+        let message = failed.error_message.unwrap();
+        assert!(
+            message.contains("GitHub App installation token") && message.contains("HTTP 404"),
+            "{message}"
+        );
+
+        compose_projects::set_github_app(&pool, project.id, None)
+            .await
+            .unwrap();
+        db::github_apps::delete(&pool, app).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_agent_call_marks_deployment_and_project_failed() {
         let _serial = QUEUE_TESTS.lock().await;
         let pool = test_pool().await;
@@ -370,7 +527,14 @@ mod tests {
         let job = claim_for(&pool, project.id).await.unwrap();
         let adapter = MockAdapter::new();
         adapter.fail_next_call("deploy_compose_project");
-        run_job(&pool, &adapter, &test_secrets(), job).await;
+        run_job(
+            &pool,
+            &adapter,
+            &test_secrets(),
+            &test_support::github_apps(),
+            job,
+        )
+        .await;
 
         let failed = compose_projects::find_deployment(&pool, project.id, queued.id)
             .await
@@ -416,7 +580,7 @@ mod tests {
             if fail {
                 adapter.fail_next_call("deploy_compose_project");
             }
-            run_job(&pool, &adapter, &secrets, job).await;
+            run_job(&pool, &adapter, &secrets, &test_support::github_apps(), job).await;
             assert_eq!(
                 *adapter.calls.lock().unwrap(),
                 [
@@ -440,7 +604,14 @@ mod tests {
             .unwrap();
         let job = claim_for(&pool, project.id).await.unwrap();
         let adapter = MockAdapter::new();
-        run_job(&pool, &adapter, &test_secrets(), job).await;
+        run_job(
+            &pool,
+            &adapter,
+            &test_secrets(),
+            &test_support::github_apps(),
+            job,
+        )
+        .await;
         assert_eq!(
             *adapter.calls.lock().unwrap(),
             ["write_compose_environment", "deploy_compose_project"]
@@ -462,7 +633,14 @@ mod tests {
             "deploy_compose_project",
             CoreError::Cancelled("deployment cancelled".into()),
         );
-        run_job(&pool, &adapter, &test_secrets(), job).await;
+        run_job(
+            &pool,
+            &adapter,
+            &test_secrets(),
+            &test_support::github_apps(),
+            job,
+        )
+        .await;
         let cancelled = compose_projects::find_deployment(&pool, project.id, queued.id)
             .await
             .unwrap()
@@ -555,7 +733,7 @@ mod tests {
             .unwrap();
         let job = claim_for(&pool, project.id).await.unwrap();
         let adapter = MockAdapter::new();
-        run_job(&pool, &adapter, &secrets, job).await;
+        run_job(&pool, &adapter, &secrets, &test_support::github_apps(), job).await;
 
         let calls = adapter.calls.lock().unwrap().clone();
         assert_eq!(
@@ -605,7 +783,14 @@ mod tests {
             .unwrap();
         let job = claim_for(&pool, project.id).await.unwrap();
         let adapter = MockAdapter::new();
-        run_job(&pool, &adapter, &test_secrets(), job).await;
+        run_job(
+            &pool,
+            &adapter,
+            &test_secrets(),
+            &test_support::github_apps(),
+            job,
+        )
+        .await;
         assert_eq!(
             adapter.calls.lock().unwrap().clone(),
             vec!["deploy_compose_project"]
