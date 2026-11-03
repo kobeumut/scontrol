@@ -107,6 +107,13 @@ pub struct DeployComposeProjectParams {
     /// Let's Encrypt account email, required when any binding has `https`.
     #[serde(default)]
     pub acme_email: Option<String>,
+    /// Short-lived HTTPS credentials for this deployment only, e.g. a GitHub
+    /// App installation token minted by panel-api when the job starts. They
+    /// take precedence over a stored token, are masked in the deployment log,
+    /// and are deleted from the agent when the deployment ends. They are
+    /// never part of a queue row.
+    #[serde(default)]
+    pub git_credentials: Option<GitHttpCredentials>,
 }
 
 /// Replaces a project's write-only environment file. Sent separately from
@@ -297,6 +304,10 @@ pub struct AgentCapabilities {
     pub mail: bool,
     pub antivirus: bool,
     pub version: String,
+    /// Image builders the agent was compiled with (`builders` feature) and
+    /// found installed. Empty for older agents.
+    #[serde(default)]
+    pub build_tools: Vec<BuildTool>,
 }
 
 /// Boundary trait between panel-api business logic and privileged host
@@ -385,6 +396,9 @@ pub mod mock {
         /// Every `write_compose_environment` request, so tests can check
         /// what reached the agent (only tests ever see these values).
         pub environment_writes: Mutex<Vec<WriteComposeEnvironmentParams>>,
+        /// Every deployment request received, for tests that inspect what
+        /// panel-api sent the agent.
+        pub deploys: Mutex<Vec<DeployComposeProjectParams>>,
     }
 
     impl MockAdapter {
@@ -423,6 +437,7 @@ pub mod mock {
                 mail: true,
                 antivirus: true,
                 version: "mock".into(),
+                build_tools: BuildTool::ALL.to_vec(),
             })
         }
 
@@ -515,6 +530,7 @@ pub mod mock {
             params: DeployComposeProjectParams,
         ) -> CoreResult<ComposeDeployOutcome> {
             self.record("deploy_compose_project")?;
+            self.deploys.lock().unwrap().push(params.clone());
             Ok(ComposeDeployOutcome {
                 services: vec![ComposeServiceInfo {
                     name: params.project_slug,

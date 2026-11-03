@@ -4,6 +4,7 @@ pub mod compose_projects;
 pub mod cron;
 pub mod databases;
 pub mod firewall;
+pub mod github_apps;
 pub mod health;
 pub mod mcp;
 pub mod notifications;
@@ -29,6 +30,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/compose-projects", compose_projects::router())
         .nest("/api/notifications", notifications::router())
         .nest("/api/registries", registries::router())
+        .nest("/api/github-apps", github_apps::router())
         .nest("/api/firewall", firewall::router())
         .nest("/api/tls", tls::router())
         .nest("/api/webhooks", webhooks::router())

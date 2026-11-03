@@ -1,5 +1,7 @@
 #[cfg(feature = "antivirus")]
 pub mod antivirus;
+#[cfg(feature = "builders")]
+pub mod builders;
 #[cfg(feature = "docker")]
 pub mod compose;
 pub mod cron;
@@ -45,6 +47,15 @@ impl LocalAdapter {
         }
     }
 
+    /// Builders compiled in and present on `PATH` (no process is spawned).
+    fn build_tools(&self) -> Vec<BuildTool> {
+        #[cfg(feature = "builders")]
+        if self.config.docker_enabled() {
+            return builders::available();
+        }
+        Vec::new()
+    }
+
     fn feature_disabled(name: &str) -> CoreError {
         CoreError::PermissionDenied(format!(
             "the '{name}' optional feature was not selected at install time"
@@ -60,6 +71,7 @@ impl AdapterPort for LocalAdapter {
             mail: self.config.mail_enabled(),
             antivirus: self.config.antivirus_enabled(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build_tools: self.build_tools(),
         })
     }
 

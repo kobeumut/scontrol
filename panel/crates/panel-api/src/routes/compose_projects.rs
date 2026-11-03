@@ -11,7 +11,8 @@
 //! worker merges project → environment → service layers and writes the
 //! result to the agent right before each deployment.
 //! Git HTTPS tokens follow the same rule, and a deploy key's private half
-//! never leaves the agent.
+//! never leaves the agent. A linked GitHub App installation stores only the
+//! App and installation IDs; tokens are minted per deployment.
 
 use crate::auth::AdminUser;
 use crate::db;
@@ -69,6 +70,10 @@ pub fn router() -> Router<AppState> {
             get(project_registry).put(set_project_registry),
         )
         .route(
+            "/:id/git-access/github-app",
+            put(link_github_app).delete(unlink_github_app),
+        )
+        .route(
             "/:id/webhook",
             get(webhook_status)
                 .post(rotate_webhook)
@@ -114,6 +119,9 @@ struct CreateProjectBody {
     /// Write-only HTTPS token for a private Git remote.
     #[serde(default)]
     git_credentials: Option<GitHttpCredentials>,
+    /// GitHub App installation that mints a token per deployment.
+    #[serde(default)]
+    github_app: Option<GitHubAppLinkBody>,
     #[serde(default)]
     pull_images: bool,
     /// Private registry to pull images with (see `/api/registries`).
@@ -161,6 +169,9 @@ async fn create(
             return Err(ApiError::BadRequest("registry not found".into()));
         }
     }
+    if let Some(link) = &body.github_app {
+        check_github_app_link(&state, &body.source, link).await?;
+    }
     let project = db::compose_projects::create(
         &state.db,
         Uuid::new_v4(),
@@ -189,6 +200,15 @@ async fn create(
         prepared = db::registries::set_project_registry(&state.db, project.id, body.registry_id)
             .await
             .map_err(ApiError::from);
+    }
+    if let (Ok(()), Some(link)) = (&prepared, &body.github_app) {
+        prepared = db::compose_projects::set_github_app(
+            &state.db,
+            project.id,
+            Some((link.github_app_id, link.installation_id)),
+        )
+        .await
+        .map_err(Into::into);
     }
     if let Err(error) = prepared {
         // Removes whatever the agent already wrote under the slug.
@@ -922,6 +942,24 @@ struct GitAccess {
     /// Host a write-only HTTPS token was saved for. The token itself is
     /// never returned.
     token_host: Option<String>,
+    /// Linked GitHub App installation, if any.
+    github_app: Option<GitHubAppLink>,
+}
+
+#[derive(Serialize)]
+struct GitHubAppLink {
+    id: Uuid,
+    name: String,
+    app_id: i64,
+    installation_id: i64,
+}
+
+#[derive(Deserialize)]
+struct GitHubAppLinkBody {
+    github_app_id: Uuid,
+    /// From the installation's settings URL
+    /// (`github.com/settings/installations/<id>`).
+    installation_id: i64,
 }
 
 async fn git_access(
@@ -939,6 +977,17 @@ async fn git_access_of(state: &AppState, project: &ComposeProject) -> ApiResult<
         .git_checkout()
         .and_then(|(repository_url, _)| validate::git_remote(repository_url));
     let record = db::compose_projects::git_access(&state.db, project.id).await?;
+    let github_app = match (record.github_app_id, record.github_installation_id) {
+        (Some(app_id), Some(installation_id)) => db::github_apps::find(&state.db, app_id)
+            .await?
+            .map(|app| GitHubAppLink {
+                id: app.id,
+                name: app.name,
+                app_id: app.app_id,
+                installation_id,
+            }),
+        _ => None,
+    };
     Ok(GitAccess {
         transport: remote.as_ref().map(|(transport, _)| match transport {
             GitTransport::Ssh => "ssh",
@@ -947,7 +996,88 @@ async fn git_access_of(state: &AppState, project: &ComposeProject) -> ApiResult<
         host: remote.map(|(_, host)| host),
         deploy_public_key: record.deploy_public_key,
         token_host: record.git_token_host,
+        github_app,
     })
+}
+
+/// A GitHub App link needs a registered App, a positive installation ID,
+/// and an `https://github.com/<owner>/<repo>` remote.
+async fn check_github_app_link(
+    state: &AppState,
+    source: &ComposeSource,
+    link: &GitHubAppLinkBody,
+) -> ApiResult<()> {
+    let repository = source
+        .git_checkout()
+        .and_then(|(url, _)| crate::services::github_app::github_repository(url));
+    if repository.is_none() {
+        return Err(ApiError::BadRequest(
+            "GitHub Apps need an https://github.com/<owner>/<repo> remote".into(),
+        ));
+    }
+    if link.installation_id <= 0 {
+        return Err(ApiError::BadRequest("invalid installation ID".into()));
+    }
+    if db::github_apps::find(&state.db, link.github_app_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::BadRequest("unknown GitHub App".into()));
+    }
+    Ok(())
+}
+
+/// Links a GitHub App installation. Deployments then mint a short-lived,
+/// repository-scoped token instead of using a stored one.
+async fn link_github_app(
+    AdminUser(user): AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(link): Json<GitHubAppLinkBody>,
+) -> ApiResult<Json<GitAccess>> {
+    let project = find_project(&state, id).await?;
+    check_github_app_link(&state, &project.source, &link).await?;
+    db::compose_projects::set_github_app(
+        &state.db,
+        id,
+        Some((link.github_app_id, link.installation_id)),
+    )
+    .await?;
+    db::audit::record(
+        &state.db,
+        Some(user.id),
+        "user",
+        "link_compose_github_app",
+        Some(&project.slug),
+        serde_json::json!({
+            "project_id": id,
+            "github_app_id": link.github_app_id,
+            "installation_id": link.installation_id,
+        }),
+    )
+    .await
+    .ok();
+    git_access_of(&state, &project).await.map(Json)
+}
+
+async fn unlink_github_app(
+    AdminUser(user): AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let project = find_project(&state, id).await?;
+    db::compose_projects::set_github_app(&state.db, id, None).await?;
+    db::audit::record(
+        &state.db,
+        Some(user.id),
+        "user",
+        "unlink_compose_github_app",
+        Some(&project.slug),
+        serde_json::json!({ "project_id": id }),
+    )
+    .await
+    .ok();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Creates the project's SSH deploy key, or replaces it: the old key stops
@@ -1226,6 +1356,9 @@ fn validate_source(source: &ComposeSource) -> ApiResult<()> {
             !compose_yaml.is_empty() && compose_yaml.len() <= 512 * 1024
         }
         ComposeSource::Application(spec) => {
+            return spec.validate().map_err(ApiError::BadRequest);
+        }
+        ComposeSource::Static(spec) => {
             return spec.validate().map_err(ApiError::BadRequest);
         }
     };
@@ -1682,6 +1815,234 @@ mod tests {
         // Create, replace, remove.
         assert_eq!(count("write_git_credentials"), 3, "{calls:?}");
         assert_eq!(count("generate_deploy_key"), 1, "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn github_apps_are_write_only_and_link_only_github_https_remotes() {
+        let pool = test_support::test_pool().await;
+        let adapter = Arc::new(MockAdapter::new());
+        let state = test_support::app_state(pool.clone(), adapter.clone());
+        let admin = test_support::user(&pool, true).await;
+        let cookie = test_support::session_cookie(&state, admin.id).await;
+        let router = crate::routes::build_router(state);
+        let unique = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let key = crate::services::github_app::TEST_KEY_PKCS1;
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/github-apps",
+            Some(json!({ "name": "bad", "app_id": 1, "private_key": "ghp_not_a_pem" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/github-apps",
+            Some(
+                json!({ "name": format!("deployer-{unique}"), "app_id": 4242, "private_key": key }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            !body.contains("PRIVATE KEY") && !body.contains("private_key"),
+            "{body}"
+        );
+        let app: Value = serde_json::from_str(&body).unwrap();
+        let app_id = app["id"].as_str().unwrap().to_string();
+        let (_, listed) = call(&router, &cookie, Method::GET, "/api/github-apps", None).await;
+        assert!(listed.contains(&app_id) && !listed.contains("PRIVATE KEY"));
+        // The key is sealed at rest and appears in no other table.
+        let sealed: Vec<u8> =
+            sqlx::query_scalar("SELECT private_key_sealed FROM github_apps WHERE id = $1::uuid")
+                .bind(&app_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!String::from_utf8_lossy(&sealed).contains("PRIVATE KEY"));
+        let audit: Vec<String> = sqlx::query_scalar("SELECT row_to_json(a)::text FROM audit_log a")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(audit.iter().all(|row| !row.contains("PRIVATE KEY")));
+
+        let create = |slug: String, url: &str| {
+            json!({
+                "name": "Private", "slug": slug, "deploy": false,
+                "source": { "kind": "git", "repository_url": url, "branch": "main",
+                            "compose_path": "docker-compose.yml" },
+                "github_app": { "github_app_id": app_id, "installation_id": 77 },
+            })
+        };
+        // SSH and non-GitHub remotes cannot use an App token.
+        for url in [
+            "git@github.com:acme/app.git",
+            "https://gitlab.com/acme/app.git",
+        ] {
+            let (status, body) = call(
+                &router,
+                &cookie,
+                Method::POST,
+                "/api/compose-projects",
+                Some(create(format!("ghx{unique}"), url)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+        }
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/compose-projects",
+            Some(create(
+                format!("gh{unique}"),
+                "https://github.com/acme/app.git",
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["project"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, body) = call(
+            &router,
+            &cookie,
+            Method::GET,
+            &format!("/api/compose-projects/{id}/git-access"),
+            None,
+        )
+        .await;
+        let access: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(access["github_app"]["id"], app_id.as_str());
+        assert_eq!(access["github_app"]["installation_id"], 77);
+        assert_eq!(access["github_app"]["app_id"], 4242);
+
+        // An App in use cannot be deleted; unlink first.
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::DELETE,
+            &format!("/api/github-apps/{app_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains(&format!("gh{unique}")));
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::PUT,
+            &format!("/api/compose-projects/{id}/git-access/github-app"),
+            Some(json!({ "github_app_id": app_id, "installation_id": 0 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::DELETE,
+            &format!("/api/compose-projects/{id}/git-access/github-app"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::DELETE,
+            &format!("/api/github-apps/{app_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn static_sites_and_builder_apps_are_validated_sources() {
+        let pool = test_support::test_pool().await;
+        let adapter = Arc::new(MockAdapter::new());
+        let state = test_support::app_state(pool.clone(), adapter.clone());
+        let admin = test_support::user(&pool, true).await;
+        let cookie = test_support::session_cookie(&state, admin.id).await;
+        let router = crate::routes::build_router(state);
+        let slug = |p: &str| format!("{p}{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let repo = "https://github.com/acme/site.git";
+
+        for bad in [
+            json!({ "kind": "static", "repository_url": repo, "branch": "main", "publish_path": "../.." }),
+            json!({ "kind": "static", "repository_url": repo, "branch": "main", "publish_path": "/etc" }),
+            json!({ "kind": "static", "repository_url": repo, "branch": "main",
+                    "build": { "image": "node --privileged", "commands": [["npm", "ci"]] } }),
+            json!({ "kind": "static", "repository_url": repo, "branch": "main",
+                    "build": { "image": "node:22", "commands": [] } }),
+            json!({ "kind": "application", "build": { "type": "builder", "builder": "nixpacks",
+                    "repository_url": repo, "branch": "main", "context_path": "../x" } }),
+            json!({ "kind": "application", "build": { "type": "builder", "builder": "make",
+                    "repository_url": repo, "branch": "main" } }),
+        ] {
+            let (status, body) = call(
+                &router,
+                &cookie,
+                Method::POST,
+                "/api/compose-projects",
+                Some(json!({ "name": "Bad", "slug": slug("bad"), "source": bad })),
+            )
+            .await;
+            assert!(status.is_client_error(), "{status}: {body}");
+        }
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/compose-projects",
+            Some(json!({
+                "name": "Docs", "slug": slug("docs"),
+                "source": { "kind": "static", "repository_url": repo, "branch": "main",
+                            "publish_path": "dist", "spa": true,
+                            "build": { "image": "node:22-alpine",
+                                       "commands": [["npm", "ci"], ["npm", "run", "build"]] } },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let created: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["project"]["source"]["kind"], "static");
+        assert_eq!(created["project"]["source"]["publish_path"], "dist");
+        assert!(created["deployment"]["id"].is_string());
+        // Static sites deploy from Git, so webhooks apply.
+        let id = created["project"]["id"].as_str().unwrap();
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            &format!("/api/compose-projects/{id}/webhook"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/compose-projects",
+            Some(json!({
+                "name": "Api", "slug": slug("api"),
+                "source": { "kind": "application", "container_port": 3000,
+                            "build": { "type": "builder", "builder": "railpack",
+                                       "repository_url": repo, "branch": "main" } },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let created: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["project"]["source"]["build"]["context_path"], ".");
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { RegistrySelect } from './Registries';
 import {
-  api, ApiState, ApplicationBuild, ApplicationSpec, ComposeProject, ComposeSource, Deployment, Domain, duration,
-  formatTime, GitAccess, gitCheckout, gitTransport, isActive, LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, useApi,
+  api, ApiState, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
+  Deployment, Domain, duration, formatTime, GitAccess, gitCheckout, GitHubApp, gitTransport, isActive, isGitHubHttps,
+  LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
 } from './api';
 import { LayeredVariables } from './Variables';
 
@@ -50,10 +51,11 @@ function EnvEditor({ rows, onChange }: { rows: EnvRow[]; onChange: (rows: EnvRow
 
 const toPairs = (rows: EnvRow[]) => rows.filter((r) => r.key.trim()).map((r) => [r.key.trim(), r.value]);
 
-export function ComposeProjects() {
+/** Builders the agent reports as installed; `undefined` while unknown. */
+export function ComposeProjects({ buildTools }: { buildTools?: BuildTool[] }) {
   const [openId, setOpenId] = useState<string | null>(null);
   if (openId) return <ProjectDetail id={openId} onBack={() => setOpenId(null)} />;
-  return <ProjectList onOpen={setOpenId} />;
+  return <ProjectList onOpen={setOpenId} buildTools={buildTools} />;
 }
 
 /** `Project / environment` label of every environment, by environment id. */
@@ -63,7 +65,7 @@ function environmentLabels(projects?: Project[]): Map<string, string> {
   return labels;
 }
 
-function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
+function ProjectList({ onOpen, buildTools }: { onOpen: (id: string) => void; buildTools?: BuildTool[] }) {
   const projects = useApi<ComposeProject[]>('/compose-projects', 5000);
   const groups = useApi<Project[]>('/projects');
   const labels = environmentLabels(groups.data);
@@ -74,8 +76,8 @@ function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
       <h2>Compose projects</h2>
       <button className="action" onClick={() => setCreating((c) => !c)}>{creating ? 'Close' : 'New project'}</button>
     </div>
-    <p className="hint">Compose projects (Git or raw) and single-service applications (image or Dockerfile) with a durable queue, write-only environment and streamed logs.</p>
-    {creating && <CreateProjectForm projects={groups.data} onCreated={(id) => { setCreating(false); onOpen(id); }} />}
+    <p className="hint">Compose projects (Git or raw), single-service applications (image, Dockerfile, or an automatic builder) and static sites served by Nginx, with a durable queue, write-only environment and streamed logs.</p>
+    {creating && <CreateProjectForm projects={groups.data} buildTools={buildTools} onCreated={(id) => { setCreating(false); onOpen(id); }} />}
     <StateView state={projects} />
     {projects.data && <table><thead><tr><th>Project</th><th>Slug</th><th>Environment</th><th>Source</th><th>Status</th></tr></thead><tbody>
       {projects.data.length === 0
@@ -93,7 +95,7 @@ function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
 
 const SAMPLE_COMPOSE = 'services:\n  web:\n    image: traefik/whoami:v1.10\n';
 
-function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCreated: (id: string) => void }) {
+function CreateProjectForm({ projects, buildTools, onCreated }: { projects?: Project[]; buildTools?: BuildTool[]; onCreated: (id: string) => void }) {
   const [name, setName] = useState('');
   // Empty: the owner's Default project, production environment.
   const [environmentId, setEnvironmentId] = useState('');
@@ -106,6 +108,10 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
   const [image, setImage] = useState('');
   const [contextPath, setContextPath] = useState('.');
   const [dockerfilePath, setDockerfilePath] = useState('Dockerfile');
+  const [builder, setBuilder] = useState<BuildTool>(buildTools?.[0] ?? 'nixpacks');
+  const [site, setSite] = useState<StaticSettings>(DEFAULT_STATIC);
+  const [githubApp, setGithubApp] = useState('');
+  const [installationId, setInstallationId] = useState('');
   const [app, setApp] = useState<AppSettings>(DEFAULT_APP);
   const [env, setEnv] = useState<EnvRow[]>([]);
   const [tokenUser, setTokenUser] = useState('x-access-token');
@@ -113,8 +119,10 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
   const [registryId, setRegistryId] = useState('');
   const [deployNow, setDeployNow] = useState<boolean>();
   const action = useAction();
-  const fromGit = kind === 'git' || kind === 'dockerfile';
+  const fromGit = kind !== 'raw' && kind !== 'image';
   const transport = fromGit ? gitTransport(repo.trim()) : null;
+  const canUseApp = fromGit && isGitHubHttps(repo);
+  const useApp = canUseApp && githubApp !== '';
   // A private SSH repository needs its deploy key registered first, and the
   // key exists only once the project does.
   const deploy = deployNow ?? transport !== 'ssh';
@@ -122,22 +130,36 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
   const submit = (event: FormEvent) => {
     event.preventDefault();
     let source: ComposeSource;
-    if (kind === 'git') source = { kind, repository_url: repo.trim(), branch: branch.trim(), compose_path: composePath.trim() };
+    const git = { repository_url: repo.trim(), branch: branch.trim() };
+    if (kind === 'git') source = { kind, ...git, compose_path: composePath.trim() };
     else if (kind === 'raw') source = { kind, compose_yaml: yaml };
-    else {
-      const spec = toApplicationSpec(app, kind === 'image'
+    else if (kind === 'static') {
+      const spec = toStaticSpec(site, git);
+      if (typeof spec === 'string') { action.fail(spec); return; }
+      source = { kind: 'static', ...spec };
+    } else {
+      const build: ApplicationBuild = kind === 'image'
         ? { type: 'image', image: image.trim() }
-        : { type: 'dockerfile', repository_url: repo.trim(), branch: branch.trim(), context_path: contextPath.trim() || '.', dockerfile_path: dockerfilePath.trim() || 'Dockerfile' });
+        : kind === 'builder'
+          ? { type: 'builder', builder, ...git, context_path: contextPath.trim() || '.' }
+          : { type: 'dockerfile', ...git, context_path: contextPath.trim() || '.', dockerfile_path: dockerfilePath.trim() || 'Dockerfile' };
+      const spec = toApplicationSpec(app, build);
       if (typeof spec === 'string') { action.fail(spec); return; }
       source = { kind: 'application', ...spec };
     }
-    const git_credentials = transport === 'https' && token ? { username: tokenUser.trim(), token } : undefined;
+    let github_app: { github_app_id: string; installation_id: number } | undefined;
+    if (useApp) {
+      const id = Number(installationId);
+      if (!Number.isInteger(id) || id < 1) { action.fail('Installation ID is the number at the end of the installation settings URL.'); return; }
+      github_app = { github_app_id: githubApp, installation_id: id };
+    }
+    const git_credentials = transport === 'https' && token && !useApp ? { username: tokenUser.trim(), token } : undefined;
     action.run(async () => {
       const created = await api<{ project: ComposeProject }>('/compose-projects', {
         method: 'POST',
         body: {
           name: name.trim(), slug: slug.trim(), environment_id: environmentId || undefined, source,
-          environment: toPairs(env), git_credentials, deploy, registry_id: registryId || undefined,
+          environment: toPairs(env), git_credentials, github_app, deploy, registry_id: registryId || undefined,
         },
       });
       setToken('');
@@ -165,17 +187,31 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
     {fromGit && <div className="grid3">
       <label>Repository URL<input required placeholder="https://github.com/org/app.git or git@github.com:org/app.git" value={repo} onChange={(e) => setRepo(e.target.value)} /></label>
       <label>Branch<input required value={branch} onChange={(e) => setBranch(e.target.value)} /></label>
-      {kind === 'git'
-        ? <label>Compose path<input required className="mono" value={composePath} onChange={(e) => setComposePath(e.target.value)} /></label>
-        : <div className="grid2">
-          <label>Build context<input required className="mono" value={contextPath} onChange={(e) => setContextPath(e.target.value)} /></label>
-          <label>Dockerfile<input required className="mono" value={dockerfilePath} onChange={(e) => setDockerfilePath(e.target.value)} /></label>
-        </div>}
+      {kind === 'git' && <label>Compose path<input required className="mono" value={composePath} onChange={(e) => setComposePath(e.target.value)} /></label>}
+      {kind === 'dockerfile' && <div className="grid2">
+        <label>Build context<input required className="mono" value={contextPath} onChange={(e) => setContextPath(e.target.value)} /></label>
+        <label>Dockerfile<input required className="mono" value={dockerfilePath} onChange={(e) => setDockerfilePath(e.target.value)} /></label>
+      </div>}
+      {kind === 'builder' && <div className="grid2">
+        <label>Builder<select value={builder} onChange={(e) => setBuilder(e.target.value as BuildTool)}>
+          {(Object.keys(BUILD_TOOL_LABELS) as BuildTool[]).map((tool) => <option key={tool} value={tool}>
+            {BUILD_TOOL_LABELS[tool]}{buildTools && !buildTools.includes(tool) ? ' (not installed)' : ''}</option>)}
+        </select></label>
+        <label>App directory<input required className="mono" value={contextPath} onChange={(e) => setContextPath(e.target.value)} /></label>
+      </div>}
+      {kind === 'static' && <label>Publish directory<input required className="mono" value={site.publishPath}
+        onChange={(e) => setSite({ ...site, publishPath: e.target.value })} /></label>}
     </div>}
+    {kind === 'builder' && <p className="hint">{buildTools && !buildTools.includes(builder)
+      ? <span className="error">{BUILD_TOOL_LABELS[builder]} is not installed on this server; re-run the installer and enable application builders.</span>
+      : <>The builder detects the language and builds an image without a Dockerfile. Build-time variables are not passed (they would be visible in the process list); the environment reaches the running container.</>}</p>}
+    {kind === 'static' && <StaticFields value={site} onChange={setSite} />}
     {kind === 'raw' && <label>Compose YAML<textarea required rows={8} className="mono" value={yaml} onChange={(e) => setYaml(e.target.value)} /></label>}
     {kind === 'image' && <label>Image<input required className="mono" placeholder="ghcr.io/org/app:1.0" value={image} onChange={(e) => setImage(e.target.value)} /></label>}
-    {(kind === 'image' || kind === 'dockerfile') && <ApplicationFields value={app} onChange={setApp} />}
-    {transport === 'https' && <fieldset><legend>Private repository token (optional, write-only)</legend>
+    {(kind === 'image' || kind === 'dockerfile' || kind === 'builder') && <ApplicationFields value={app} onChange={setApp} />}
+    {canUseApp && <GitHubAppPicker app={githubApp} installation={installationId}
+      onApp={setGithubApp} onInstallation={setInstallationId} />}
+    {transport === 'https' && !useApp && <fieldset><legend>Private repository token (optional, write-only)</legend>
       <div className="grid2">
         <label>Username<input className="mono" value={tokenUser} onChange={(e) => setTokenUser(e.target.value)} /></label>
         <label>Token<input type="password" autoComplete="off" placeholder="leave empty for a public repository" value={token}
@@ -194,11 +230,65 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
   </form>;
 }
 
-type SourceChoice = 'git' | 'raw' | 'image' | 'dockerfile';
+type SourceChoice = 'git' | 'raw' | 'image' | 'dockerfile' | 'builder' | 'static';
 
 const SOURCE_CHOICES: [SourceChoice, string][] = [
   ['git', 'Compose from Git'], ['raw', 'Raw Compose'], ['image', 'App: image'], ['dockerfile', 'App: Dockerfile'],
+  ['builder', 'App: Nixpacks / Railpack / Buildpacks'], ['static', 'Static site'],
 ];
+
+/** Pick a registered GitHub App for a github.com HTTPS remote. */
+function GitHubAppPicker({ app, installation, onApp, onInstallation }: {
+  app: string; installation: string; onApp: (id: string) => void; onInstallation: (id: string) => void;
+}) {
+  const apps = useApi<GitHubApp[]>('/github-apps');
+  return <fieldset><legend>GitHub App (optional)</legend>
+    <StateView state={apps} />
+    {apps.data && (apps.data.length === 0
+      ? <p className="hint">No GitHub App registered. Add one under the GitHub Apps tab to deploy private repositories with short-lived tokens.</p>
+      : <div className="grid2">
+        <label>App<select value={app} onChange={(e) => onApp(e.target.value)}>
+          <option value="">none (public repository or a stored token)</option>
+          {apps.data.map((a) => <option key={a.id} value={a.id}>{a.name} (App ID {a.app_id})</option>)}
+        </select></label>
+        {app && <label>Installation ID<input required inputMode="numeric" className="mono" placeholder="12345678" value={installation}
+          onChange={(e) => onInstallation(e.target.value)} /></label>}
+      </div>)}
+    {app && <p className="hint">Each deployment mints a one-hour token limited to this repository with read-only contents access. The installation ID is the number in <span className="mono">github.com/settings/installations/&lt;id&gt;</span>.</p>}
+  </fieldset>;
+}
+
+type StaticSettings = { publishPath: string; spa: boolean; buildImage: string; buildCommands: string };
+
+const DEFAULT_STATIC: StaticSettings = { publishPath: 'dist', spa: false, buildImage: '', buildCommands: '' };
+
+/** Builds the static-site spec from form fields, or returns a message to show. */
+function toStaticSpec(site: StaticSettings, git: { repository_url: string; branch: string }): StaticSiteSpec | string {
+  // One command per line, arguments split on whitespace; never a shell.
+  const commands = site.buildCommands.split('\n').map((line) => line.trim().split(/\s+/).filter(Boolean)).filter((c) => c.length);
+  const image = site.buildImage.trim();
+  if (commands.length && !image) return 'A build needs a toolchain image, e.g. node:22-alpine.';
+  if (image && !commands.length) return 'Add at least one build command, e.g. npm ci.';
+  return {
+    ...git,
+    publish_path: site.publishPath.trim() || '.',
+    spa: site.spa,
+    build: image ? { image, commands } : null,
+  };
+}
+
+function StaticFields({ value, onChange }: { value: StaticSettings; onChange: (v: StaticSettings) => void }) {
+  return <fieldset><legend>Static site</legend>
+    <div className="grid2">
+      <label>Build image (optional)<input className="mono" placeholder="node:22-alpine" value={value.buildImage}
+        onChange={(e) => onChange({ ...value, buildImage: e.target.value })} /></label>
+      <label>Build commands (one per line, no shell)<textarea rows={3} className="mono" placeholder={'npm ci\nnpm run build'}
+        value={value.buildCommands} onChange={(e) => onChange({ ...value, buildCommands: e.target.value })} /></label>
+    </div>
+    <label className="check"><input type="checkbox" checked={value.spa} onChange={(e) => onChange({ ...value, spa: e.target.checked })} /> single-page app (serve index.html for unknown paths)</label>
+    <p className="hint">Leave the build empty to publish files committed to the repository. Commands run in a throwaway container with the checkout at <span className="mono">/workspace</span>; the environment is available to them. Only regular files are published (symlinks are skipped), and Nginx serves them with no container running.</p>
+  </fieldset>;
+}
 
 type AppSettings = {
   serviceName: string; port: string; restart: RestartPolicy; memoryMb: string; cpus: string;
@@ -267,6 +357,10 @@ function SourceSummary({ source }: { source: ComposeSource }) {
     return <>Git <span className="mono">{source.repository_url}</span> · branch <span className="mono">{source.branch}</span> · <span className="mono">{source.compose_path}</span></>;
   }
   if (source.kind === 'raw') return <>Raw Compose YAML</>;
+  if (source.kind === 'static') {
+    return <>Static site from <span className="mono">{source.repository_url}</span> · branch <span className="mono">{source.branch}</span> · publishes <span className="mono">{source.publish_path}</span>
+      {source.build ? <> · built in <span className="mono">{source.build.image}</span></> : null}{source.spa ? ' · SPA' : ''}</>;
+  }
   const limits = [
     source.container_port ? `port ${source.container_port}` : null,
     source.memory_limit_mb ? `${source.memory_limit_mb} MiB` : null,
@@ -276,6 +370,8 @@ function SourceSummary({ source }: { source: ComposeSource }) {
   const build = source.build;
   return <>Application <span className="mono">{source.service_name}</span> · {build.type === 'image'
     ? <>image <span className="mono">{build.image}</span></>
+    : build.type === 'builder'
+    ? <>{BUILD_TOOL_LABELS[build.builder]} build of <span className="mono">{build.context_path}</span> from <span className="mono">{build.repository_url}</span> · branch <span className="mono">{build.branch}</span></>
     : <>Dockerfile <span className="mono">{build.dockerfile_path}</span> in <span className="mono">{build.context_path}</span> from <span className="mono">{build.repository_url}</span> · branch <span className="mono">{build.branch}</span></>}
     {' · '}{limits}</>;
 }
@@ -288,6 +384,7 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const action = useAction();
 
   const latest = deployments.data?.[0];
+  const isStatic = project.data?.source.kind === 'static';
   const shown = deployments.data?.find((d) => d.id === (selected ?? latest?.id));
 
   const deploy = () => action.run(async () => {
@@ -315,9 +412,9 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <p className="hint"><SourceSummary source={project.data.source} /></p>
       <div className="toolbar">
         <button className="action" disabled={action.busy} onClick={deploy}>Deploy</button>
-        <label className="check"><input type="checkbox" checked={pull} onChange={(e) => setPull(e.target.checked)} /> pull images</label>
+        {!isStatic && <label className="check"><input type="checkbox" checked={pull} onChange={(e) => setPull(e.target.checked)} /> pull images</label>}
         <span className="spacer" />
-        <button className="ghost" disabled={action.busy || project.data.status === 'running'} onClick={stop}>Stop</button>
+        {!isStatic && <button className="ghost" disabled={action.busy || project.data.status === 'running'} onClick={stop}>Stop</button>}
         <button className="ghost danger" disabled={action.busy || project.data.status === 'running'} onClick={remove}>Delete</button>
       </div>
       <ErrorLine error={action.error} />
@@ -329,8 +426,8 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       {shown && <DeploymentLog key={shown.id} projectId={id} deployment={shown} />}
 
       <Services projectId={id} refreshKey={latest?.status} />
-      <ContainerLogs projectId={id} />
-      <Domains projectId={id} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
+      {!isStatic && <ContainerLogs projectId={id} />}
+      <Domains projectId={id} isStatic={isStatic} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
       <LayeredVariables path={`/compose-projects/${id}/variables`} layer="service" title="Variables"
         hint="Write-only. Merged at each deployment: project → environment → this service, the most specific value wins. Stored values are never shown again." />
       <RegistryPanel projectId={id} />
@@ -494,7 +591,9 @@ function ContainerLogs({ projectId }: { projectId: string }) {
   </>;
 }
 
-function Domains({ projectId, onDeploy }: { projectId: string; onDeploy: (deployment: Deployment) => void }) {
+function Domains({ projectId, isStatic, onDeploy }: {
+  projectId: string; isStatic: boolean; onDeploy: (deployment: Deployment) => void;
+}) {
   const domains = useApi<Domain[]>(`/compose-projects/${projectId}/domains`);
   const [domain, setDomain] = useState('');
   const [service, setService] = useState('');
@@ -506,7 +605,11 @@ function Domains({ projectId, onDeploy }: { projectId: string; onDeploy: (deploy
     event.preventDefault();
     action.run(async () => {
       const created = await api<Domain & { deployment?: Deployment }>(`/compose-projects/${projectId}/domains`, {
-        method: 'POST', body: { domain: domain.trim(), service_name: service.trim(), container_port: Number(port), https },
+        method: 'POST',
+        // A static site has one implicit target: its release directory.
+        body: isStatic
+          ? { domain: domain.trim(), service_name: 'static', container_port: 80, https }
+          : { domain: domain.trim(), service_name: service.trim(), container_port: Number(port), https },
       });
       setDomain('');
       domains.reload();
@@ -521,21 +624,23 @@ function Domains({ projectId, onDeploy }: { projectId: string; onDeploy: (deploy
 
   return <>
     <h3>Domains</h3>
-    <p className="hint">Each domain proxies to one service port published on loopback only. Changes queue a redeploy.</p>
+    <p className="hint">{isStatic
+      ? 'Each domain serves the current release directly from Nginx. Changes queue a redeploy.'
+      : 'Each domain proxies to one service port published on loopback only. Changes queue a redeploy.'}</p>
     <StateView state={domains} />
     {domains.data && domains.data.length > 0 && <table><thead><tr><th>Domain</th><th>Target</th><th>Loopback</th><th>HTTPS</th><th /></tr></thead><tbody>
       {domains.data.map((d) => <tr key={d.id}>
         <td><a href={`${d.https ? 'https' : 'http'}://${d.domain}`} target="_blank" rel="noreferrer">{d.domain}</a></td>
-        <td className="mono">{d.service_name}:{d.container_port}</td>
-        <td className="mono">127.0.0.1:{d.host_port}</td>
+        <td className="mono">{isStatic ? 'static files' : `${d.service_name}:${d.container_port}`}</td>
+        <td className="mono">{isStatic ? '—' : `127.0.0.1:${d.host_port}`}</td>
         <td>{d.https ? 'yes' : '—'}</td>
         <td><button className="link danger" disabled={action.busy} onClick={() => remove(d)}>remove</button></td>
       </tr>)}
     </tbody></table>}
     <form className="inline-form" onSubmit={add}>
       <input required aria-label="Domain" placeholder="app.example.com" value={domain} onChange={(e) => setDomain(e.target.value)} />
-      <input required aria-label="Service" placeholder="service" className="mono" value={service} onChange={(e) => setService(e.target.value)} />
-      <input required aria-label="Container port" type="number" min={1} max={65535} className="port" value={port} onChange={(e) => setPort(e.target.value)} />
+      {!isStatic && <input required aria-label="Service" placeholder="service" className="mono" value={service} onChange={(e) => setService(e.target.value)} />}
+      {!isStatic && <input required aria-label="Container port" type="number" min={1} max={65535} className="port" value={port} onChange={(e) => setPort(e.target.value)} />}
       <label className="check"><input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} /> HTTPS</label>
       <button className="action" disabled={action.busy}>Add domain</button>
     </form>
@@ -589,6 +694,16 @@ function GitAccessPanel({ projectId }: { projectId: string }) {
     });
   };
   const removeToken = () => action.run(async () => { await api(`${base}/token`, { method: 'DELETE' }); access.reload(); });
+  const [githubApp, setGithubApp] = useState('');
+  const [installationId, setInstallationId] = useState('');
+  const linkApp = (event: FormEvent) => {
+    event.preventDefault();
+    action.run(async () => {
+      await api(`${base}/github-app`, { method: 'PUT', body: { github_app_id: githubApp, installation_id: Number(installationId) } });
+      setGithubApp(''); setInstallationId(''); access.reload();
+    });
+  };
+  const unlinkApp = () => action.run(async () => { await api(`${base}/github-app`, { method: 'DELETE' }); access.reload(); });
   const copy = (key: string) => navigator.clipboard?.writeText(key).then(() => setCopied(true)).catch(() => undefined);
 
   return <>
@@ -605,6 +720,16 @@ function GitAccessPanel({ projectId }: { projectId: string }) {
         {data.deploy_public_key && <button className="ghost danger" disabled={action.busy} onClick={removeKey}>Remove</button>}
       </div>
     </div>}
+    {data?.transport === 'https' && data.host === 'github.com' && <form className="card" onSubmit={linkApp}>
+      {data.github_app
+        ? <p className="hint">Deployments mint a short-lived, read-only token from GitHub App <strong>{data.github_app.name}</strong> (App ID {data.github_app.app_id}, installation <span className="mono">{data.github_app.installation_id}</span>). It takes precedence over a saved token.</p>
+        : <p className="hint">Link a GitHub App installation to deploy with a one-hour token minted per deployment instead of a long-lived token.</p>}
+      {!data.github_app && <GitHubAppPicker app={githubApp} installation={installationId} onApp={setGithubApp} onInstallation={setInstallationId} />}
+      <div className="toolbar">
+        {!data.github_app && <button className="ghost" disabled={action.busy || !githubApp || !installationId}>Link GitHub App</button>}
+        {data.github_app && <button type="button" className="ghost danger" disabled={action.busy} onClick={unlinkApp}>Unlink GitHub App</button>}
+      </div>
+    </form>}
     {data?.transport === 'https' && <form className="card" onSubmit={saveToken}>
       <p className="hint">{data.token_host
         ? <>A token is saved for <span className="mono">{data.token_host}</span>. It is never shown again; saving replaces it.</>

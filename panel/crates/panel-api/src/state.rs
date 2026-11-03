@@ -1,6 +1,7 @@
 use crate::auth::session::CookieCipher;
 use crate::config::ApiConfig;
 use crate::services::deploy_queue::DeployQueue;
+use crate::services::github_app::GitHubApps;
 use crate::services::notifications::Notifier;
 use crate::services::secret_box::SecretBox;
 use crate::services::webhook::WebhookKey;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub notifier: Notifier,
     /// Seals stored secrets (layered environment variables).
     pub secret_box: SecretBox,
+    pub github_apps: GitHubApps,
 }
 
 impl AppState {
@@ -33,6 +35,7 @@ impl AppState {
             webhook_key: WebhookKey::derive(&config.cookie_key),
             notifier: Notifier::new(SecretBox::derive(&config.secret_key)),
             secret_box: SecretBox::derive(&config.secret_key),
+            github_apps: GitHubApps::new(SecretBox::derive(&config.secret_key)),
         }
     }
 }

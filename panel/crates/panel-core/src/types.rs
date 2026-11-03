@@ -233,6 +233,10 @@ pub enum ComposeSource {
     /// Compose file, so applications share the Compose deploy engine
     /// (queue, logs, environment, domains, webhooks).
     Application(Box<ApplicationSpec>),
+    /// Static files from a Git checkout (optionally built in a throwaway
+    /// container), copied into a release directory and served by the host
+    /// Nginx. No container runs once the deployment finishes.
+    Static(Box<StaticSiteSpec>),
 }
 
 impl ComposeSource {
@@ -249,9 +253,15 @@ impl ComposeSource {
                     repository_url,
                     branch,
                     ..
+                }
+                | ApplicationBuild::Builder {
+                    repository_url,
+                    branch,
+                    ..
                 } => Some((repository_url, branch)),
                 ApplicationBuild::Image { .. } => None,
             },
+            ComposeSource::Static(spec) => Some((&spec.repository_url, &spec.branch)),
             ComposeSource::Raw { .. } => None,
         }
     }
@@ -264,9 +274,57 @@ impl ComposeSource {
             ComposeSource::Application(spec) => match spec.build {
                 ApplicationBuild::Image { .. } => "image",
                 ApplicationBuild::Dockerfile { .. } => "dockerfile",
+                ApplicationBuild::Builder { builder, .. } => builder.as_str(),
             },
+            ComposeSource::Static(_) => "static",
         }
     }
+}
+
+/// An opt-in image builder for repositories without a Dockerfile. Each is a
+/// pinned binary the installer adds only when asked, and the agent runs it
+/// only when compiled with the `builders` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildTool {
+    /// `nixpacks build`.
+    Nixpacks,
+    /// `railpack prepare` plus `docker buildx build` with the Railpack
+    /// BuildKit frontend.
+    Railpack,
+    /// Cloud Native Buildpacks through `pack build`.
+    Buildpacks,
+}
+
+impl BuildTool {
+    pub const ALL: [BuildTool; 3] = [
+        BuildTool::Nixpacks,
+        BuildTool::Railpack,
+        BuildTool::Buildpacks,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BuildTool::Nixpacks => "nixpacks",
+            BuildTool::Railpack => "railpack",
+            BuildTool::Buildpacks => "buildpacks",
+        }
+    }
+
+    /// The program the agent runs for this builder.
+    pub fn program(self) -> &'static str {
+        match self {
+            BuildTool::Nixpacks => "nixpacks",
+            BuildTool::Railpack => "railpack",
+            BuildTool::Buildpacks => "pack",
+        }
+    }
+}
+
+/// Image a builder produces for a project. It exists only in the local
+/// Docker image store; the generated Compose file never pulls it.
+pub fn built_image_tag(project_slug: &str) -> String {
+    format!("scontrol-app/{project_slug}:latest")
 }
 
 /// Where an application's container image comes from.
@@ -290,10 +348,82 @@ pub enum ApplicationBuild {
         #[serde(default)]
         target: Option<String>,
     },
+    /// A Git checkout without a Dockerfile, turned into an image by an
+    /// opt-in builder that detects the language. Build-time variables are
+    /// not passed (the builders only take them on argv); the environment
+    /// still reaches the running container through `env_file`.
+    Builder {
+        builder: BuildTool,
+        repository_url: String,
+        branch: String,
+        /// Application directory relative to the repository root.
+        #[serde(default = "default_build_context")]
+        context_path: String,
+    },
 }
 
 fn default_build_context() -> String {
     ".".into()
+}
+
+/// Optional build of a static site, run before publishing. Each command
+/// runs as `docker run` of `image` with the checkout mounted at
+/// `/workspace`, in exec form (no shell), with all capabilities dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StaticBuild {
+    /// Toolchain image, e.g. `node:22-alpine`.
+    pub image: String,
+    /// Commands run in order, e.g. `[["npm", "ci"], ["npm", "run", "build"]]`.
+    pub commands: Vec<Vec<String>>,
+}
+
+/// A static site deployed from Git and served by the host Nginx.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StaticSiteSpec {
+    pub repository_url: String,
+    pub branch: String,
+    /// Directory to publish, relative to the repository root (after the
+    /// build, if any). Must resolve inside the checkout.
+    #[serde(default = "default_build_context")]
+    pub publish_path: String,
+    #[serde(default)]
+    pub build: Option<StaticBuild>,
+    /// Serve `index.html` for unknown paths (single-page applications).
+    #[serde(default)]
+    pub spa: bool,
+}
+
+/// Name the domain editor uses for a static site's single "service".
+pub const STATIC_SERVICE_NAME: &str = "static";
+
+impl StaticSiteSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if !validate::is_valid_git_url(&self.repository_url) {
+            return Err("invalid Git repository URL".into());
+        }
+        if !validate::is_valid_git_branch(&self.branch) {
+            return Err("invalid Git branch".into());
+        }
+        if !validate::is_valid_relative_path(&self.publish_path, true) {
+            return Err("invalid publish path".into());
+        }
+        if let Some(build) = &self.build {
+            if !validate::is_valid_image_reference(&build.image) {
+                return Err("invalid build image reference".into());
+            }
+            if build.commands.is_empty() || build.commands.len() > 8 {
+                return Err("a static build needs 1..=8 commands".into());
+            }
+            if !build
+                .commands
+                .iter()
+                .all(|c| validate::is_valid_exec_argv(c))
+            {
+                return Err("each build command must be 1..=32 non-empty arguments".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_dockerfile() -> String {
@@ -427,6 +557,22 @@ impl ApplicationSpec {
                     return Err("invalid build target".into());
                 }
             }
+            ApplicationBuild::Builder {
+                repository_url,
+                branch,
+                context_path,
+                ..
+            } => {
+                if !validate::is_valid_git_url(repository_url) {
+                    return Err("invalid Git repository URL".into());
+                }
+                if !validate::is_valid_git_branch(branch) {
+                    return Err("invalid Git branch".into());
+                }
+                if !validate::is_valid_relative_path(context_path, true) {
+                    return Err("invalid build context path".into());
+                }
+            }
         }
         if !validate::is_valid_service_name(&self.service_name) {
             return Err("invalid service name".into());
@@ -447,13 +593,7 @@ impl ApplicationSpec {
             return Err("CPU limit must be 10..=512000 millicpus".into());
         }
         if let Some(check) = &self.health_check {
-            if check.command.is_empty()
-                || check.command.len() > 32
-                || check
-                    .command
-                    .iter()
-                    .any(|arg| arg.is_empty() || arg.len() > 1024 || arg.contains(['\0', '\n']))
-            {
+            if !validate::is_valid_exec_argv(&check.command) {
                 return Err("health check command must be 1..=32 non-empty arguments".into());
             }
             if !(1..=3600).contains(&check.interval_secs)
@@ -882,6 +1022,16 @@ pub mod validate {
                 .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     }
 
+    /// An exec-form command (health check, static build step): 1..=32
+    /// non-empty arguments without NUL or newlines. It never reaches a shell.
+    pub fn is_valid_exec_argv(command: &[String]) -> bool {
+        !command.is_empty()
+            && command.len() <= 32
+            && command
+                .iter()
+                .all(|arg| !arg.is_empty() && arg.len() <= 1024 && !arg.contains(['\0', '\n']))
+    }
+
     /// Docker named volume name.
     pub fn is_valid_volume_name(name: &str) -> bool {
         VOLUME_NAME_RE.is_match(name)
@@ -1303,5 +1453,74 @@ mod env_layer_tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    fn site() -> StaticSiteSpec {
+        StaticSiteSpec {
+            repository_url: "https://github.com/acme/site.git".into(),
+            branch: "main".into(),
+            publish_path: "dist".into(),
+            build: Some(StaticBuild {
+                image: "node:22-alpine".into(),
+                commands: vec![
+                    vec!["npm".into(), "ci".into()],
+                    vec!["npm".into(), "run".into(), "build".into()],
+                ],
+            }),
+            spa: true,
+        }
+    }
+
+    #[test]
+    fn static_site_specs_are_validated() {
+        site().validate().unwrap();
+        let mut spec = site();
+        spec.publish_path = "../outside".into();
+        assert!(spec.validate().is_err());
+        spec.publish_path = "/etc".into();
+        assert!(spec.validate().is_err());
+        let mut spec = site();
+        spec.build.as_mut().unwrap().image = "node --privileged".into();
+        assert!(spec.validate().is_err());
+        let mut spec = site();
+        spec.build.as_mut().unwrap().commands = vec![];
+        assert!(spec.validate().is_err());
+        let mut spec = site();
+        spec.build.as_mut().unwrap().commands = vec![vec!["sh".into(), "-c\nid".into()]];
+        assert!(spec.validate().is_err());
+        let source = ComposeSource::Static(Box::new(site()));
+        assert_eq!(source.kind(), "static");
+        assert_eq!(
+            source.git_checkout(),
+            Some(("https://github.com/acme/site.git", "main"))
+        );
+    }
+
+    #[test]
+    fn builder_applications_deploy_from_git() {
+        let json = serde_json::json!({
+            "build": { "type": "builder", "builder": "railpack",
+                       "repository_url": "git@github.com:acme/api.git", "branch": "main" }
+        });
+        let spec: ApplicationSpec = serde_json::from_value(json).unwrap();
+        spec.validate().unwrap();
+        let source = ComposeSource::Application(Box::new(spec.clone()));
+        assert_eq!(source.kind(), "railpack");
+        assert!(source.git_checkout().is_some());
+        let mut bad = spec;
+        bad.build = ApplicationBuild::Builder {
+            builder: BuildTool::Nixpacks,
+            repository_url: "https://github.com/acme/api.git".into(),
+            branch: "main".into(),
+            context_path: "../..".into(),
+        };
+        assert!(bad.validate().is_err());
+        assert_eq!(built_image_tag("shop"), "scontrol-app/shop:latest");
+        assert!(validate::is_valid_image_reference(&built_image_tag("shop")));
     }
 }

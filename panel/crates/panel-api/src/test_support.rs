@@ -4,6 +4,7 @@
 use crate::auth::session::{self, CookieCipher};
 use crate::db;
 use crate::services::deploy_queue::DeployQueue;
+use crate::services::github_app::GitHubApps;
 use crate::services::notifications::Notifier;
 use crate::services::secret_box::SecretBox;
 use crate::services::webhook::WebhookKey;
@@ -54,6 +55,7 @@ pub fn app_state(pool: PgPool, adapter: Arc<MockAdapter>) -> AppState {
         webhook_key: WebhookKey::derive(&key),
         notifier: Notifier::new(SecretBox::derive(&key)),
         secret_box: SecretBox::derive(&key),
+        github_apps: github_apps(),
     }
 }
 
@@ -66,4 +68,10 @@ pub async fn session_cookie(state: &AppState, user_id: Uuid) -> String {
         .unwrap();
     let value = state.cookie_cipher.encrypt(&token).unwrap();
     format!("{}={value}", session::SESSION_COOKIE_NAME)
+}
+
+/// GitHub App service with the test key; it talks to an unroutable API
+/// unless a test builds its own with `GitHubApps::with_api_base`.
+pub fn github_apps() -> GitHubApps {
+    GitHubApps::with_api_base(SecretBox::derive(&[42u8; 32]), "http://127.0.0.1:9")
 }

@@ -108,6 +108,65 @@ create_accounts_and_dirs() {
   install -d -o root -g root -m 0755 /srv/scontrol/sites
 }
 
+# Pinned application builders (opt-in, Docker only). Each download is
+# checked against the SHA-256 recorded here before anything is installed;
+# bump a version only together with its checksums.
+readonly NIXPACKS_VERSION="1.41.0"
+readonly RAILPACK_VERSION="0.43.0"
+readonly PACK_VERSION="0.40.10"
+
+builder_sha256() {
+  case "$1" in
+    nixpacks-amd64) echo 0f55de7874507b9cf7502113120bd96f2ab6979f78d10eaf2eb2ade9207b3af6 ;;
+    nixpacks-arm64) echo 912bd02dd2bb6f9c3a9ed965fe8a68b4aa318dc7a2546e2eca6f2806a894ba39 ;;
+    railpack-amd64) echo 248a8f60f36854aabed6124113631078a802de3461660855fc4de9c26065c1fb ;;
+    railpack-arm64) echo 732ece14eb4f4676a43ebba19431f954edf7b130acb76159ef0f2ff86ac42ac9 ;;
+    pack-amd64) echo 687c3616e21824a449b56d4f989613ca68c921c6cce670b4de4459b025233806 ;;
+    pack-arm64) echo 9a294abb0576fd95e19a009b3f9d5f5aa9fecdc2d7da7fa05e7e1e94f5085d77 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Downloads <url>, verifies it, and installs the <binary> it contains.
+install_pinned_binary() {
+  local name="$1" url="$2" binary="$3" arch="$4" sha tmp
+  sha="$(builder_sha256 "${name}-${arch}")" || die "no pinned checksum for ${name} on ${arch}"
+  tmp="$(mktemp -d)"
+  curl --proto '=https' --tlsv1.2 -fsSL -o "${tmp}/archive.tgz" "$url"
+  echo "${sha}  ${tmp}/archive.tgz" | sha256sum -c --quiet - \
+    || { rm -rf "$tmp"; die "checksum mismatch for ${name}; refusing to install it"; }
+  tar -xzf "${tmp}/archive.tgz" -C "$tmp" "$binary"
+  install -m 0755 -o root -g root "${tmp}/${binary}" "/usr/local/bin/${binary}"
+  rm -rf "$tmp"
+}
+
+install_builders() {
+  local arch
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64|arm64) ;;
+    *) die "application builders are available for amd64 and arm64 only (found ${arch})" ;;
+  esac
+  log "Installing application builders (Nixpacks ${NIXPACKS_VERSION}, Railpack ${RAILPACK_VERSION}, pack ${PACK_VERSION})"
+  # Railpack builds through BuildKit (`docker buildx`).
+  apt-get install -y --no-install-recommends docker-buildx \
+    || apt-get install -y --no-install-recommends docker-buildx-plugin \
+    || true
+  docker buildx version >/dev/null 2>&1 \
+    || log "warning: docker buildx is missing; Railpack builds will fail until it is installed"
+  local nix_arch="x86_64" rail_arch="x86_64" pack_suffix=""
+  if [[ "$arch" == arm64 ]]; then nix_arch="aarch64"; rail_arch="arm64"; pack_suffix="-arm64"; fi
+  install_pinned_binary nixpacks \
+    "https://github.com/railwayapp/nixpacks/releases/download/v${NIXPACKS_VERSION}/nixpacks-v${NIXPACKS_VERSION}-${nix_arch}-unknown-linux-musl.tar.gz" \
+    nixpacks "$arch"
+  install_pinned_binary railpack \
+    "https://github.com/railwayapp/railpack/releases/download/v${RAILPACK_VERSION}/railpack-v${RAILPACK_VERSION}-${rail_arch}-unknown-linux-musl.tar.gz" \
+    railpack "$arch"
+  install_pinned_binary pack \
+    "https://github.com/buildpacks/pack/releases/download/v${PACK_VERSION}/pack-v${PACK_VERSION}-linux${pack_suffix}.tgz" \
+    pack "$arch"
+}
+
 random_cookie_key() {
   # 32 raw bytes encoded once; never print it or add it to Git. Also used
   # for PANEL_SECRET_KEY, which encrypts stored notification credentials.
@@ -147,6 +206,9 @@ letsencrypt_live_dir = "/etc/letsencrypt/live"
 deploy_timeout_secs = 1800
 deployment_log_max_bytes = 5242880
 deployment_logs_retained = 20
+static_sites_root = "/srv/scontrol/static"
+railpack_frontend = "ghcr.io/railwayapp/railpack-frontend:v${RAILPACK_VERSION}"
+buildpacks_builder = "paketobuildpacks/builder-jammy-base"
 
 [runtime_features]
 docker = ${docker_enabled}
@@ -185,6 +247,8 @@ install_optional_packages() {
     docker compose version >/dev/null 2>&1 \
       || die "Docker Compose v2 ('docker compose') is required; install docker-compose-plugin from Docker's apt repository and re-run"
     configure_acme_webroot
+    # Static sites: release directories the Nginx worker reads directly.
+    install -d -o root -g root -m 0755 /srv/scontrol/static
   fi
   if [[ "$mail_enabled" == true ]]; then
     log "Installing optional mail support"
@@ -258,7 +322,12 @@ main() {
   [[ "$repo_url" != *"REPLACE_ME"* ]] || die "set SCONTROL_REPO_URL to this project's Git repository URL"
 
   local docker_enabled=false mail_enabled=false antivirus_enabled=false
+  local builders_enabled=false
   ask_yes_no "Install optional Docker support?" && docker_enabled=true
+  if [[ "$docker_enabled" == true ]]; then
+    ask_yes_no "Install application builders (Nixpacks, Railpack, Buildpacks) for apps without a Dockerfile?" \
+      && builders_enabled=true
+  fi
   ask_yes_no "Install optional mail support (Postfix/Dovecot/DKIM)?" && mail_enabled=true
   ask_yes_no "Install optional antivirus support (ClamAV)?" && antivirus_enabled=true
 
@@ -270,10 +339,12 @@ main() {
   create_accounts_and_dirs
   setup_database
   install_optional_packages "$docker_enabled" "$mail_enabled" "$antivirus_enabled"
+  [[ "$builders_enabled" == true ]] && install_builders
   write_configuration "$docker_enabled" "$mail_enabled" "$antivirus_enabled"
 
   local features=""
   [[ "$docker_enabled" == true ]] && features="${features:+$features,}panel-agent/docker"
+  [[ "$builders_enabled" == true ]] && features="${features:+$features,}panel-agent/builders"
   [[ "$mail_enabled" == true ]] && features="${features:+$features,}panel-agent/mail"
   [[ "$antivirus_enabled" == true ]] && features="${features:+$features,}panel-agent/antivirus"
   build_and_install "$features"
