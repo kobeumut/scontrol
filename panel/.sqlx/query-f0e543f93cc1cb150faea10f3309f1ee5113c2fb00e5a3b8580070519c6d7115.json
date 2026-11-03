@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE docker_registries\n           SET name = $2, server_url = $3, username = $4, credential_ciphertext = $5,\n               updated_at = now()\n           WHERE id = $1\n           RETURNING id, name, server_url, username, credential_ciphertext, created_at, updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "server_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "username",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "credential_ciphertext",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f0e543f93cc1cb150faea10f3309f1ee5113c2fb00e5a3b8580070519c6d7115"
+}

@@ -206,6 +206,14 @@ impl AdapterPort for AgentClient {
         self.call(AgentRequest::WriteGitCredentials(params)).await
     }
 
+    async fn write_docker_config(&self, params: WriteDockerConfigParams) -> CoreResult<()> {
+        self.call(AgentRequest::WriteDockerConfig(params)).await
+    }
+
+    async fn test_docker_registry(&self, params: TestDockerRegistryParams) -> CoreResult<()> {
+        self.call(AgentRequest::TestDockerRegistry(params)).await
+    }
+
     async fn stop_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()> {
         self.call(AgentRequest::StopComposeProject(params)).await
     }

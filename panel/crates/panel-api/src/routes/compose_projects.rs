@@ -65,6 +65,10 @@ pub fn router() -> Router<AppState> {
             put(set_git_token).delete(remove_git_token),
         )
         .route(
+            "/:id/registry",
+            get(project_registry).put(set_project_registry),
+        )
+        .route(
             "/:id/webhook",
             get(webhook_status)
                 .post(rotate_webhook)
@@ -112,6 +116,9 @@ struct CreateProjectBody {
     git_credentials: Option<GitHttpCredentials>,
     #[serde(default)]
     pull_images: bool,
+    /// Private registry to pull images with (see `/api/registries`).
+    #[serde(default)]
+    registry_id: Option<Uuid>,
     /// Queue the first deployment right away (default true).
     #[serde(default = "default_true")]
     deploy: bool,
@@ -146,6 +153,14 @@ async fn create(
             .await?
             .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
     }
+    if let Some(registry_id) = body.registry_id {
+        if db::registries::find(&state.db, registry_id)
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::BadRequest("registry not found".into()));
+        }
+    }
     let project = db::compose_projects::create(
         &state.db,
         Uuid::new_v4(),
@@ -169,6 +184,11 @@ async fn create(
     .await;
     if let (Ok(()), Some(host)) = (&prepared, &token_host) {
         prepared = write_git_token(&state, &project, host, body.git_credentials).await;
+    }
+    if prepared.is_ok() && body.registry_id.is_some() {
+        prepared = db::registries::set_project_registry(&state.db, project.id, body.registry_id)
+            .await
+            .map_err(ApiError::from);
     }
     if let Err(error) = prepared {
         // Removes whatever the agent already wrote under the slug.
@@ -1098,6 +1118,53 @@ fn validate_git_credentials(credentials: &GitHttpCredentials) -> ApiResult<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
+struct ProjectRegistry {
+    /// The private registry the project pulls images with; `None` pulls
+    /// anonymously.
+    registry_id: Option<Uuid>,
+}
+
+async fn project_registry(
+    AdminUser(_): AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ProjectRegistry>> {
+    find_project(&state, id).await?;
+    Ok(Json(ProjectRegistry {
+        registry_id: db::registries::project_registry(&state.db, id).await?,
+    }))
+}
+
+async fn set_project_registry(
+    AdminUser(user): AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ProjectRegistry>,
+) -> ApiResult<Json<ProjectRegistry>> {
+    let project = find_project(&state, id).await?;
+    if let Some(registry_id) = body.registry_id {
+        if db::registries::find(&state.db, registry_id)
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::BadRequest("registry not found".into()));
+        }
+    }
+    db::registries::set_project_registry(&state.db, id, body.registry_id).await?;
+    db::audit::record(
+        &state.db,
+        Some(user.id),
+        "user",
+        "set_compose_registry",
+        Some(&project.slug),
+        serde_json::json!({ "project_id": id, "registry_id": body.registry_id }),
+    )
+    .await
+    .ok();
+    Ok(Json(body))
+}
+
 async fn find_project(state: &AppState, id: Uuid) -> ApiResult<ComposeProject> {
     db::compose_projects::find_by_id(&state.db, id)
         .await?
@@ -1666,5 +1733,116 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = call(&router, "", Method::GET, &base, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn projects_are_linked_to_a_registry_at_creation_or_later() {
+        let pool = test_support::test_pool().await;
+        let adapter = Arc::new(MockAdapter::new());
+        let state = test_support::app_state(pool.clone(), adapter.clone());
+        let admin = test_support::user(&pool, true).await;
+        let cookie = test_support::session_cookie(&state, admin.id).await;
+        let router = crate::routes::build_router(state);
+        let unique = &uuid::Uuid::new_v4().simple().to_string()[..12];
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/registries",
+            Some(
+                json!({ "name": format!("reg-{unique}"), "server_url": "ghcr.io",
+                         "username": "octocat", "password": "pw" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let registry_id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let new_project = |slug: String, registry: Value| {
+            json!({ "name": "Private app", "slug": slug, "deploy": false,
+                    "source": { "kind": "application", "build": { "type": "image", "image": "ghcr.io/acme/app:1" } },
+                    "registry_id": registry })
+        };
+        // An unknown registry is refused before anything is created.
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/compose-projects",
+            Some(new_project(
+                format!("bad{unique}"),
+                json!(uuid::Uuid::new_v4()),
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/compose-projects",
+            Some(new_project(format!("reg{unique}"), json!(registry_id))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let project_id = serde_json::from_str::<Value>(&body).unwrap()["project"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let uri = format!("/api/compose-projects/{project_id}/registry");
+        let (_, body) = call(&router, &cookie, Method::GET, &uri, None).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["registry_id"],
+            registry_id
+        );
+
+        // Unlinking, and linking to something that does not exist.
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::PUT,
+            &uri,
+            Some(json!({ "registry_id": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = call(&router, &cookie, Method::GET, &uri, None).await;
+        assert!(serde_json::from_str::<Value>(&body).unwrap()["registry_id"].is_null());
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::PUT,
+            &uri,
+            Some(json!({ "registry_id": uuid::Uuid::new_v4() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Deleting a registry leaves its projects in place, unlinked.
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::PUT,
+            &uri,
+            Some(json!({ "registry_id": registry_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::DELETE,
+            &format!("/api/registries/{registry_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = call(&router, &cookie, Method::GET, &uri, None).await;
+        assert!(serde_json::from_str::<Value>(&body).unwrap()["registry_id"].is_null());
     }
 }

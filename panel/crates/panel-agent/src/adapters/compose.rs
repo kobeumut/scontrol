@@ -22,6 +22,7 @@
 //! ```
 
 use super::deploy_log::{self, maskable_secrets, redact, DeployLog};
+use super::docker_config;
 use super::exec::{follow_lines, run, run_allow_nonzero, run_streamed};
 use super::git_auth;
 use super::nginx;
@@ -70,6 +71,7 @@ pub async fn deploy(
     adopt_legacy_env_file(&root, &env_path).await;
     let mut secrets = environment_secrets(&root).await?;
     secrets.extend(git_auth::stored_secrets(&root).await);
+    secrets.extend(docker_config::stored_secrets(&root).await);
     let mut log = DeployLog::create(
         &root.join("logs"),
         params.deployment_id,
@@ -80,6 +82,10 @@ pub async fn deploy(
     .await?;
 
     let result = deploy_steps(cfg, &params, &root, &env_path, &mut log).await;
+    // Registry logins live only for the deployment, whatever its outcome.
+    tokio::fs::remove_dir_all(docker_config::config_dir(&root))
+        .await
+        .ok();
     match &result {
         Ok(outcome) => {
             for warning in &outcome.warnings {
@@ -135,7 +141,12 @@ async fn deploy_steps(
     log.step("starting services with docker compose").await?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let timeout = Duration::from_secs(cfg.deploy_timeout_secs.max(60));
-    let code = run_streamed("docker", &refs, &[], log, timeout).await?;
+    // Pulls use the project's own registry logins, never root's `~/.docker`.
+    let docker_config = docker_config::config_dir(root)
+        .to_string_lossy()
+        .into_owned();
+    let envs = [("DOCKER_CONFIG", docker_config.as_str())];
+    let code = run_streamed("docker", &refs, &envs, log, timeout).await?;
     if code != 0 {
         return Err(CoreError::External(format!(
             "docker compose up failed (exit code {code}); see the deployment log"

@@ -165,6 +165,43 @@ pub struct WriteGitCredentialsParams {
     pub credentials: Option<GitHttpCredentials>,
 }
 
+/// One private registry login. `server` is the user-facing registry address
+/// (`ghcr.io`, `123.dkr.ecr.eu-west-1.amazonaws.com`, `docker.io`); the agent
+/// maps it to the key Docker stores credentials under.
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DockerRegistryAuth {
+    pub server: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for DockerRegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DockerRegistryAuth")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"********")
+            .finish()
+    }
+}
+
+/// Replaces a project's isolated `DOCKER_CONFIG` (`<project root>/.docker`).
+/// An empty `registries` list removes the credentials. The panel sends this
+/// right before a deployment and removes it right after, so registry
+/// passwords exist on disk only while an image pull can need them.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WriteDockerConfigParams {
+    pub project_slug: String,
+    pub registries: Vec<DockerRegistryAuth>,
+}
+
+/// Checks a registry login with `docker login` (password on stdin, throwaway
+/// `DOCKER_CONFIG`) without touching any project.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TestDockerRegistryParams {
+    pub auth: DockerRegistryAuth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CancelDeploymentParams {
     pub deployment_id: Uuid,
@@ -306,6 +343,10 @@ pub trait AdapterPort: Send + Sync {
     async fn generate_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<String>;
     async fn remove_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
     async fn write_git_credentials(&self, params: WriteGitCredentialsParams) -> CoreResult<()>;
+    /// Writes (or, with no registries, removes) the project's private
+    /// `DOCKER_CONFIG/config.json`.
+    async fn write_docker_config(&self, params: WriteDockerConfigParams) -> CoreResult<()>;
+    async fn test_docker_registry(&self, params: TestDockerRegistryParams) -> CoreResult<()>;
     async fn stop_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
     async fn remove_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
     async fn list_compose_project_services(
@@ -510,6 +551,14 @@ pub mod mock {
             _params: WriteGitCredentialsParams,
         ) -> CoreResult<()> {
             self.record("write_git_credentials")
+        }
+
+        async fn write_docker_config(&self, _params: WriteDockerConfigParams) -> CoreResult<()> {
+            self.record("write_docker_config")
+        }
+
+        async fn test_docker_registry(&self, _params: TestDockerRegistryParams) -> CoreResult<()> {
+            self.record("test_docker_registry")
         }
 
         async fn stop_compose_project(

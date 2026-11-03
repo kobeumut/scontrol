@@ -24,10 +24,11 @@ regex = { workspace = true }
 once_cell = { workspace = true }
 toml = "0.8"
 serde_yaml = { version = "0.9", optional = true }
+base64 = { workspace = true, optional = true }
 sha-crypt = { version = "0.5", optional = true }
 
 [features]
 default = []
-docker = ["dep:serde_yaml"]
+docker = ["dep:serde_yaml", "dep:base64"]
 mail = ["dep:sha-crypt"]
 antivirus = []

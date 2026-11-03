@@ -19,9 +19,11 @@ use crate::db::compose_projects::ClaimedDeployment;
 use crate::error::ApiResult;
 use crate::services::env_layers;
 use crate::services::notifications::Notifier;
+use crate::services::registries;
 use crate::services::secret_box::SecretBox;
 use panel_core::adapters::{
-    AdapterPort, DeployComposeProjectParams, WriteComposeEnvironmentParams,
+    AdapterPort, DeployComposeProjectParams, DockerRegistryAuth, WriteComposeEnvironmentParams,
+    WriteDockerConfigParams,
 };
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
@@ -186,7 +188,20 @@ async fn execute(
     } else {
         None
     };
-    agent
+    let slug = project.slug.clone();
+    let registry = registry_login(db, secrets, project.id).await?;
+    let has_registry = registry.is_some();
+    if let Some(auth) = registry {
+        // Registry credentials reach the agent right before the pull and are
+        // removed right after, win or lose; the job row never carries them.
+        agent
+            .write_docker_config(WriteDockerConfigParams {
+                project_slug: slug.clone(),
+                registries: vec![auth],
+            })
+            .await?;
+    }
+    let result = agent
         .deploy_compose_project(DeployComposeProjectParams {
             project_id: project.id,
             deployment_id: job.id,
@@ -205,7 +220,41 @@ async fn execute(
                 .collect(),
             acme_email,
         })
+        .await;
+    if has_registry {
+        if let Err(error) = agent
+            .write_docker_config(WriteDockerConfigParams {
+                project_slug: slug,
+                registries: Vec::new(),
+            })
+            .await
+        {
+            tracing::warn!(deployment_id = %job.id, %error, "removing registry credentials failed");
+        }
+    }
+    result
+}
+
+/// The decrypted login of the project's private registry, if it has one.
+async fn registry_login(
+    db: &PgPool,
+    secrets: &SecretBox,
+    project_id: Uuid,
+) -> CoreResult<Option<DockerRegistryAuth>> {
+    let Some(registry_id) = db::registries::project_registry(db, project_id)
         .await
+        .map_err(|e| CoreError::External(format!("loading project registry: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let row = db::registries::find(db, registry_id)
+        .await
+        .map_err(|e| CoreError::External(format!("loading registry: {e}")))?
+        .ok_or_else(|| CoreError::NotFound("the project's registry no longer exists".into()))?;
+    registries::open(secrets, &row)
+        .map(Some)
+        // The error names no secret: it comes from the AEAD check.
+        .map_err(|e| CoreError::External(format!("unsealing registry credential: {e}")))
 }
 
 /// Truncates on a character boundary (slicing bytes could panic).
@@ -226,6 +275,10 @@ mod tests {
     use crate::test_support::QUEUE_TESTS;
 
     use crate::test_support::test_pool;
+
+    fn test_secrets() -> SecretBox {
+        SecretBox::derive(&[42u8; 32])
+    }
 
     async fn project(pool: &PgPool) -> panel_core::types::ComposeProject {
         let owner = crate::test_support::user(pool, true).await;
@@ -257,10 +310,6 @@ mod tests {
                 .unwrap();
         }
         None
-    }
-
-    fn test_secrets() -> SecretBox {
-        SecretBox::derive(&[9u8; 32])
     }
 
     #[test]
@@ -335,6 +384,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.status, DeploymentStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn registry_credentials_bracket_the_deployment_even_when_it_fails() {
+        let _serial = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let secrets = test_secrets();
+        for fail in [false, true] {
+            let project = project(&pool).await;
+            let registry_id = Uuid::new_v4();
+            crate::db::registries::create(
+                &pool,
+                registry_id,
+                &format!("reg-{registry_id}"),
+                "ghcr.io",
+                "octocat",
+                &crate::services::registries::seal(&secrets, registry_id, "pw"),
+            )
+            .await
+            .unwrap();
+            crate::db::registries::set_project_registry(&pool, project.id, Some(registry_id))
+                .await
+                .unwrap();
+            DeployQueue::new()
+                .enqueue(&pool, project.id, &project.slug, true, "manual")
+                .await
+                .unwrap();
+            let job = claim_for(&pool, project.id).await.unwrap();
+            let adapter = MockAdapter::new();
+            if fail {
+                adapter.fail_next_call("deploy_compose_project");
+            }
+            run_job(&pool, &adapter, &secrets, job).await;
+            assert_eq!(
+                *adapter.calls.lock().unwrap(),
+                [
+                    "write_compose_environment",
+                    "write_docker_config",
+                    "deploy_compose_project",
+                    "write_docker_config"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn projects_without_a_registry_never_touch_docker_config() {
+        let _serial = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let project = project(&pool).await;
+        DeployQueue::new()
+            .enqueue(&pool, project.id, &project.slug, false, "manual")
+            .await
+            .unwrap();
+        let job = claim_for(&pool, project.id).await.unwrap();
+        let adapter = MockAdapter::new();
+        run_job(&pool, &adapter, &test_secrets(), job).await;
+        assert_eq!(
+            *adapter.calls.lock().unwrap(),
+            ["write_compose_environment", "deploy_compose_project"]
+        );
     }
 
     #[tokio::test]
