@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from 'react';
 import { RegistrySelect } from './Registries';
 import {
   api, ApiState, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
+  DATABASE_ENGINE_LABELS,
   Deployment, Domain, duration, formatTime, GitAccess, gitCheckout, GitHubApp, gitTransport, isActive, isGitHubHttps,
   LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
 } from './api';
@@ -360,6 +361,9 @@ function SourceSummary({ source }: { source: ComposeSource }) {
   if (source.kind === 'static') {
     return <>Static site from <span className="mono">{source.repository_url}</span> · branch <span className="mono">{source.branch}</span> · publishes <span className="mono">{source.publish_path}</span>
       {source.build ? <> · built in <span className="mono">{source.build.image}</span></> : null}{source.spa ? ' · SPA' : ''}</>;
+  }
+  if (source.kind === 'database') {
+    return <>{DATABASE_ENGINE_LABELS[source.engine]} {source.version} database · manage credentials and outside access under Databases</>;
   }
   const limits = [
     source.container_port ? `port ${source.container_port}` : null,

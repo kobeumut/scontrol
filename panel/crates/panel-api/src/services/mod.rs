@@ -1,3 +1,4 @@
+pub mod database_services;
 pub mod deploy_queue;
 pub mod env_layers;
 pub mod github_app;

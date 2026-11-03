@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE database_services\n           SET public_port = $2, allow_from = $3, updated_at = now()\n           WHERE project_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3fe35174c9cadc2e68f45708dbebc8ed05e7caa586480f79f1c34120fd606aea"
+}

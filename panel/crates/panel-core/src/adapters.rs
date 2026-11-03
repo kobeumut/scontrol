@@ -114,6 +114,23 @@ pub struct DeployComposeProjectParams {
     /// never part of a queue row.
     #[serde(default)]
     pub git_credentials: Option<GitHttpCredentials>,
+    /// Loopback port and generated credentials of a database service
+    /// (`ComposeSource::Database` only). Unsealed by the queue worker for
+    /// this request; never part of a queue row. The agent writes the
+    /// credentials to 0600 files and masks them in logs.
+    #[serde(default)]
+    pub database: Option<DatabaseDeployment>,
+}
+
+/// Opens (`Some`) or closes (`None`) outside access to a database service:
+/// a host Nginx `stream` proxy from `public_port` to the service's loopback
+/// port, plus the matching UFW allow rules. Replaces any previous exposure
+/// of the same service.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SetDatabaseExposureParams {
+    pub project_slug: String,
+    pub loopback_port: u16,
+    pub exposure: Option<DatabaseExposure>,
 }
 
 /// Replaces a project's write-only environment file. Sent separately from
@@ -359,6 +376,9 @@ pub trait AdapterPort: Send + Sync {
     async fn write_docker_config(&self, params: WriteDockerConfigParams) -> CoreResult<()>;
     async fn test_docker_registry(&self, params: TestDockerRegistryParams) -> CoreResult<()>;
     async fn stop_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
+    /// `docker compose restart` of the last deployed project model.
+    async fn restart_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
+    async fn set_database_exposure(&self, params: SetDatabaseExposureParams) -> CoreResult<()>;
     async fn remove_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
     async fn list_compose_project_services(
         &self,
@@ -399,6 +419,8 @@ pub mod mock {
         /// Every deployment request received, for tests that inspect what
         /// panel-api sent the agent.
         pub deploys: Mutex<Vec<DeployComposeProjectParams>>,
+        /// Every `set_database_exposure` request.
+        pub exposures: Mutex<Vec<SetDatabaseExposureParams>>,
     }
 
     impl MockAdapter {
@@ -582,6 +604,19 @@ pub mod mock {
             _params: ComposeProjectActionParams,
         ) -> CoreResult<()> {
             self.record("stop_compose_project")
+        }
+
+        async fn restart_compose_project(
+            &self,
+            _params: ComposeProjectActionParams,
+        ) -> CoreResult<()> {
+            self.record("restart_compose_project")
+        }
+
+        async fn set_database_exposure(&self, params: SetDatabaseExposureParams) -> CoreResult<()> {
+            self.record("set_database_exposure")?;
+            self.exposures.lock().unwrap().push(params);
+            Ok(())
         }
 
         async fn remove_compose_project(

@@ -80,6 +80,13 @@ pub struct AgentConfig {
     #[serde(default = "default_buildpacks_builder")]
     pub buildpacks_builder: String,
 
+    /// Directory of generated Nginx `stream` servers that expose database
+    /// services. The installer includes it from a top-level `stream {}`
+    /// block; the agent refuses to expose anything when it is not loaded.
+    #[allow(dead_code)]
+    #[serde(default = "default_nginx_stream_dir")]
+    pub nginx_stream_dir: PathBuf,
+
     #[serde(default)]
     pub runtime_features: RuntimeFeatures,
 }
@@ -159,6 +166,10 @@ fn default_static_sites_root() -> PathBuf {
     PathBuf::from("/srv/scontrol/static")
 }
 
+fn default_nginx_stream_dir() -> PathBuf {
+    PathBuf::from("/etc/nginx/scontrol-stream")
+}
+
 fn default_railpack_frontend() -> String {
     "ghcr.io/railwayapp/railpack-frontend:v0.43.0".into()
 }
@@ -184,6 +195,7 @@ impl Default for AgentConfig {
             static_sites_root: default_static_sites_root(),
             railpack_frontend: default_railpack_frontend(),
             buildpacks_builder: default_buildpacks_builder(),
+            nginx_stream_dir: default_nginx_stream_dir(),
             runtime_features: RuntimeFeatures {
                 docker: true,
                 mail: true,

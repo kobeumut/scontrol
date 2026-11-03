@@ -73,7 +73,7 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Build types | Dockerfile (core). Nixpacks, Railpack, and buildpacks as opt-in pinned binaries (agent feature `builders`, checksummed installer downloads). Static apps served by Nginx directly from a release directory, with no container (optional exec-form build in a capability-less container; only regular files published) | D2 | ✅ |
 | Registries | Per-project `DOCKER_CONFIG` directory; credentials encrypted at rest | D2 | ✅ |
 | Projects, environments, env layering | `projects → environments → services` (each owner gets a Default project with `production`; existing services migrate into it). Layers are sealed with `SecretBox` in PostgreSQL, merged project → environment → service (most specific wins) by the queue worker at deploy time, and written to the agent through `write_compose_environment`. Overridden values are masked in logs too; the API returns key names and layer provenance only | D2 | ✅ |
-| Databases as services | Postgres, MySQL, MariaDB, Mongo, and Redis containers bound to `127.0.0.1` with persistent named volumes. An external port only through an explicit firewall rule | D3 | ⬜ |
+| Databases as services | Postgres, MySQL, MariaDB, Mongo, and Redis containers bound to `127.0.0.1` with persistent named volumes. An external port only through an explicit Nginx `stream` proxy plus UFW rule (Docker-published ports would bypass UFW) | D3 | ✅ |
 | Backups to S3 | Spawn the dump tool with argv and credentials in env. Stream through gzip into an in-process S3 multipart upload, or `rclone rcat` with env credentials. Retention by count; restore streams back | D3 | ⬜ |
 | Volume backups | Optional stop, then `tar` streamed in-process from the volume mountpoint to S3, then start | D3 | ⬜ |
 | Scheduled jobs | Generated systemd timers (`OnCalendar=`, timezone) running `docker compose exec` argv. Runs recorded as job rows with bounded logs | D3 | ⬜ |
@@ -125,6 +125,7 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 
 **D3: Data.**
 - Database services, S3 backups and restore, volume backups, and systemd-timer schedules.
+- Done: database services (generated sealed credentials, loopback-only ports, opt-in outside access).
 
 **D4: Observability.**
 - `/proc` and cgroup sampler, metrics retention, alerts, request stats, and Docker cleanup.

@@ -2,6 +2,7 @@ pub mod admin;
 pub mod auth;
 pub mod compose_projects;
 pub mod cron;
+pub mod database_services;
 pub mod databases;
 pub mod firewall;
 pub mod github_apps;
@@ -24,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/auth", auth::router())
         .nest("/api/sites", sites::router())
         .nest("/api/databases", databases::router())
+        .nest("/api/database-services", database_services::router())
         .nest("/api/mcp", mcp::router())
         .nest("/api/cron", cron::router())
         .nest("/api/projects", projects::router())

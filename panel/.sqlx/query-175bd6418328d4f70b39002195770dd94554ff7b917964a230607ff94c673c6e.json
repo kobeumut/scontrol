@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO database_services (project_id, loopback_port, credentials_ciphertext)\n           SELECT $1, port, $2\n           FROM generate_series(25000, 29999) AS port\n           WHERE NOT EXISTS (SELECT 1 FROM database_services WHERE loopback_port = port)\n           ORDER BY port\n           LIMIT 1\n           RETURNING project_id, loopback_port, credentials_ciphertext, public_port,\n                     allow_from",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "loopback_port",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "credentials_ciphertext",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "public_port",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "allow_from",
+        "type_info": "TextArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "175bd6418328d4f70b39002195770dd94554ff7b917964a230607ff94c673c6e"
+}

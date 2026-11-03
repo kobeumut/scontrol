@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod compose_projects;
 pub mod cron;
+pub mod database_services;
 pub mod databases;
 pub mod firewall;
 pub mod github_apps;

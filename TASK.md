@@ -135,7 +135,13 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 
 ### D3: Data
 
-- [ ] Database services (Postgres/MySQL/MariaDB/Mongo/Redis) bound to `127.0.0.1`, with an external port only via an explicit firewall rule.
+- [x] Database services: PostgreSQL, MySQL, MariaDB, MongoDB, Redis (migration `0011`, `panel_core::database_services`, `routes/database_services.rs`, `frontend/src/Databases.tsx`).
+  - A `ComposeSource::Database` the agent renders from a vetted per-engine template (`render_database`): pinned version list, `127.0.0.1:<25000–29999>` port only, named volume `data`, exec-form health check without a password, `no-new-privileges`. Shares the queue, logs, variables, and history with other services.
+  - Credentials are generated (OS RNG, 32 alphanumeric characters; MySQL/MariaDB also get a root password), sealed with `SecretBox` in `database_services`, and sent only in that deployment's `DeployComposeProjectParams::database`. The agent writes them to a 0600 `db.env` (the last `env_file`, so user variables cannot replace them) and, for Redis, a 0400 config owned by the container user and mounted as a Compose secret. Never on argv; masked in deployment and container logs.
+  - `POST /:id/credentials` shows user, password(s), and URIs (`Cache-Control: no-store`, audited without values). Start (queued `up -d`), stop, restart (new `restart_compose_project` RPC), delete. The data volume survives deletion.
+  - Outside access is opt-in (`PUT/DELETE /:id/exposure`): a generated Nginx `stream` server on the public port proxies to the loopback port with `allow`/`deny`, and UFW allows the port only from the listed addresses. Docker never publishes on `0.0.0.0` (that would bypass UFW). The agent checks with `nginx -T` that the stream include is loaded, rolls back on failure, and removes the exposure with the project. The installer adds `libnginx-mod-stream` and the `stream {}` include.
+  - Templates smoke-tested with real images (all five healthy and authenticating over loopback). MongoDB 8.0 builds before 8.0.17 refuse to start on Linux 6.19+ kernels, so 8.2 is the default.
+- [ ] Database services: live E2E on Ubuntu 24.04 of outside access (stream module include, UFW rules) and a shared network so containers of other services can reach a database by name (today they use the host's loopback port only from host processes).
 - [ ] Streaming S3 backups with credentials in env, retention by count, and restore.
 - [ ] Volume backups (optional stop, then streamed tar).
 - [ ] Scheduled jobs via generated systemd timers, with runs recorded and bounded logs.

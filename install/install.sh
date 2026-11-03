@@ -207,6 +207,7 @@ deploy_timeout_secs = 1800
 deployment_log_max_bytes = 5242880
 deployment_logs_retained = 20
 static_sites_root = "/srv/scontrol/static"
+nginx_stream_dir = "/etc/nginx/scontrol-stream"
 railpack_frontend = "ghcr.io/railwayapp/railpack-frontend:v${RAILPACK_VERSION}"
 buildpacks_builder = "paketobuildpacks/builder-jammy-base"
 
@@ -232,6 +233,24 @@ HOOK
   chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/scontrol-reload-nginx
 }
 
+# Database services are reachable from outside only through generated Nginx
+# `stream` servers (never a Docker port on 0.0.0.0, which would bypass UFW).
+# The stream module is a separate package; the top-level `stream {}` block
+# goes into modules-enabled because Debian's nginx.conf includes that
+# directory in the main context, after the module that defines `stream`.
+configure_nginx_stream() {
+  apt-get install -y --no-install-recommends libnginx-mod-stream
+  install -d -o root -g root -m 0755 /etc/nginx/scontrol-stream
+  cat > /etc/nginx/modules-enabled/99-scontrol-stream.conf <<'NGINX'
+# Managed by scontrol: database services opened for outside access.
+stream {
+    include /etc/nginx/scontrol-stream/*.conf;
+}
+NGINX
+  chmod 0644 /etc/nginx/modules-enabled/99-scontrol-stream.conf
+  nginx -t
+}
+
 install_optional_packages() {
   local docker_enabled="$1" mail_enabled="$2" antivirus_enabled="$3"
   if [[ "$docker_enabled" == true ]]; then
@@ -247,6 +266,7 @@ install_optional_packages() {
     docker compose version >/dev/null 2>&1 \
       || die "Docker Compose v2 ('docker compose') is required; install docker-compose-plugin from Docker's apt repository and re-run"
     configure_acme_webroot
+    configure_nginx_stream
     # Static sites: release directories the Nginx worker reads directly.
     install -d -o root -g root -m 0755 /srv/scontrol/static
   fi

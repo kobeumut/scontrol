@@ -701,6 +701,11 @@ async fn add_domain(
     Json(body): Json<AddDomainBody>,
 ) -> ApiResult<(StatusCode, Json<DomainChange<ComposeDomain>>)> {
     let project = find_project(&state, id).await?;
+    if matches!(project.source, ComposeSource::Database(_)) {
+        return Err(ApiError::BadRequest(
+            "database services are not served over HTTP; open outside access instead".into(),
+        ));
+    }
     let domain = body.domain.trim().to_ascii_lowercase();
     if !validate::is_valid_domain(&domain) {
         return Err(ApiError::BadRequest("invalid domain".into()));
@@ -1360,6 +1365,12 @@ fn validate_source(source: &ComposeSource) -> ApiResult<()> {
         }
         ComposeSource::Static(spec) => {
             return spec.validate().map_err(ApiError::BadRequest);
+        }
+        // They need a loopback port and generated credentials first.
+        ComposeSource::Database(_) => {
+            return Err(ApiError::BadRequest(
+                "create database services through /api/database-services".into(),
+            ));
         }
     };
     if valid {

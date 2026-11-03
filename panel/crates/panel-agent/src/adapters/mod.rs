@@ -7,6 +7,8 @@ pub mod compose;
 pub mod cron;
 pub mod database;
 #[cfg(feature = "docker")]
+pub mod db_exposure;
+#[cfg(feature = "docker")]
 pub mod deploy_log;
 #[cfg(feature = "docker")]
 pub mod docker;
@@ -320,6 +322,36 @@ impl AdapterPort for LocalAdapter {
                 return Err(Self::feature_disabled("docker"));
             }
             return compose::stop(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn restart_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return compose::restart(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn set_database_exposure(&self, params: SetDatabaseExposureParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return db_exposure::set(&self.config, params).await;
         }
         #[cfg(not(feature = "docker"))]
         {

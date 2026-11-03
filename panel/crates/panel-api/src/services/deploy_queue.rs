@@ -19,6 +19,7 @@
 use crate::db;
 use crate::db::compose_projects::ClaimedDeployment;
 use crate::error::ApiResult;
+use crate::services::database_services;
 use crate::services::env_layers;
 use crate::services::github_app::{self, GitHubApps};
 use crate::services::notifications::Notifier;
@@ -30,7 +31,7 @@ use panel_core::adapters::{
 };
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
-    ComposeDeployOutcome, ComposeDomainBinding, DeploymentInfo, DeploymentStatus,
+    ComposeDeployOutcome, ComposeDomainBinding, ComposeSource, DeploymentInfo, DeploymentStatus,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -209,6 +210,16 @@ async fn execute(
             .await?;
     }
     let git_credentials = github_app_credentials(db, github, &project).await?;
+    // Database credentials are unsealed for this request only.
+    let database = if matches!(project.source, ComposeSource::Database(_)) {
+        Some(
+            database_services::deployment_for(db, secrets, project.id)
+                .await
+                .map_err(|e| CoreError::External(format!("loading database settings: {e}")))?,
+        )
+    } else {
+        None
+    };
     let result = agent
         .deploy_compose_project(DeployComposeProjectParams {
             project_id: project.id,
@@ -228,6 +239,7 @@ async fn execute(
                 .collect(),
             acme_email,
             git_credentials,
+            database,
         })
         .await;
     if has_registry {

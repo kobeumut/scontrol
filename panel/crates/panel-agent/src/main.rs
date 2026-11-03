@@ -237,6 +237,12 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         AgentRequest::StopComposeProject(p) => {
             AgentResponse::from_core_result(adapter.stop_compose_project(p).await)
         }
+        AgentRequest::RestartComposeProject(p) => {
+            AgentResponse::from_core_result(adapter.restart_compose_project(p).await)
+        }
+        AgentRequest::SetDatabaseExposure(p) => {
+            AgentResponse::from_core_result(adapter.set_database_exposure(p).await)
+        }
         AgentRequest::RemoveComposeProject(p) => {
             AgentResponse::from_core_result(adapter.remove_compose_project(p).await)
         }
