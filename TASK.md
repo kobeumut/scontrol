@@ -34,7 +34,7 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 - [x] Per-deployment streamed logs (`adapters/deploy_log.rs`).
   - Output is written line by line, environment values are masked, each log is capped at 5 MiB, and 20 logs are kept per project.
   - Read by byte offset with `GET /:id/deployments/:deployment_id/log?offset=`, which never splits a UTF-8 character.
-- [x] Write-only environment via a separate agent RPC (`PUT /:id/environment`). Stored 0600 outside the source tree and kept across redeploys. Queue rows never hold secrets.
+- [x] Write-only environment via a separate agent RPC (`PUT /:id/environment`). Stored 0600 outside the source tree and kept across redeploys. Queue rows never hold secrets. (Since D2 env layering, panel-api keeps the layers sealed and the worker writes the merged set before each deployment; see D2.)
 - [x] Domain route integration.
   - A loopback-only Compose override publishes the service on `127.0.0.1:<40000–49999>`.
   - A generated Nginx vhost (`scontrol-compose-<domain>.conf`) proxies to it with WebSocket upgrade, using an atomic write and rolling back if `nginx -t` fails.
@@ -109,7 +109,13 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
   - [ ] Nixpacks, Railpack, and buildpacks as opt-in pinned binaries.
   - [ ] Static apps served by Nginx from a release directory, with no container.
 - [ ] Registries with a per-project `DOCKER_CONFIG`.
-- [ ] Projects → environments → services with env layering.
+- [x] Projects → environments → services with env layering (migration `0008_projects_environments.sql`).
+  - `projects` (unique slug per owner) and `environments` (unique slug per project). Every owner of existing Compose projects gets a Default project with a `production` environment holding them. A new Compose project takes `environment_id` (default: the owner's Default/production, created on first use). Deleting an environment or project that still has services is refused (409).
+  - `env_variables`: one sealed row per variable of a project, environment, or service (exactly one scope column set). Values are AES-256-GCM sealed with `SecretBox`, AAD = layer + scope id + key, so a value moved to another scope or key fails to open.
+  - Merge rule (`panel_core::types::merge_env_layers`): project → environment → service, the most specific layer wins. The queue worker merges right before `deploy_compose_project` and calls `write_compose_environment` with the result plus the overridden values (`masked_values`, kept 0600 in `env.masked` and masked in deployment and live logs). Up to 256 variables per layer, 768 merged.
+  - API: `/api/projects` (list, create, rename, delete), `/api/projects/:id/variables`, `/api/projects/:id/environments` (create, delete), `/api/projects/:id/environments/:eid/variables`, and `/api/compose-projects/:id/variables`. GET returns key names per layer and, per key, the winning layer and the layers it overrides. PUT replaces a layer; an entry without `value` keeps the stored value. `PUT /:id/environment` and `environment` on create/deploy now store the service layer instead of writing to the agent.
+  - Services from before layering (`env_layered = false`) keep their agent env file untouched and inherit nothing until their variables are saved once; the UI says so.
+  - UI: "Projects & environments" tab (projects, environments, project and environment variables) and a layered variables editor on each Compose project showing inherited and overridden keys.
 - [ ] AES-GCM encryption at rest for every secret panel-api stores (registry, S3, GitHub App keys). Notification credentials are done; Git deploy keys and tokens stay on the agent instead (see `MEMORY.md`).
 
 ### D3: Data
@@ -172,7 +178,16 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 
 ## Validation
 
-Latest run, 2026-11-03, D2 applications (image and Dockerfile) plus Compose policy hardening (Linux x86_64, Rust 1.99.1 in a container, PostgreSQL 16):
+Latest run, 2026-11-03, D2 projects, environments, and env layering (Linux x86_64, Rust 1.99.1 in a container, PostgreSQL 16):
+
+- [x] `cargo test --workspace` with all agent features against PostgreSQL: 86 tests (agent 40, api 32, core 14); 85 passed in the container run. `git_auth::deploy_key_is_generated_private_and_replaceable` failed only because the container's uid 1000 has no passwd entry (`ssh-keygen: No user exists for uid 1000`); it passes when run as root. Default-feature agent build: 10 passed.
+  - New tests: merge precedence and overridden values, key provenance without values (core); sealed rows hold no plaintext, update keeps omitted values and rejects unknown keys and duplicates, sealed values bound to scope and key (env_layers); the worker writes the merged layers before deploying, with values absent from the queue row and from `Debug` output; legacy services keep their agent env file; API test that project, environment, and service secrets never reach responses, errors, or audit rows, plus 409 on deleting a non-empty environment or project; agent test that overridden values are kept 0600 and masked.
+- [x] Migration 0008 checked against a 0007 database holding projects of two owners: each owner got a Default/production project and every service moved into it with `env_layered = false`.
+- [x] `cargo sqlx prepare --workspace` (metadata updated), `SQLX_OFFLINE=true cargo clippy --workspace --all-targets -- -D warnings` with default and all agent features, `cargo fmt --all -- --check`, `SQLX_OFFLINE=true cargo build --release --workspace`.
+- [x] Frontend `npm run build`.
+- [ ] Not run: the new screens in a browser; a real Docker deployment of a layered service.
+
+Previous run, 2026-11-03, D2 applications (image and Dockerfile) plus Compose policy hardening (Linux x86_64, Rust 1.99.1 in a container, PostgreSQL 16):
 
 - [x] `cargo test --workspace` with all agent features against PostgreSQL: 75 tests passed (agent 39, api 25, core 11). Default-feature agent build: 10 passed.
   - New tests: image reference, relative path, and container path rules; application spec validation (hostile image, service name, mount target, empty health check, escaping build context); rendered application YAML (exact keys, exec-form health check keeps a hostile argument as one argument, absolute `env_file` only allowed for the project's own file); 25 Compose policy rejections; host-path collection; symlink resolution of host paths; the generated file replaces a planted symlink without writing through it; `RuntimeFeatures` defaults; an API test covering application validation errors, defaults, webhook refusal for image apps, and Git access/webhooks for Dockerfile apps.

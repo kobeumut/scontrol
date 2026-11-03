@@ -72,7 +72,7 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Applications (single service) | `ComposeSource::Application` (stored in the project's `source` JSONB, no extra table): Dockerfile build from Git (context and Dockerfile validated and symlink-checked inside the checkout, optional target) or a validated image reference; memory/CPU limits, restart policy, exec-form health check, named volumes. Rendered by the agent into a generated Compose file, so one deploy engine serves both. Replicas are not offered (one loopback port per domain) | D2 | ✅ |
 | Build types | Dockerfile (core). Nixpacks, Railpack, and buildpacks as opt-in pinned binaries. Static apps served by Nginx directly from a release directory, with no container | D2 | 🟡 (Dockerfile done) |
 | Registries | Per-project `DOCKER_CONFIG` directory; credentials encrypted at rest | D2 | ⬜ |
-| Projects, environments, env layering | `projects → environments → services`, merged project → environment → service at deploy time, by the agent | D2 | ⬜ |
+| Projects, environments, env layering | `projects → environments → services` (each owner gets a Default project with `production`; existing services migrate into it). Layers are sealed with `SecretBox` in PostgreSQL, merged project → environment → service (most specific wins) by the queue worker at deploy time, and written to the agent through `write_compose_environment`. Overridden values are masked in logs too; the API returns key names and layer provenance only | D2 | ✅ |
 | Databases as services | Postgres, MySQL, MariaDB, Mongo, and Redis containers bound to `127.0.0.1` with persistent named volumes. An external port only through an explicit firewall rule | D3 | ⬜ |
 | Backups to S3 | Spawn the dump tool with argv and credentials in env. Stream through gzip into an in-process S3 multipart upload, or `rclone rcat` with env credentials. Retention by count; restore streams back | D3 | ⬜ |
 | Volume backups | Optional stop, then `tar` streamed in-process from the volume mountpoint to S3, then start | D3 | ⬜ |
@@ -121,7 +121,7 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 
 **D2: Applications and builds (in progress).**
 - Application model, Dockerfile and image sources, private git, registries, environments, and encrypted secrets at rest.
-- Done: application model with image and Dockerfile sources, deploy keys, and HTTPS tokens. Open: GitHub App tokens, Nixpacks/Railpack/buildpacks, static apps, registries, environments with env layering.
+- Done: application model with image and Dockerfile sources, deploy keys, HTTPS tokens, and projects/environments with env layering. Open: GitHub App tokens, Nixpacks/Railpack/buildpacks, static apps, registries.
 
 **D3: Data.**
 - Database services, S3 backups and restore, volume backups, and systemd-timer schedules.

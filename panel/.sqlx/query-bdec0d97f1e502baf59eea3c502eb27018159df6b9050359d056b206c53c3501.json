@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT key, value_sealed FROM env_variables\n           WHERE ($1::uuid IS NOT NULL AND project_id = $1)\n              OR ($2::uuid IS NOT NULL AND environment_id = $2)\n              OR ($3::uuid IS NOT NULL AND service_id = $3)\n           ORDER BY key",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "value_sealed",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "bdec0d97f1e502baf59eea3c502eb27018159df6b9050359d056b206c53c3501"
+}

@@ -400,6 +400,7 @@ mod tests {
             "Notify test",
             &format!("p{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
             admin.id,
+            None,
             &panel_core::types::ComposeSource::Raw {
                 compose_yaml: "services: {}".into(),
             },

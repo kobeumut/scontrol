@@ -46,3 +46,8 @@ fieldset{border:1px solid var(--line);padding:12px 14px;margin:0}legend{font:11p
 .log pre{margin:0;padding:12px;max-height:420px;overflow:auto;background:#121714;color:#d9e2d3;font:12px/1.5 'DM Mono',monospace;white-space:pre-wrap;word-break:break-word}
 .log .state{padding:0 12px 10px}.secret{background:#fff6d6;border:1px solid #d8c06a;padding:9px 10px;word-break:break-all}
 @media(max-width:680px){.grid2,.grid3,.inline-form,.env-row{grid-template-columns:1fr}.panel-title{flex-wrap:wrap;gap:8px}table{display:block;overflow-x:auto}}
+/* Layered variables: where each value comes from and what it overrides. */
+.state.warn{color:#7e620a;background:#fff6d6;border:1px solid #d8c06a;padding:9px 10px}
+table.layers{margin-bottom:12px}table.layers td{padding:8px 10px}
+.badge.layer-project{border-color:#6c7fa8;color:#3d4f78}.badge.layer-environment{border-color:#ac8613;color:#7e620a}.badge.layer-service{border-color:#5e9d68;color:#296438}
+.badge.overridden{color:var(--muted);text-decoration:line-through;margin-right:4px}

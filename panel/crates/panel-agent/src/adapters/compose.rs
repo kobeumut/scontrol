@@ -11,7 +11,8 @@
 //!
 //! ```text
 //! code/                     checked-out Git source or raw Compose file
-//! env                       0600 environment file (`--env-file`)
+//! env                       0600 merged environment file (`--env-file`)
+//! env.masked                0600 overridden inherited values, masked in logs
 //! scontrol.override.yml     generated loopback port publishing for domains
 //! .scontrol-compose-path    Compose file path relative to code/
 //! domains.json              domains whose vhosts this project owns
@@ -33,7 +34,7 @@ use panel_core::adapters::{
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
     validate, ApplicationBuild, ApplicationSpec, ComposeDeployOutcome, ComposeDomainBinding,
-    ComposeServiceInfo, ComposeSource, DeploymentLogChunk,
+    ComposeServiceInfo, ComposeSource, DeploymentLogChunk, MAX_MERGED_ENV_VARS,
 };
 use serde_yaml::Value as Yaml;
 use std::collections::HashSet;
@@ -47,6 +48,8 @@ const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
 /// so the build context resolves relative to the repository root.
 const APPLICATION_COMPOSE_FILE: &str = ".scontrol-app.yml";
 const ENV_FILE: &str = "env";
+/// Overridden inherited values (0600), read only to mask them in logs.
+const MASKED_VALUES_FILE: &str = "env.masked";
 const OVERRIDE_FILE: &str = "scontrol.override.yml";
 const COMPOSE_PATH_MARKER: &str = ".scontrol-compose-path";
 const DOMAINS_FILE: &str = "domains.json";
@@ -65,11 +68,7 @@ pub async fn deploy(
 
     let env_path = root.join(ENV_FILE);
     adopt_legacy_env_file(&root, &env_path).await;
-    let mut secrets: Vec<String> = read_environment(&env_path)
-        .await?
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect();
+    let mut secrets = environment_secrets(&root).await?;
     secrets.extend(git_auth::stored_secrets(&root).await);
     let mut log = DeployLog::create(
         &root.join("logs"),
@@ -172,9 +171,46 @@ pub async fn write_project_environment(
         )));
     }
     validate_environment(&params.environment)?;
+    validate_masked_values(&params.masked_values)?;
     let root = project_root(cfg, &params.project_slug);
     create_private_dir(&root).await?;
-    write_environment(&root.join(ENV_FILE), &params.environment).await
+    write_environment(&root.join(ENV_FILE), &params.environment).await?;
+    write_private_file(
+        &root.join(MASKED_VALUES_FILE),
+        &params
+            .masked_values
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect::<String>(),
+    )
+    .await
+}
+
+/// Every environment value of the project, including overridden inherited
+/// ones, for masking in deployment and container logs.
+async fn environment_secrets(root: &Path) -> CoreResult<Vec<String>> {
+    let mut secrets: Vec<String> = read_environment(&root.join(ENV_FILE))
+        .await?
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    match tokio::fs::read_to_string(root.join(MASKED_VALUES_FILE)).await {
+        Ok(body) => secrets.extend(body.lines().map(str::to_string)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CoreError::Io(format!("reading masked values: {e}"))),
+    }
+    Ok(secrets)
+}
+
+fn validate_masked_values(values: &[String]) -> CoreResult<()> {
+    if values.len() > MAX_MERGED_ENV_VARS
+        || values
+            .iter()
+            .any(|v| v.contains('\0') || v.contains('\n') || v.len() > 16 * 1024)
+    {
+        return Err(CoreError::Validation("invalid masked values".into()));
+    }
+    Ok(())
 }
 
 pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
@@ -388,9 +424,9 @@ pub async fn follow_logs(
     let permit = LOG_FOLLOWERS.clone().try_acquire_owned().map_err(|_| {
         CoreError::External("too many live log viewers are open; close one and retry".into())
     })?;
-    let secrets = read_environment(&project_root(cfg, &params.project_slug).join(ENV_FILE))
+    let secrets = environment_secrets(&project_root(cfg, &params.project_slug))
         .await
-        .map(|env| maskable_secrets(env.into_iter().map(|(_, value)| value).collect()))
+        .map(maskable_secrets)
         .unwrap_or_default();
 
     let mut args = compose_args(&params.project_slug, &paths);
@@ -484,7 +520,7 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
 }
 
 fn validate_environment(environment: &[(String, String)]) -> CoreResult<()> {
-    if environment.len() > 256 {
+    if environment.len() > MAX_MERGED_ENV_VARS {
         return Err(CoreError::Validation(
             "too many environment variables".into(),
         ));
@@ -1025,6 +1061,11 @@ async fn write_environment(path: &Path, environment: &[(String, String)]) -> Cor
         body.push_str(value);
         body.push('\n');
     }
+    write_private_file(path, &body).await
+}
+
+/// Replaces `path` with `body`, readable by root only (0600).
+async fn write_private_file(path: &Path, body: &str) -> CoreResult<()> {
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
@@ -1818,6 +1859,40 @@ mod tests {
         assert_eq!(read_environment(&path).await.unwrap(), env);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn overridden_inherited_values_are_kept_private_for_masking() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("scontrol-mask-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let cfg = AgentConfig {
+            docker_projects_root: base.clone(),
+            ..AgentConfig::default()
+        };
+        write_project_environment(
+            &cfg,
+            WriteComposeEnvironmentParams {
+                project_slug: "layered".into(),
+                environment: vec![("DB_URL".into(), "service-value-1".into())],
+                masked_values: vec!["project-value-1".into()],
+            },
+        )
+        .await
+        .unwrap();
+        let root = project_root(&cfg, "layered");
+        let secrets = maskable_secrets(environment_secrets(&root).await.unwrap());
+        let line = redact("db=service-value-1 old=project-value-1", &secrets);
+        assert!(!line.contains("service-value-1"), "{line}");
+        assert!(!line.contains("project-value-1"), "{line}");
+        let mode = std::fs::metadata(root.join(MASKED_VALUES_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(validate_masked_values(&["a\nb".into()]).is_err());
         std::fs::remove_dir_all(base).ok();
     }
 

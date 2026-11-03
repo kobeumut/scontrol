@@ -12,6 +12,8 @@ struct ProjectRecord {
     name: String,
     slug: String,
     owner_user_id: Uuid,
+    environment_id: Uuid,
+    env_layered: bool,
     source: serde_json::Value,
     status: String,
     created_at: DateTime<Utc>,
@@ -25,6 +27,8 @@ impl ProjectRecord {
             name: self.name,
             slug: self.slug,
             owner_user_id: self.owner_user_id,
+            environment_id: self.environment_id,
+            env_layered: self.env_layered,
             source: serde_json::from_value(self.source)?,
             status: DeploymentStatus::from_str(&self.status).map_err(anyhow::Error::msg)?,
             created_at: self.created_at,
@@ -104,18 +108,28 @@ pub async fn create(
     name: &str,
     slug: &str,
     owner_user_id: Uuid,
+    environment_id: Option<Uuid>,
     source: &ComposeSource,
 ) -> anyhow::Result<ComposeProject> {
+    let environment_id = match environment_id {
+        Some(id) => id,
+        None => super::projects::default_environment(pool, owner_user_id).await?,
+    };
     let source = serde_json::to_value(source)?;
+    // A service created by the panel starts layered: the panel holds its
+    // own variables from the first write on.
     let record = sqlx::query_as!(
         ProjectRecord,
-        r#"INSERT INTO compose_projects (id, name, slug, owner_user_id, source)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING id, name, slug, owner_user_id, source, status, created_at, updated_at"#,
+        r#"INSERT INTO compose_projects
+               (id, name, slug, owner_user_id, environment_id, env_layered, source)
+           VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+           RETURNING id, name, slug, owner_user_id, environment_id, env_layered, source, status,
+                     created_at, updated_at"#,
         id,
         name,
         slug,
         owner_user_id,
+        environment_id,
         source,
     )
     .fetch_one(pool)
@@ -126,7 +140,7 @@ pub async fn create(
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<ComposeProject>> {
     let record = sqlx::query_as!(
         ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, source, status, created_at, updated_at FROM compose_projects WHERE id = $1",
+        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects WHERE id = $1",
         id,
     )
     .fetch_optional(pool)
@@ -140,7 +154,7 @@ pub async fn list_for_owner(
 ) -> anyhow::Result<Vec<ComposeProject>> {
     let records = sqlx::query_as!(
         ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, source, status, created_at, updated_at FROM compose_projects WHERE owner_user_id = $1 ORDER BY created_at DESC",
+        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects WHERE owner_user_id = $1 ORDER BY created_at DESC",
         owner_user_id,
     )
     .fetch_all(pool)
@@ -154,7 +168,7 @@ pub async fn list_for_owner(
 pub async fn list_all(pool: &PgPool) -> anyhow::Result<Vec<ComposeProject>> {
     let records = sqlx::query_as!(
         ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, source, status, created_at, updated_at FROM compose_projects ORDER BY created_at DESC",
+        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await?;

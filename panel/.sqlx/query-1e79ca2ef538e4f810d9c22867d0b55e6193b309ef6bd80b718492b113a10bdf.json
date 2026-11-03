@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, slug, owner_user_id, source, status, created_at, updated_at FROM compose_projects WHERE owner_user_id = $1 ORDER BY created_at DESC",
+  "query": "INSERT INTO projects (id, name, slug, owner_user_id) VALUES ($1, $2, $3, $4)\n           RETURNING id, name, slug, owner_user_id, created_at, updated_at",
   "describe": {
     "columns": [
       {
@@ -25,27 +25,20 @@
       },
       {
         "ordinal": 4,
-        "name": "source",
-        "type_info": "Jsonb"
-      },
-      {
-        "ordinal": 5,
-        "name": "status",
-        "type_info": "Text"
-      },
-      {
-        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 5,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Text",
+        "Text",
         "Uuid"
       ]
     },
@@ -55,10 +48,8 @@
       false,
       false,
       false,
-      false,
-      false,
       false
     ]
   },
-  "hash": "5a7b31900bf203f30755f9e85ee0ee2a6ced85122a80b90b785a1d78b17fc3d2"
+  "hash": "1e79ca2ef538e4f810d9c22867d0b55e6193b309ef6bd80b718492b113a10bdf"
 }

@@ -157,6 +157,7 @@ mod tests {
             "Webhook test",
             &format!("p{}", &Uuid::new_v4().simple().to_string()[..12]),
             owner.id,
+            None,
             &ComposeSource::Git {
                 repository_url: "https://example.com/app.git".into(),
                 branch: "main".into(),

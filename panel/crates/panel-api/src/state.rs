@@ -18,6 +18,8 @@ pub struct AppState {
     pub deploy_queue: DeployQueue,
     pub webhook_key: WebhookKey,
     pub notifier: Notifier,
+    /// Seals stored secrets (layered environment variables).
+    pub secret_box: SecretBox,
 }
 
 impl AppState {
@@ -30,6 +32,7 @@ impl AppState {
             deploy_queue: DeployQueue::new(),
             webhook_key: WebhookKey::derive(&config.cookie_key),
             notifier: Notifier::new(SecretBox::derive(&config.secret_key)),
+            secret_box: SecretBox::derive(&config.secret_key),
         }
     }
 }

@@ -9,14 +9,20 @@
 //! poll at a slow interval, so an idle panel costs one indexed query per
 //! worker every [`IDLE_POLL`].
 //!
-//! Job rows never contain environment values: those are written to the
-//! agent before the job is queued.
+//! Job rows never contain environment values. Right before a deployment
+//! the worker merges the service's sealed variable layers (project →
+//! environment → service, see `services::env_layers`) and writes the result
+//! to the agent with `write_compose_environment`.
 
 use crate::db;
 use crate::db::compose_projects::ClaimedDeployment;
 use crate::error::ApiResult;
+use crate::services::env_layers;
 use crate::services::notifications::Notifier;
-use panel_core::adapters::{AdapterPort, DeployComposeProjectParams};
+use crate::services::secret_box::SecretBox;
+use panel_core::adapters::{
+    AdapterPort, DeployComposeProjectParams, WriteComposeEnvironmentParams,
+};
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
     ComposeDeployOutcome, ComposeDomainBinding, DeploymentInfo, DeploymentStatus,
@@ -47,12 +53,15 @@ impl DeployQueue {
         db: PgPool,
         agent: Arc<dyn AdapterPort>,
         notifier: Notifier,
+        secrets: SecretBox,
         workers: usize,
     ) {
         for worker in 0..workers.max(1) {
             let (db, agent, wake) = (db.clone(), agent.clone(), self.wake.clone());
-            let notifier = notifier.clone();
-            tokio::spawn(async move { worker_loop(worker, db, agent, notifier, wake).await });
+            let (notifier, secrets) = (notifier.clone(), secrets.clone());
+            tokio::spawn(
+                async move { worker_loop(worker, db, agent, notifier, secrets, wake).await },
+            );
         }
     }
 
@@ -96,6 +105,7 @@ async fn worker_loop(
     db: PgPool,
     agent: Arc<dyn AdapterPort>,
     notifier: Notifier,
+    secrets: SecretBox,
     wake: Arc<Notify>,
 ) {
     loop {
@@ -103,7 +113,7 @@ async fn worker_loop(
             Ok(Some(job)) => {
                 tracing::info!(worker, deployment_id = %job.id, project_id = %job.project_id, "deployment started");
                 let (project_id, deployment_id) = (job.project_id, job.id);
-                run_job(&db, agent.as_ref(), job).await;
+                run_job(&db, agent.as_ref(), &secrets, job).await;
                 notifier.deployment_finished(db.clone(), project_id, deployment_id);
                 continue;
             }
@@ -117,8 +127,13 @@ async fn worker_loop(
     }
 }
 
-pub(crate) async fn run_job(db: &PgPool, agent: &dyn AdapterPort, job: ClaimedDeployment) {
-    let result = execute(db, agent, &job).await;
+pub(crate) async fn run_job(
+    db: &PgPool,
+    agent: &dyn AdapterPort,
+    secrets: &SecretBox,
+    job: ClaimedDeployment,
+) {
+    let result = execute(db, agent, secrets, &job).await;
     let message = result.as_ref().err().map(ToString::to_string);
     let (status, commit) = match &result {
         Ok(outcome) => (DeploymentStatus::Succeeded, outcome.commit_sha.as_deref()),
@@ -137,12 +152,29 @@ pub(crate) async fn run_job(db: &PgPool, agent: &dyn AdapterPort, job: ClaimedDe
 async fn execute(
     db: &PgPool,
     agent: &dyn AdapterPort,
+    secrets: &SecretBox,
     job: &ClaimedDeployment,
 ) -> CoreResult<ComposeDeployOutcome> {
     let project = db::compose_projects::find_by_id(db, job.project_id)
         .await
         .map_err(|e| CoreError::External(format!("loading project: {e}")))?
         .ok_or_else(|| CoreError::NotFound("project no longer exists".into()))?;
+    // A service that predates layering keeps the env file the agent has;
+    // the panel does not know its own variables, so overwriting it would
+    // lose them.
+    if project.env_layered {
+        let (environment, masked_values) = env_layers::merged_for_service(db, secrets, project.id)
+            .await
+            // Errors name keys at most (decryption failures name none).
+            .map_err(|e| CoreError::External(format!("loading environment variables: {e}")))?;
+        agent
+            .write_compose_environment(WriteComposeEnvironmentParams {
+                project_slug: project.slug.clone(),
+                environment,
+                masked_values,
+            })
+            .await?;
+    }
     let domains = db::compose_projects::list_domains(db, project.id)
         .await
         .map_err(|e| CoreError::External(format!("loading domains: {e}")))?;
@@ -204,6 +236,7 @@ mod tests {
             "Test",
             &slug,
             owner.id,
+            None,
             &ComposeSource::Raw {
                 compose_yaml: "services:\n  web:\n    image: nginx".into(),
             },
@@ -224,6 +257,10 @@ mod tests {
                 .unwrap();
         }
         None
+    }
+
+    fn test_secrets() -> SecretBox {
+        SecretBox::derive(&[9u8; 32])
     }
 
     #[test]
@@ -254,7 +291,7 @@ mod tests {
         // The second job must wait while the first one runs.
         assert!(claim_for(&pool, project.id).await.is_none());
 
-        run_job(&pool, &MockAdapter::new(), claimed).await;
+        run_job(&pool, &MockAdapter::new(), &test_secrets(), claimed).await;
         let done = compose_projects::find_deployment(&pool, project.id, first.id)
             .await
             .unwrap()
@@ -284,7 +321,7 @@ mod tests {
         let job = claim_for(&pool, project.id).await.unwrap();
         let adapter = MockAdapter::new();
         adapter.fail_next_call("deploy_compose_project");
-        run_job(&pool, &adapter, job).await;
+        run_job(&pool, &adapter, &test_secrets(), job).await;
 
         let failed = compose_projects::find_deployment(&pool, project.id, queued.id)
             .await
@@ -315,7 +352,7 @@ mod tests {
             "deploy_compose_project",
             CoreError::Cancelled("deployment cancelled".into()),
         );
-        run_job(&pool, &adapter, job).await;
+        run_job(&pool, &adapter, &test_secrets(), job).await;
         let cancelled = compose_projects::find_deployment(&pool, project.id, queued.id)
             .await
             .unwrap()
@@ -358,6 +395,111 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancelled.status, DeploymentStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn deployment_writes_the_merged_layers_to_the_agent_first() {
+        use crate::db::projects::EnvScope;
+        let _serial = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let secrets = test_secrets();
+        let project = project(&pool).await;
+        let (environment_id, project_scope_id) =
+            crate::db::projects::service_scopes(&pool, project.id)
+                .await
+                .unwrap()
+                .unwrap();
+        let set = |scope, items: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = items
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let (pool, secrets) = (pool.clone(), secrets.clone());
+            async move { env_layers::replace(&pool, &secrets, scope, &pairs).await }
+        };
+        set(
+            EnvScope::Project(project_scope_id),
+            &[
+                ("SHARED", "from-project-xx"),
+                ("ONLY_PROJECT", "p-value-xx"),
+            ],
+        )
+        .await
+        .unwrap();
+        set(
+            EnvScope::Environment(environment_id),
+            &[("SHARED", "from-env-xx"), ("ONLY_ENV", "e-value-xx")],
+        )
+        .await
+        .unwrap();
+        set(
+            EnvScope::Service(project.id),
+            &[("SHARED", "from-service-xx")],
+        )
+        .await
+        .unwrap();
+
+        let queued = DeployQueue::new()
+            .enqueue(&pool, project.id, &project.slug, false, "manual")
+            .await
+            .unwrap();
+        let job = claim_for(&pool, project.id).await.unwrap();
+        let adapter = MockAdapter::new();
+        run_job(&pool, &adapter, &secrets, job).await;
+
+        let calls = adapter.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["write_compose_environment", "deploy_compose_project"]
+        );
+        let writes = adapter.environment_writes.lock().unwrap().clone();
+        let mut env = writes[0].environment.clone();
+        env.sort();
+        assert_eq!(
+            env,
+            vec![
+                ("ONLY_ENV".to_string(), "e-value-xx".to_string()),
+                ("ONLY_PROJECT".to_string(), "p-value-xx".to_string()),
+                ("SHARED".to_string(), "from-service-xx".to_string()),
+            ]
+        );
+        let mut masked = writes[0].masked_values.clone();
+        masked.sort();
+        assert_eq!(masked, vec!["from-env-xx", "from-project-xx"]);
+        // Debug output (what a stray log line would print) has no values.
+        let debug = format!("{:?}", writes[0]);
+        assert!(!debug.contains("-xx"), "{debug}");
+
+        let row: String =
+            sqlx::query_scalar("SELECT to_jsonb(d)::text FROM compose_deployments d WHERE id = $1")
+                .bind(queued.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!row.contains("-xx"), "{row}");
+    }
+
+    #[tokio::test]
+    async fn legacy_services_keep_their_agent_env_file() {
+        let _serial = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let project = project(&pool).await;
+        sqlx::query("UPDATE compose_projects SET env_layered = FALSE WHERE id = $1")
+            .bind(project.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        DeployQueue::new()
+            .enqueue(&pool, project.id, &project.slug, false, "manual")
+            .await
+            .unwrap();
+        let job = claim_for(&pool, project.id).await.unwrap();
+        let adapter = MockAdapter::new();
+        run_job(&pool, &adapter, &test_secrets(), job).await;
+        assert_eq!(
+            adapter.calls.lock().unwrap().clone(),
+            vec!["deploy_compose_project"]
+        );
     }
 
     #[tokio::test]

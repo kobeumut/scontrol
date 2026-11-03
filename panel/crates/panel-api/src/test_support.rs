@@ -53,6 +53,7 @@ pub fn app_state(pool: PgPool, adapter: Arc<MockAdapter>) -> AppState {
         deploy_queue: DeployQueue::new(),
         webhook_key: WebhookKey::derive(&key),
         notifier: Notifier::new(SecretBox::derive(&key)),
+        secret_box: SecretBox::derive(&key),
     }
 }
 

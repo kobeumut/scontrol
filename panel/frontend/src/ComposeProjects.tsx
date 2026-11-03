@@ -1,8 +1,9 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import {
   api, ApiState, ApplicationBuild, ApplicationSpec, ComposeProject, ComposeSource, Deployment, Domain, duration,
-  formatTime, GitAccess, gitCheckout, gitTransport, isActive, LogChunk, RestartPolicy, ServiceInfo, sourceLabel, useApi,
+  formatTime, GitAccess, gitCheckout, gitTransport, isActive, LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, useApi,
 } from './api';
+import { LayeredVariables } from './Variables';
 
 type EnvRow = { key: string; value: string };
 
@@ -54,8 +55,17 @@ export function ComposeProjects() {
   return <ProjectList onOpen={setOpenId} />;
 }
 
+/** `Project / environment` label of every environment, by environment id. */
+function environmentLabels(projects?: Project[]): Map<string, string> {
+  const labels = new Map<string, string>();
+  for (const p of projects ?? []) for (const e of p.environments) labels.set(e.id, `${p.name} / ${e.name}`);
+  return labels;
+}
+
 function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
   const projects = useApi<ComposeProject[]>('/compose-projects', 5000);
+  const groups = useApi<Project[]>('/projects');
+  const labels = environmentLabels(groups.data);
   const [creating, setCreating] = useState(false);
 
   return <section className="panel">
@@ -64,14 +74,15 @@ function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
       <button className="action" onClick={() => setCreating((c) => !c)}>{creating ? 'Close' : 'New project'}</button>
     </div>
     <p className="hint">Compose projects (Git or raw) and single-service applications (image or Dockerfile) with a durable queue, write-only environment and streamed logs.</p>
-    {creating && <CreateProjectForm onCreated={(id) => { setCreating(false); onOpen(id); }} />}
+    {creating && <CreateProjectForm projects={groups.data} onCreated={(id) => { setCreating(false); onOpen(id); }} />}
     <StateView state={projects} />
-    {projects.data && <table><thead><tr><th>Project</th><th>Slug</th><th>Source</th><th>Status</th></tr></thead><tbody>
+    {projects.data && <table><thead><tr><th>Project</th><th>Slug</th><th>Environment</th><th>Source</th><th>Status</th></tr></thead><tbody>
       {projects.data.length === 0
-        ? <tr><td colSpan={4} className="empty">No Compose projects yet.</td></tr>
+        ? <tr><td colSpan={5} className="empty">No Compose projects yet.</td></tr>
         : projects.data.map((project) => <tr key={project.id} className="clickable" onClick={() => onOpen(project.id)}>
           <td><button className="link strong" onClick={() => onOpen(project.id)}>{project.name}</button></td>
           <td className="mono">{project.slug}</td>
+          <td>{labels.get(project.environment_id) ?? '—'}</td>
           <td>{sourceLabel(project.source)}</td>
           <td><span className={`badge ${project.status}`}>{project.status}</span></td>
         </tr>)}
@@ -81,8 +92,10 @@ function ProjectList({ onOpen }: { onOpen: (id: string) => void }) {
 
 const SAMPLE_COMPOSE = 'services:\n  web:\n    image: traefik/whoami:v1.10\n';
 
-function CreateProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
+function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCreated: (id: string) => void }) {
   const [name, setName] = useState('');
+  // Empty: the owner's Default project, production environment.
+  const [environmentId, setEnvironmentId] = useState('');
   const [slug, setSlug] = useState('');
   const [kind, setKind] = useState<SourceChoice>('git');
   const [repo, setRepo] = useState('');
@@ -120,7 +133,10 @@ function CreateProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
     action.run(async () => {
       const created = await api<{ project: ComposeProject }>('/compose-projects', {
         method: 'POST',
-        body: { name: name.trim(), slug: slug.trim(), source, environment: toPairs(env), git_credentials, deploy },
+        body: {
+          name: name.trim(), slug: slug.trim(), environment_id: environmentId || undefined, source,
+          environment: toPairs(env), git_credentials, deploy,
+        },
       });
       setToken('');
       onCreated(created.project.id);
@@ -136,6 +152,10 @@ function CreateProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
       <label>Slug<input required className="mono" pattern="[a-z][a-z0-9-]{2,47}" value={slug}
         onChange={(e) => setSlug(e.target.value)} /></label>
     </div>
+    <label>Project / environment<select value={environmentId} onChange={(e) => setEnvironmentId(e.target.value)}>
+      <option value="">Default / production</option>
+      {(projects ?? []).flatMap((p) => p.environments.map((e) => <option key={e.id} value={e.id}>{p.name} / {e.name}</option>))}
+    </select></label>
     <div className="segmented" role="radiogroup" aria-label="Source">
       {SOURCE_CHOICES.map(([k, label]) => <button type="button" key={k} role="radio" aria-checked={kind === k}
         className={kind === k ? 'selected' : ''} onClick={() => setKind(k)}>{label}</button>)}
@@ -162,7 +182,9 @@ function CreateProjectForm({ onCreated }: { onCreated: (id: string) => void }) {
       <p className="hint">GitHub: <span className="mono">x-access-token</span> with a fine-grained token. GitLab: <span className="mono">oauth2</span>. Gitea/Forgejo: your login name.</p>
     </fieldset>}
     {transport === 'ssh' && <p className="hint">SSH remote: after creating, generate the project deploy key under Git access, add it to the repository as a read-only deploy key, then deploy.</p>}
-    <fieldset><legend>Environment (write-only)</legend><EnvEditor rows={env} onChange={setEnv} /></fieldset>
+    <fieldset><legend>Service variables (write-only)</legend>
+      <p className="hint">Inherited from the project and environment; set here to override them for this service only.</p>
+      <EnvEditor rows={env} onChange={setEnv} /></fieldset>
     <label className="check"><input type="checkbox" checked={deploy} onChange={(e) => setDeployNow(e.target.checked)} /> deploy right away</label>
     <ErrorLine error={action.error} />
     <button className="action" disabled={action.busy}>{action.busy ? 'Creating…' : deploy ? 'Create and deploy' : 'Create'}</button>
@@ -306,7 +328,8 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <Services projectId={id} refreshKey={latest?.status} />
       <ContainerLogs projectId={id} />
       <Domains projectId={id} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
-      <Environment projectId={id} />
+      <LayeredVariables path={`/compose-projects/${id}/variables`} layer="service" title="Variables"
+        hint="Write-only. Merged at each deployment: project → environment → this service, the most specific value wins. Stored values are never shown again." />
       {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
       {gitCheckout(project.data.source) && <Webhook projectId={id} />}
     </>}
@@ -512,26 +535,6 @@ function Domains({ projectId, onDeploy }: { projectId: string; onDeploy: (deploy
       <label className="check"><input type="checkbox" checked={https} onChange={(e) => setHttps(e.target.checked)} /> HTTPS</label>
       <button className="action" disabled={action.busy}>Add domain</button>
     </form>
-    <ErrorLine error={action.error} />
-  </>;
-}
-
-function Environment({ projectId }: { projectId: string }) {
-  const [rows, setRows] = useState<EnvRow[]>([]);
-  const [saved, setSaved] = useState(false);
-  const action = useAction();
-  const save = () => action.run(async () => {
-    await api(`/compose-projects/${projectId}/environment`, { method: 'PUT', body: { environment: toPairs(rows) } });
-    setRows([]); setSaved(true);
-  });
-  return <>
-    <h3>Environment</h3>
-    <p className="hint">Write-only. Saving replaces the whole set; stored values are never shown again. The next deployment uses it.</p>
-    <EnvEditor rows={rows} onChange={(r) => { setRows(r); setSaved(false); }} />
-    <div className="toolbar">
-      <button className="ghost" disabled={action.busy || rows.length === 0} onClick={save}>Replace environment</button>
-      {saved && <span className="state">Saved. Deploy to apply.</span>}
-    </div>
     <ErrorLine error={action.error} />
   </>;
 }

@@ -43,8 +43,33 @@ export type DeploymentStatus = 'queued' | 'running' | 'succeeded' | 'failed' | '
 
 export type ComposeProject = {
   id: string; name: string; slug: string; status: DeploymentStatus; source: ComposeSource;
+  /** Environment (of a project) the service inherits variables from. */
+  environment_id: string;
+  /** False for a service that predates layering: nothing is inherited until its variables are saved. */
+  env_layered: boolean;
   created_at: string; updated_at: string;
 };
+
+export type Environment = {
+  id: string; project_id: string; name: string; slug: string; service_count: number;
+  created_at: string; updated_at: string;
+};
+
+export type Project = {
+  id: string; name: string; slug: string; owner_user_id: string; environments: Environment[];
+  created_at: string; updated_at: string;
+};
+
+/** Least to most specific; a later layer overrides an earlier one. */
+export type EnvLayer = 'project' | 'environment' | 'service';
+export const ENV_LAYERS: EnvLayer[] = ['project', 'environment', 'service'];
+
+/** Key names only: stored values are write-only and never returned. */
+export type EnvKeyInfo = { key: string; source: EnvLayer; overrides: EnvLayer[] };
+export type EnvLayerKeys = { layer: EnvLayer; keys: string[] };
+export type LayerVariables = { layers: EnvLayerKeys[]; variables: EnvKeyInfo[]; layered?: boolean };
+/** `value` omitted keeps the stored value of an existing key. */
+export type VariableInput = { key: string; value?: string };
 
 export type Deployment = {
   id: string; project_id: string; status: DeploymentStatus; trigger: string; commit_sha: string | null;

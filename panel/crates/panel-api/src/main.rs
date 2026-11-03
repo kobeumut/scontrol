@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         state.db.clone(),
         state.agent.clone(),
         state.notifier.clone(),
+        state.secret_box.clone(),
         config.deploy_workers,
     );
     tracing::info!(
