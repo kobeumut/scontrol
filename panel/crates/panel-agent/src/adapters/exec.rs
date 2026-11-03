@@ -89,6 +89,41 @@ pub async fn run_with_stdin(program: &str, args: &[&str], stdin: &[u8]) -> CoreR
     checked_stdout(program, output)
 }
 
+/// Same as [`run_with_stdin`], with extra environment variables for the
+/// child (e.g. `DOCKER_CONFIG`).
+#[cfg(feature = "docker")]
+pub async fn run_with_stdin_env(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin: &[u8],
+) -> CoreResult<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    check_program(program)?;
+    tracing::debug!(program, ?args, "exec (stdin, env)");
+    let mut child = Command::new(program)
+        .args(args)
+        .envs(envs.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))?;
+    let mut pipe = child.stdin.take().expect("piped stdin");
+    pipe.write_all(stdin)
+        .await
+        .map_err(|e| CoreError::Io(format!("writing {program} stdin: {e}")))?;
+    drop(pipe);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+        .await
+        .map_err(|_| CoreError::External(format!("{program} timed out")))?
+        .map_err(|e| CoreError::Io(format!("waiting for {program}: {e}")))?;
+    checked_stdout(program, output)
+}
+
 fn checked_stdout(program: &str, output: std::process::Output) -> CoreResult<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -396,11 +431,11 @@ mod tests {
     #[test]
     fn every_spawn_goes_through_exec_with_a_literal_allowed_program() {
         let call = regex::Regex::new(
-            r"\b(run|run_allow_nonzero|run_streamed|run_with_stdin|follow_lines|exec_replace)\(",
+            r"\b(run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|follow_lines|exec_replace)\(",
         )
         .unwrap();
         let literal = regex::Regex::new(
-            r#"^\b(?:run|run_allow_nonzero|run_streamed|run_with_stdin|follow_lines|exec_replace)\(\s*"([^"]+)""#,
+            r#"^\b(?:run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|follow_lines|exec_replace)\(\s*"([^"]+)""#,
         )
         .unwrap();
         let mut files = Vec::new();

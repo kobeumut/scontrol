@@ -8,6 +8,8 @@ pub mod database;
 pub mod deploy_log;
 #[cfg(feature = "docker")]
 pub mod docker;
+#[cfg(feature = "docker")]
+pub mod docker_config;
 pub mod exec;
 pub mod firewall;
 #[cfg(feature = "docker")]
@@ -261,6 +263,36 @@ impl AdapterPort for LocalAdapter {
                 return Err(Self::feature_disabled("docker"));
             }
             return git_auth::write_credentials(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn write_docker_config(&self, params: WriteDockerConfigParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return docker_config::write_config(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn test_docker_registry(&self, params: TestDockerRegistryParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return docker_config::test_registry(&self.config, params).await;
         }
         #[cfg(not(feature = "docker"))]
         {

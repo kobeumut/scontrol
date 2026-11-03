@@ -228,6 +228,12 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         AgentRequest::WriteGitCredentials(p) => {
             AgentResponse::from_core_result(adapter.write_git_credentials(p).await)
         }
+        AgentRequest::WriteDockerConfig(p) => {
+            AgentResponse::from_core_result(adapter.write_docker_config(p).await)
+        }
+        AgentRequest::TestDockerRegistry(p) => {
+            AgentResponse::from_core_result(adapter.test_docker_registry(p).await)
+        }
         AgentRequest::StopComposeProject(p) => {
             AgentResponse::from_core_result(adapter.stop_compose_project(p).await)
         }

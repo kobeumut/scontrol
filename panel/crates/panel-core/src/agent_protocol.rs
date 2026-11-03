@@ -40,6 +40,8 @@ pub enum AgentRequest {
     GenerateDeployKey(ComposeProjectActionParams),
     RemoveDeployKey(ComposeProjectActionParams),
     WriteGitCredentials(WriteGitCredentialsParams),
+    WriteDockerConfig(WriteDockerConfigParams),
+    TestDockerRegistry(TestDockerRegistryParams),
     StopComposeProject(ComposeProjectActionParams),
     RemoveComposeProject(ComposeProjectActionParams),
     ListComposeProjectServices(ComposeProjectActionParams),

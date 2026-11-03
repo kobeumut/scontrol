@@ -982,9 +982,103 @@ pub mod validate {
     static GIT_USERNAME_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$").unwrap());
 
+    /// Key under which Docker stores Docker Hub credentials.
+    pub const DOCKER_HUB_AUTH_KEY: &str = "https://index.docker.io/v1/";
+
+    /// Normalizes a registry address to the key used in `config.json`
+    /// `auths`: `host` or `host:port`, lowercase, no scheme or path. Docker
+    /// Hub's names collapse to [`DOCKER_HUB_AUTH_KEY`]. `None` rejects
+    /// anything else (userinfo, paths, whitespace, bad ports).
+    pub fn registry_auth_key(server: &str) -> Option<String> {
+        let trimmed = server.trim().to_ascii_lowercase();
+        let host_port = trimmed.strip_prefix("https://").unwrap_or(&trimmed);
+        let host_port = host_port.strip_suffix("/v1/").unwrap_or(host_port);
+        let host_port = host_port.strip_suffix('/').unwrap_or(host_port);
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            || !is_valid_git_host(host)
+        {
+            return None;
+        }
+        if let Some(port) = port {
+            if !(1..=5).contains(&port.len())
+                || !port.chars().all(|c| c.is_ascii_digit())
+                || port
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|p| (1..=65535).contains(p))
+                    .is_none()
+            {
+                return None;
+            }
+        }
+        if port.is_none()
+            && matches!(
+                host,
+                "docker.io"
+                    | "index.docker.io"
+                    | "registry-1.docker.io"
+                    | "registry.hub.docker.com"
+            )
+        {
+            return Some(DOCKER_HUB_AUTH_KEY.to_string());
+        }
+        Some(host_port.to_string())
+    }
+
+    /// A registry password or access token: printable, no whitespace.
+    pub fn is_valid_registry_secret(secret: &str) -> bool {
+        !secret.is_empty()
+            && secret.len() <= 4096
+            && !secret.chars().any(|c| c.is_control() || c.is_whitespace())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn registry_addresses_normalize_to_docker_auth_keys() {
+            assert_eq!(registry_auth_key("GHCR.io").as_deref(), Some("ghcr.io"));
+            assert_eq!(
+                registry_auth_key("https://registry.gitlab.com/").as_deref(),
+                Some("registry.gitlab.com")
+            );
+            assert_eq!(
+                registry_auth_key("123.dkr.ecr.eu-west-1.amazonaws.com").as_deref(),
+                Some("123.dkr.ecr.eu-west-1.amazonaws.com")
+            );
+            assert_eq!(
+                registry_auth_key("registry.local:5000").as_deref(),
+                Some("registry.local:5000")
+            );
+            for hub in [
+                "docker.io",
+                "index.docker.io",
+                "https://index.docker.io/v1/",
+            ] {
+                assert_eq!(registry_auth_key(hub).as_deref(), Some(DOCKER_HUB_AUTH_KEY));
+            }
+            for bad in [
+                "",
+                "user@ghcr.io",
+                "ghcr.io/org",
+                "ghcr.io:0",
+                "ghcr.io:99999",
+                "ghcr.io:x",
+                "gh cr.io",
+                "-ghcr.io",
+                "http://ghcr.io",
+            ] {
+                assert_eq!(registry_auth_key(bad), None, "{bad:?}");
+            }
+        }
 
         #[test]
         fn accepts_valid_domains() {

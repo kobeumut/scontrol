@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
+import { RegistrySelect } from './Registries';
 import {
   api, ApiState, ApplicationBuild, ApplicationSpec, ComposeProject, ComposeSource, Deployment, Domain, duration,
   formatTime, GitAccess, gitCheckout, gitTransport, isActive, LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, useApi,
@@ -109,6 +110,7 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
   const [env, setEnv] = useState<EnvRow[]>([]);
   const [tokenUser, setTokenUser] = useState('x-access-token');
   const [token, setToken] = useState('');
+  const [registryId, setRegistryId] = useState('');
   const [deployNow, setDeployNow] = useState<boolean>();
   const action = useAction();
   const fromGit = kind === 'git' || kind === 'dockerfile';
@@ -135,7 +137,7 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
         method: 'POST',
         body: {
           name: name.trim(), slug: slug.trim(), environment_id: environmentId || undefined, source,
-          environment: toPairs(env), git_credentials, deploy,
+          environment: toPairs(env), git_credentials, deploy, registry_id: registryId || undefined,
         },
       });
       setToken('');
@@ -182,6 +184,7 @@ function CreateProjectForm({ projects, onCreated }: { projects?: Project[]; onCr
       <p className="hint">GitHub: <span className="mono">x-access-token</span> with a fine-grained token. GitLab: <span className="mono">oauth2</span>. Gitea/Forgejo: your login name.</p>
     </fieldset>}
     {transport === 'ssh' && <p className="hint">SSH remote: after creating, generate the project deploy key under Git access, add it to the repository as a read-only deploy key, then deploy.</p>}
+    <RegistrySelect value={registryId} onChange={setRegistryId} />
     <fieldset><legend>Service variables (write-only)</legend>
       <p className="hint">Inherited from the project and environment; set here to override them for this service only.</p>
       <EnvEditor rows={env} onChange={setEnv} /></fieldset>
@@ -330,6 +333,7 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <Domains projectId={id} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
       <LayeredVariables path={`/compose-projects/${id}/variables`} layer="service" title="Variables"
         hint="Write-only. Merged at each deployment: project → environment → this service, the most specific value wins. Stored values are never shown again." />
+      <RegistryPanel projectId={id} />
       {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
       {gitCheckout(project.data.source) && <Webhook projectId={id} />}
     </>}
@@ -543,6 +547,26 @@ function Domains({ projectId, onDeploy }: { projectId: string; onDeploy: (deploy
  * Deploy key (SSH remotes) or write-only token (HTTPS remotes). The deploy
  * key's private half never leaves the server; the token is never shown again.
  */
+/** Which private registry the project's image pulls use. */
+function RegistryPanel({ projectId }: { projectId: string }) {
+  const current = useApi<{ registry_id: string | null }>(`/compose-projects/${projectId}/registry`);
+  const action = useAction();
+  const [saved, setSaved] = useState(false);
+  const change = (registryId: string) => action.run(async () => {
+    setSaved(false);
+    await api(`/compose-projects/${projectId}/registry`, { method: 'PUT', body: { registry_id: registryId || null } });
+    current.reload(); setSaved(true);
+  });
+  return <>
+    <h3>Registry</h3>
+    <StateView state={current} />
+    {current.data && <RegistrySelect value={current.data.registry_id ?? ''} onChange={change} disabled={action.busy} />}
+    <p className="hint">The login is used by the next deployment's image pulls. Enable "pull images" when deploying to fetch newer tags.</p>
+    <ErrorLine error={action.error} />
+    {saved && <p className="state" role="status">Saved.</p>}
+  </>;
+}
+
 function GitAccessPanel({ projectId }: { projectId: string }) {
   const base = `/compose-projects/${projectId}/git-access`;
   const access = useApi<GitAccess>(base);

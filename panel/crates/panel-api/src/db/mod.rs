@@ -5,6 +5,7 @@ pub mod databases;
 pub mod firewall;
 pub mod notifications;
 pub mod projects;
+pub mod registries;
 pub mod sites;
 pub mod users;
 
