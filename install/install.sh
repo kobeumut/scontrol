@@ -109,7 +109,11 @@ create_accounts_and_dirs() {
 }
 
 random_cookie_key() {
-  # 32 raw bytes encoded once; never print it or add it to Git.
+  # 32 raw bytes encoded once; never print it or add it to Git. Also used
+  # for PANEL_SECRET_KEY, which encrypts stored notification credentials.
+  # An existing env file is left alone: an install that predates
+  # PANEL_SECRET_KEY keys those secrets from PANEL_COOKIE_KEY, and adding a
+  # new key later would make them unreadable.
   openssl rand -base64 32
 }
 
@@ -124,6 +128,7 @@ DATABASE_URL=postgresql:///scontrol?user=scontrol
 PANEL_API_BIND=127.0.0.1:8080
 PANEL_AGENT_SOCKET=${RUNTIME_ROOT}/agent.sock
 PANEL_COOKIE_KEY=$(random_cookie_key)
+PANEL_SECRET_KEY=$(random_cookie_key)
 PANEL_SESSION_TTL_HOURS=168
 EOF
     chown root:"$PANEL_GROUP" "$env_file"
@@ -137,6 +142,11 @@ nginx_sites_available = "/etc/nginx/sites-available"
 nginx_sites_enabled = "/etc/nginx/sites-enabled"
 systemd_unit_dir = "/etc/systemd/system"
 docker_projects_root = "/var/lib/scontrol/docker"
+acme_webroot = "/var/lib/scontrol/acme"
+letsencrypt_live_dir = "/etc/letsencrypt/live"
+deploy_timeout_secs = 1800
+deployment_log_max_bytes = 5242880
+deployment_logs_retained = 20
 
 [runtime_features]
 docker = ${docker_enabled}
@@ -147,11 +157,34 @@ EOF
   chmod 0644 "${CONFIG_ROOT}/agent.toml"
 }
 
+# Compose domain vhosts answer ACME HTTP-01 challenges from this webroot
+# (certbot --webroot). The deploy hook reloads Nginx after each renewal so
+# renewed certificates are picked up; it is a fixed command, not user input.
+configure_acme_webroot() {
+  install -d -o root -g root -m 0755 /var/lib/scontrol/acme
+  install -d -o root -g root -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/scontrol-reload-nginx <<'HOOK'
+#!/bin/sh
+exec systemctl reload nginx
+HOOK
+  chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/scontrol-reload-nginx
+}
+
 install_optional_packages() {
   local docker_enabled="$1" mail_enabled="$2" antivirus_enabled="$3"
   if [[ "$docker_enabled" == true ]]; then
     log "Installing optional Docker support"
-    apt-get install -y --no-install-recommends docker.io
+    # openssh-client provides ssh and ssh-keygen for private Git deploy keys;
+    # git only recommends it, and recommends are skipped here.
+    apt-get install -y --no-install-recommends docker.io openssh-client
+    # Deployments use the Compose v2 CLI plugin (`docker compose`). Ubuntu
+    # ships it as docker-compose-v2; on Debian it comes from Docker's repo.
+    apt-get install -y --no-install-recommends docker-compose-v2 \
+      || apt-get install -y --no-install-recommends docker-compose-plugin \
+      || true
+    docker compose version >/dev/null 2>&1 \
+      || die "Docker Compose v2 ('docker compose') is required; install docker-compose-plugin from Docker's apt repository and re-run"
+    configure_acme_webroot
   fi
   if [[ "$mail_enabled" == true ]]; then
     log "Installing optional mail support"

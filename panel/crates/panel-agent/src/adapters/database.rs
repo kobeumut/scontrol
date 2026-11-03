@@ -2,14 +2,14 @@
 //!
 //! Identifiers (database/user names) are restricted to
 //! `panel_core::types::validate::is_valid_identifier` (`^[a-zA-Z][a-zA-Z0-9_]{0,62}$`)
-//! *before* they are interpolated into the SQL text handed to `psql -c` /
-//! `mysql -e`. Because the allowed charset excludes quotes, semicolons, and
-//! whitespace, this interpolation cannot change the shape of the statement.
-//! Passwords are always passed as bound parameters / dedicated flags, never
-//! interpolated into SQL text, and every invocation still goes through
-//! `Command::new(..).arg(..)` — never a shell.
+//! *before* they are interpolated into SQL text. Because the allowed charset
+//! excludes quotes, semicolons, and whitespace, this interpolation cannot
+//! change the shape of the statement. Passwords are escaped as SQL literals
+//! and sent on the client's stdin, never on argv, because `ps` shows argv to
+//! every local user. Every invocation goes through `Command::new(..).arg(..)`
+//! — never a shell.
 
-use super::exec::run;
+use super::exec::{run, run_with_stdin};
 use super::users::ensure_identifier;
 use panel_core::error::CoreResult;
 use panel_core::types::DatabaseEngine;
@@ -38,28 +38,15 @@ pub async fn delete_database(engine: DatabaseEngine, name: &str, username: &str)
 }
 
 async fn create_postgres(name: &str, username: &str, password: &str) -> CoreResult<()> {
-    // Password is bound via a separate statement using $$-quoting is still
-    // risky if it contained `$$`; instead we set it via `ALTER ROLE ...
-    // PASSWORD` through psql's `-v` variable substitution is unavailable in
-    // plain SQL, so we pass it as a distinct argument to a wrapper statement
-    // using `\set` psql meta-command, keeping password bytes out of the
-    // interpolated SQL literal position entirely.
     let create_role = format!(
         "CREATE ROLE {username} LOGIN PASSWORD '{}';",
         escape_pg_literal(password)
     );
     let create_db = format!("CREATE DATABASE {name} OWNER {username};");
-    run(
+    run_with_stdin(
         "sudo",
-        &[
-            "-u",
-            "postgres",
-            "psql",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            &create_role,
-        ],
+        &["-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-f", "-"],
+        create_role.as_bytes(),
     )
     .await?;
     run(
@@ -94,7 +81,7 @@ async fn create_mysql(name: &str, username: &str, password: &str) -> CoreResult<
          FLUSH PRIVILEGES;",
         escape_mysql_literal(password)
     );
-    run("mysql", &["-e", &sql]).await?;
+    run_with_stdin("mysql", &[], sql.as_bytes()).await?;
     Ok(())
 }
 

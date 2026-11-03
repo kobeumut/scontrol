@@ -36,6 +36,11 @@ aes-gcm = { workspace = true }
 totp-rs = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+lettre = { workspace = true }
 time = { workspace = true }
 
 [features]
@@ -43,3 +48,4 @@ test-utils = ["panel-core/test-utils"]
 
 [dev-dependencies]
 panel-core = { path = "../panel-core", features = ["test-utils"] }
+tower = { workspace = true, features = ["util"] }

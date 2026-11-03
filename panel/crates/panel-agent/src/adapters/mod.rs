@@ -5,9 +5,13 @@ pub mod compose;
 pub mod cron;
 pub mod database;
 #[cfg(feature = "docker")]
+pub mod deploy_log;
+#[cfg(feature = "docker")]
 pub mod docker;
 pub mod exec;
 pub mod firewall;
+#[cfg(feature = "docker")]
+pub mod git_auth;
 #[cfg(feature = "mail")]
 pub mod mail;
 pub mod nginx;
@@ -26,11 +30,17 @@ use panel_core::types::*;
 /// agent's RPC dispatcher.
 pub struct LocalAdapter {
     pub config: AgentConfig,
+    /// Cancellation senders of deployments currently running in this agent.
+    running_deployments:
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio::sync::watch::Sender<bool>>>,
 }
 
 impl LocalAdapter {
     pub fn new(config: AgentConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            running_deployments: Default::default(),
+        }
     }
 
     fn feature_disabled(name: &str) -> CoreError {
@@ -167,16 +177,90 @@ impl AdapterPort for LocalAdapter {
         cron::remove_job(&params.owner_username, params.job_id).await
     }
 
-    async fn deploy_compose_project(
+    async fn write_compose_environment(
         &self,
-        params: DeployComposeProjectParams,
-    ) -> CoreResult<Vec<ComposeServiceInfo>> {
+        params: WriteComposeEnvironmentParams,
+    ) -> CoreResult<()> {
         #[cfg(feature = "docker")]
         {
             if !self.config.docker_enabled() {
                 return Err(Self::feature_disabled("docker"));
             }
-            return compose::deploy(&self.config, params).await;
+            return compose::write_project_environment(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn deploy_compose_project(
+        &self,
+        params: DeployComposeProjectParams,
+    ) -> CoreResult<ComposeDeployOutcome> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            let id = params.deployment_id;
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            self.running_deployments
+                .lock()
+                .expect("deployment registry poisoned")
+                .insert(id, cancel_tx);
+            let result = compose::deploy(&self.config, params, cancel_rx).await;
+            self.running_deployments
+                .lock()
+                .expect("deployment registry poisoned")
+                .remove(&id);
+            return result;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn generate_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<String> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return git_auth::generate_deploy_key(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn remove_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return git_auth::remove_deploy_key(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn write_git_credentials(&self, params: WriteGitCredentialsParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return git_auth::write_credentials(&self.config, params).await;
         }
         #[cfg(not(feature = "docker"))]
         {
@@ -233,6 +317,21 @@ impl AdapterPort for LocalAdapter {
         }
     }
 
+    async fn follow_compose_logs(&self, params: FollowComposeLogsParams) -> CoreResult<LogLines> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return compose::follow_logs(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
     async fn compose_project_logs(&self, params: ComposeProjectLogsParams) -> CoreResult<String> {
         #[cfg(feature = "docker")]
         {
@@ -246,6 +345,34 @@ impl AdapterPort for LocalAdapter {
             let _ = params;
             Err(Self::feature_disabled("docker"))
         }
+    }
+
+    async fn read_deployment_log(
+        &self,
+        params: DeploymentLogParams,
+    ) -> CoreResult<DeploymentLogChunk> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return compose::read_deployment_log(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn cancel_deployment(&self, params: CancelDeploymentParams) -> CoreResult<bool> {
+        let sender = self
+            .running_deployments
+            .lock()
+            .expect("deployment registry poisoned")
+            .get(&params.deployment_id)
+            .cloned();
+        Ok(sender.is_some_and(|tx| tx.send(true).is_ok()))
     }
 
     async fn create_container(&self, params: CreateContainerParams) -> CoreResult<ContainerInfo> {

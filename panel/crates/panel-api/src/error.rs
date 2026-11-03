@@ -16,6 +16,10 @@ pub enum ApiError {
     Forbidden,
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -27,6 +31,7 @@ impl IntoResponse for ApiError {
             ApiError::Core(CoreError::NotFound(m)) => (StatusCode::NOT_FOUND, m.clone()),
             ApiError::Core(CoreError::AlreadyExists(m)) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Core(CoreError::PermissionDenied(m)) => (StatusCode::FORBIDDEN, m.clone()),
+            ApiError::Core(CoreError::Cancelled(m)) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Core(CoreError::Io(m)) | ApiError::Core(CoreError::External(m)) => {
                 tracing::error!(error = %m, "internal error");
                 (
@@ -44,6 +49,8 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Internal(e) => {
                 tracing::error!(error = %e, "internal error");
                 (

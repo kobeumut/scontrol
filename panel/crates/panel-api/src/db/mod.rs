@@ -3,6 +3,7 @@ pub mod compose_projects;
 pub mod cron;
 pub mod databases;
 pub mod firewall;
+pub mod notifications;
 pub mod sites;
 pub mod users;
 

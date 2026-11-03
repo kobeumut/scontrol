@@ -2,70 +2,185 @@
 //!
 //! This is deliberately not a general `docker run` control surface. Each
 //! deployment has a stable, validated project slug and an isolated directory:
-//! `<docker_projects_root>/<slug>/code`. The agent accepts only a Git source
-//! or raw Compose YAML, writes a 0600 `.env`, applies a conservative Compose
-//! policy, and invokes Docker with a fixed argv vector.
+//! `<docker_projects_root>/<slug>/`. The agent accepts only a Git source or
+//! raw Compose YAML, keeps the write-only environment in a 0600 file outside
+//! the source tree, applies a conservative Compose policy, and invokes Docker
+//! with a fixed argv vector.
+//!
+//! Layout of a project directory (mode 0700):
+//!
+//! ```text
+//! code/                     checked-out Git source or raw Compose file
+//! env                       0600 environment file (`--env-file`)
+//! scontrol.override.yml     generated loopback port publishing for domains
+//! .scontrol-compose-path    Compose file path relative to code/
+//! domains.json              domains whose vhosts this project owns
+//! logs/<deployment>.log     streamed, redacted, bounded deployment logs
+//! deploy_key, known_hosts,  private Git access (see `git_auth`)
+//! git-credentials
+//! ```
 
-use super::exec::run_allow_nonzero;
+use super::deploy_log::{self, maskable_secrets, redact, DeployLog};
+use super::exec::{follow_lines, run, run_allow_nonzero, run_streamed};
+use super::git_auth;
+use super::nginx;
 use crate::config::AgentConfig;
 use panel_core::adapters::{
     ComposeProjectActionParams, ComposeProjectLogsParams, DeployComposeProjectParams,
+    DeploymentLogParams, FollowComposeLogsParams, LogLines, WriteComposeEnvironmentParams,
+    LOG_LINES_CAPACITY,
 };
 use panel_core::error::{CoreError, CoreResult};
-use panel_core::types::{validate, ComposeServiceInfo, ComposeSource};
+use panel_core::types::{
+    validate, ComposeDeployOutcome, ComposeDomainBinding, ComposeServiceInfo, ComposeSource,
+    DeploymentLogChunk,
+};
 use serde_yaml::Value as Yaml;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
 
 const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
+const ENV_FILE: &str = "env";
+const OVERRIDE_FILE: &str = "scontrol.override.yml";
+const COMPOSE_PATH_MARKER: &str = ".scontrol-compose-path";
+const DOMAINS_FILE: &str = "domains.json";
+const MAX_DOMAIN_BINDINGS: usize = 32;
+const GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CERTBOT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub async fn deploy(
     cfg: &AgentConfig,
     params: DeployComposeProjectParams,
-) -> CoreResult<Vec<ComposeServiceInfo>> {
+    cancel: watch::Receiver<bool>,
+) -> CoreResult<ComposeDeployOutcome> {
     validate_project_params(&params)?;
     let root = project_root(cfg, &params.project_slug);
-    let code_dir = root.join("code");
-    tokio::fs::create_dir_all(&root)
+    create_private_dir(&root).await?;
+
+    let env_path = root.join(ENV_FILE);
+    adopt_legacy_env_file(&root, &env_path).await;
+    let mut secrets: Vec<String> = read_environment(&env_path)
+        .await?
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    secrets.extend(git_auth::stored_secrets(&root).await);
+    let mut log = DeployLog::create(
+        &root.join("logs"),
+        params.deployment_id,
+        cfg.deployment_log_max_bytes,
+        secrets,
+        cancel,
+    )
+    .await?;
+
+    let result = deploy_steps(cfg, &params, &root, &env_path, &mut log).await;
+    match &result {
+        Ok(outcome) => {
+            for warning in &outcome.warnings {
+                log.step(&format!("warning: {warning}")).await.ok();
+            }
+            log.step("deployment finished").await.ok();
+        }
+        Err(CoreError::Cancelled(_)) => {
+            log.step("deployment cancelled").await.ok();
+        }
+        Err(error) => {
+            log.step(&format!("deployment failed: {error}")).await.ok();
+        }
+    }
+    deploy_log::prune(&root.join("logs"), cfg.deployment_logs_retained)
         .await
-        .map_err(|e| CoreError::Io(format!("creating project root: {e}")))?;
+        .ok();
+    result
+}
 
-    let compose_path = materialize_source(&code_dir, &params.source).await?;
-    validate_compose_file(&compose_path).await?;
-    persist_compose_path(&root, &code_dir, &compose_path).await?;
-    write_environment(&code_dir, &params.environment).await?;
+async fn deploy_steps(
+    cfg: &AgentConfig,
+    params: &DeployComposeProjectParams,
+    root: &Path,
+    env_path: &Path,
+    log: &mut DeployLog,
+) -> CoreResult<ComposeDeployOutcome> {
+    let code_dir = root.join("code");
+    log.step("preparing source").await?;
+    let (compose_path, commit_sha) =
+        materialize_source(root, &code_dir, &params.source, log).await?;
+    ensure_inside(&code_dir, &compose_path).await?;
+    let compose = validate_compose_file(&compose_path).await?;
+    check_bindings_against_compose(&compose, &params.domains)?;
+    persist_compose_path(root, &code_dir, &compose_path).await?;
 
-    let mut args = compose_args(&params.project_slug, &code_dir, &compose_path)?;
-    args.extend([
-        "up".into(),
-        "-d".into(),
-        "--build".into(),
-        "--remove-orphans".into(),
-    ]);
-    if params.pull_images {
-        args.extend(["--pull".into(), "always".into()]);
+    let override_path = root.join(OVERRIDE_FILE);
+    if params.domains.is_empty() {
+        let _ = tokio::fs::remove_file(&override_path).await;
+    } else {
+        tokio::fs::write(&override_path, render_override(&params.domains)?)
+            .await
+            .map_err(|e| CoreError::Io(format!("writing Compose override: {e}")))?;
     }
 
-    // Capture stdout/stderr to a panel-owned, non-secret deployment trace.
-    // The environment values are never logged by this adapter.
+    let paths = ProjectPaths {
+        code_dir,
+        compose: compose_path,
+        env: Some(env_path.to_path_buf()),
+        override_file: (!params.domains.is_empty()).then_some(override_path),
+    };
+    let args = compose_up_args(&params.project_slug, &paths, params.pull_images);
+    log.step("starting services with docker compose").await?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
-    write_deploy_log(&root, &stdout, &stderr).await?;
+    let timeout = Duration::from_secs(cfg.deploy_timeout_secs.max(60));
+    let code = run_streamed("docker", &refs, &[], log, timeout).await?;
     if code != 0 {
         return Err(CoreError::External(format!(
-            "docker compose deployment failed (see project log; exit code {code})"
+            "docker compose up failed (exit code {code}); see the deployment log"
         )));
     }
 
-    list_services_for(cfg, &params.project_slug).await
+    let warnings = apply_domains(
+        cfg,
+        &params.project_slug,
+        root,
+        &params.domains,
+        params.acme_email.as_deref(),
+        log,
+    )
+    .await?;
+    let services = list_services_for(cfg, &params.project_slug).await?;
+    Ok(ComposeDeployOutcome {
+        services,
+        commit_sha,
+        warnings,
+    })
+}
+
+/// Replaces the project's environment file; the next deployment uses it.
+pub async fn write_project_environment(
+    cfg: &AgentConfig,
+    params: WriteComposeEnvironmentParams,
+) -> CoreResult<()> {
+    if !validate::is_valid_project_slug(&params.project_slug) {
+        return Err(CoreError::Validation(format!(
+            "invalid project slug: {}",
+            params.project_slug
+        )));
+    }
+    validate_environment(&params.environment)?;
+    let root = project_root(cfg, &params.project_slug);
+    create_private_dir(&root).await?;
+    write_environment(&root.join(ENV_FILE), &params.environment).await
 }
 
 pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
-    let (code_dir, compose_path) = existing_project_paths(cfg, &params.project_slug)?;
-    let mut args = compose_args(&params.project_slug, &code_dir, &compose_path)?;
+    let paths = existing_project_paths(cfg, &params.project_slug)?;
+    let mut args = compose_args(&params.project_slug, &paths);
     args.extend(["stop".into()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
-    write_deploy_log(&project_root(cfg, &params.project_slug), &stdout, &stderr).await?;
+    write_action_log(&project_root(cfg, &params.project_slug), &stdout, &stderr).await?;
     if code != 0 {
         return Err(CoreError::External(format!(
             "docker compose stop failed (exit code {code})"
@@ -75,20 +190,41 @@ pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Core
 }
 
 pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
-    let (code_dir, compose_path) = existing_project_paths(cfg, &params.project_slug)?;
-    let mut args = compose_args(&params.project_slug, &code_dir, &compose_path)?;
+    let root = project_root(cfg, &params.project_slug);
+    let paths = match existing_project_paths(cfg, &params.project_slug) {
+        Ok(paths) => paths,
+        // Never deployed: nothing runs, but the environment file or Git
+        // credentials may exist, and a later project could reuse the slug.
+        Err(CoreError::NotFound(_)) => {
+            if root.exists() {
+                tokio::fs::remove_dir_all(&root)
+                    .await
+                    .map_err(|e| CoreError::Io(format!("removing project files: {e}")))?;
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut args = compose_args(&params.project_slug, &paths);
     // Do not pass `--volumes`: persistent named volumes survive a project
     // removal unless an operator explicitly removes them outside the panel.
     args.extend(["down".into(), "--remove-orphans".into()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
-    write_deploy_log(&project_root(cfg, &params.project_slug), &stdout, &stderr).await?;
+    write_action_log(&root, &stdout, &stderr).await?;
     if code != 0 {
         return Err(CoreError::External(format!(
             "docker compose removal failed (exit code {code})"
         )));
     }
-    tokio::fs::remove_dir_all(project_root(cfg, &params.project_slug))
+    let owned = read_owned_domains(&root).await;
+    for domain in &owned {
+        nginx::remove_compose_vhost(cfg, domain).await?;
+    }
+    if !owned.is_empty() {
+        nginx::test_and_reload().await?;
+    }
+    tokio::fs::remove_dir_all(&root)
         .await
         .map_err(|e| CoreError::Io(format!("removing project files: {e}")))?;
     Ok(())
@@ -98,13 +234,13 @@ pub async fn list_services_for(
     cfg: &AgentConfig,
     project_slug: &str,
 ) -> CoreResult<Vec<ComposeServiceInfo>> {
-    let (code_dir, compose_path) = existing_project_paths(cfg, project_slug)?;
-    let mut args = compose_args(project_slug, &code_dir, &compose_path)?;
+    let paths = existing_project_paths(cfg, project_slug)?;
+    let mut args = compose_args(project_slug, &paths);
     args.extend([
         "ps".into(),
         "--all".into(),
         "--format".into(),
-        "{{.Service}}\t{{.Image}}\t{{.State}}\t{{.Publishers}}".into(),
+        "json".into(),
     ]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
@@ -113,30 +249,98 @@ pub async fn list_services_for(
             "docker compose ps failed: {stderr}"
         )));
     }
-    Ok(stdout
-        .lines()
-        .filter_map(|line| {
-            let mut f = line.split('\t');
-            Some(ComposeServiceInfo {
-                name: f.next()?.to_string(),
-                image: f.next().unwrap_or_default().to_string(),
-                state: f.next().unwrap_or_default().to_string(),
-                ports: f
-                    .next()
-                    .unwrap_or_default()
-                    .split(", ")
-                    .filter(|port| !port.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            })
+    parse_ps_json(&stdout)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PsEntry {
+    service: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    image: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    health: String,
+    #[serde(default)]
+    exit_code: i32,
+    #[serde(default)]
+    publishers: Option<Vec<PsPublisher>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PsPublisher {
+    #[serde(rename = "URL", default)]
+    url: String,
+    #[serde(default)]
+    target_port: u16,
+    #[serde(default)]
+    published_port: u16,
+    #[serde(default)]
+    protocol: String,
+}
+
+/// Compose v2.21+ prints one JSON object per line; older releases print a
+/// single JSON array. Accept both.
+fn parse_ps_json(output: &str) -> CoreResult<Vec<ComposeServiceInfo>> {
+    let trimmed = output.trim();
+    let entries: Vec<PsEntry> = if trimmed.is_empty() {
+        Vec::new()
+    } else if trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| CoreError::External(format!("parsing docker compose ps: {e}")))?
+    } else {
+        trimmed
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .map_err(|e| CoreError::External(format!("parsing docker compose ps: {e}")))?
+    };
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let mut ports: Vec<String> = entry
+                .publishers
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.target_port != 0)
+                .map(|p| {
+                    if p.published_port == 0 {
+                        format!("{}/{}", p.target_port, p.protocol)
+                    } else {
+                        let host = if p.url.is_empty() { "0.0.0.0" } else { &p.url };
+                        format!(
+                            "{host}:{}->{}/{}",
+                            p.published_port, p.target_port, p.protocol
+                        )
+                    }
+                })
+                .collect();
+            ports.dedup();
+            ComposeServiceInfo {
+                name: entry.service,
+                container: entry.name,
+                image: entry.image,
+                state: entry.state,
+                status: entry.status,
+                health: entry.health,
+                exit_code: entry.exit_code,
+                ports,
+            }
         })
         .collect())
 }
 
 pub async fn logs(cfg: &AgentConfig, params: ComposeProjectLogsParams) -> CoreResult<String> {
-    let (code_dir, compose_path) = existing_project_paths(cfg, &params.project_slug)?;
+    let paths = existing_project_paths(cfg, &params.project_slug)?;
     let tail = params.tail_lines.clamp(1, 2_000).to_string();
-    let mut args = compose_args(&params.project_slug, &code_dir, &compose_path)?;
+    let mut args = compose_args(&params.project_slug, &paths);
     args.extend(["logs".into(), "--no-color".into(), "--tail".into(), tail]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
@@ -148,28 +352,103 @@ pub async fn logs(cfg: &AgentConfig, params: ComposeProjectLogsParams) -> CoreRe
     Ok(stdout)
 }
 
-fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()> {
+/// Concurrent live log followers across all projects. Each holds a
+/// `docker compose logs` process, so the count is bounded.
+const MAX_LOG_FOLLOWERS: usize = 16;
+/// A follower stops after this long; clients reconnect if they still care.
+const FOLLOW_LIMIT: Duration = Duration::from_secs(60 * 60);
+static LOG_FOLLOWERS: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_LOG_FOLLOWERS)));
+
+/// Follows container output with `docker compose logs --follow`. Each line
+/// is redacted with the project's environment values first and filtered by
+/// `search` second, so searching cannot reveal a masked value.
+pub async fn follow_logs(
+    cfg: &AgentConfig,
+    params: FollowComposeLogsParams,
+) -> CoreResult<LogLines> {
+    let paths = existing_project_paths(cfg, &params.project_slug)?;
+    if let Some(service) = &params.service {
+        if !validate::is_valid_service_name(service) {
+            return Err(CoreError::Validation(format!(
+                "invalid service name: {service}"
+            )));
+        }
+    }
+    let needle = match params.search.as_deref().map(str::trim) {
+        Some(s) if s.len() > 200 || s.chars().any(char::is_control) => {
+            return Err(CoreError::Validation("invalid log search".into()));
+        }
+        Some(s) if !s.is_empty() => Some(s.to_lowercase()),
+        _ => None,
+    };
+    let permit = LOG_FOLLOWERS.clone().try_acquire_owned().map_err(|_| {
+        CoreError::External("too many live log viewers are open; close one and retry".into())
+    })?;
+    let secrets = read_environment(&project_root(cfg, &params.project_slug).join(ENV_FILE))
+        .await
+        .map(|env| maskable_secrets(env.into_iter().map(|(_, value)| value).collect()))
+        .unwrap_or_default();
+
+    let mut args = compose_args(&params.project_slug, &paths);
+    args.extend([
+        "logs".into(),
+        "--follow".into(),
+        "--no-color".into(),
+        "--tail".into(),
+        params.tail_lines.min(2_000).to_string(),
+    ]);
+    if params.timestamps {
+        args.push("--timestamps".into());
+    }
+    if let Some(service) = params.service {
+        args.extend(["--".into(), service]);
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(LOG_LINES_CAPACITY);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let filter = |line: &str| {
+            let line = redact(line, &secrets);
+            match &needle {
+                Some(n) if !line.to_lowercase().contains(n) => None,
+                _ => Some(line),
+            }
+        };
+        if let Err(error) = follow_lines("docker", &refs, &tx, FOLLOW_LIMIT, filter).await {
+            tx.send(Err(error)).await.ok();
+        }
+    });
+    Ok(rx)
+}
+
+pub async fn read_deployment_log(
+    cfg: &AgentConfig,
+    params: DeploymentLogParams,
+) -> CoreResult<DeploymentLogChunk> {
     if !validate::is_valid_project_slug(&params.project_slug) {
         return Err(CoreError::Validation(format!(
             "invalid project slug: {}",
             params.project_slug
         )));
     }
-    if params.environment.len() > 256 {
-        return Err(CoreError::Validation(
-            "too many environment variables".into(),
-        ));
-    }
-    for (key, value) in &params.environment {
-        if !validate::is_valid_env_key(key)
-            || value.contains('\0')
-            || value.contains('\n')
-            || value.len() > 16 * 1024
-        {
-            return Err(CoreError::Validation(format!(
-                "invalid environment value for key: {key}"
-            )));
-        }
+    let logs_dir = project_root(cfg, &params.project_slug).join("logs");
+    deploy_log::read_chunk(
+        &logs_dir,
+        params.deployment_id,
+        params.offset,
+        params.max_bytes,
+    )
+    .await
+}
+
+fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()> {
+    if !validate::is_valid_project_slug(&params.project_slug) {
+        return Err(CoreError::Validation(format!(
+            "invalid project slug: {}",
+            params.project_slug
+        )));
     }
     match &params.source {
         ComposeSource::Git {
@@ -195,51 +474,372 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
             }
         }
     }
+    validate_bindings(&params.domains, params.acme_email.as_deref())
+}
+
+fn validate_environment(environment: &[(String, String)]) -> CoreResult<()> {
+    if environment.len() > 256 {
+        return Err(CoreError::Validation(
+            "too many environment variables".into(),
+        ));
+    }
+    for (key, value) in environment {
+        if !validate::is_valid_env_key(key)
+            || value.contains('\0')
+            || value.contains('\n')
+            || value.len() > 16 * 1024
+        {
+            return Err(CoreError::Validation(format!(
+                "invalid environment value for key: {key}"
+            )));
+        }
+    }
     Ok(())
 }
 
-async fn materialize_source(code_dir: &Path, source: &ComposeSource) -> CoreResult<PathBuf> {
-    if code_dir.exists() {
-        tokio::fs::remove_dir_all(code_dir)
-            .await
-            .map_err(|e| CoreError::Io(format!("clearing previous source: {e}")))?;
+fn validate_bindings(
+    bindings: &[ComposeDomainBinding],
+    acme_email: Option<&str>,
+) -> CoreResult<()> {
+    if bindings.len() > MAX_DOMAIN_BINDINGS {
+        return Err(CoreError::Validation(format!(
+            "at most {MAX_DOMAIN_BINDINGS} domains per project"
+        )));
     }
+    let mut domains = HashSet::new();
+    let mut host_ports = HashSet::new();
+    for binding in bindings {
+        if !validate::is_valid_domain(&binding.domain) {
+            return Err(CoreError::Validation(format!(
+                "invalid domain: {}",
+                binding.domain
+            )));
+        }
+        if !validate::is_valid_service_name(&binding.service_name) {
+            return Err(CoreError::Validation(format!(
+                "invalid service name: {}",
+                binding.service_name
+            )));
+        }
+        if binding.container_port == 0 || binding.host_port < 1024 {
+            return Err(CoreError::Validation(format!(
+                "invalid port binding for {}",
+                binding.domain
+            )));
+        }
+        if !domains.insert(binding.domain.as_str()) || !host_ports.insert(binding.host_port) {
+            return Err(CoreError::Validation(format!(
+                "duplicate domain or host port: {}",
+                binding.domain
+            )));
+        }
+    }
+    if bindings.iter().any(|b| b.https) && !acme_email.is_some_and(is_plausible_email) {
+        return Err(CoreError::Validation(
+            "a valid ACME email is required for HTTPS domains".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_plausible_email(email: &str) -> bool {
+    email.len() <= 254
+        && !email.starts_with('-')
+        && !email.chars().any(|c| c.is_whitespace() || c.is_control())
+        && email
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && validate::is_valid_domain(domain))
+}
+
+fn check_bindings_against_compose(
+    compose: &Yaml,
+    bindings: &[ComposeDomainBinding],
+) -> CoreResult<()> {
+    let services = compose
+        .get("services")
+        .and_then(Yaml::as_mapping)
+        .ok_or_else(|| CoreError::Validation("Compose file requires a services mapping".into()))?;
+    for binding in bindings {
+        if !services.contains_key(Yaml::String(binding.service_name.clone())) {
+            return Err(CoreError::Validation(format!(
+                "domain {} targets unknown service {}",
+                binding.domain, binding.service_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Generates the override that publishes each bound container port on the
+/// loopback interface only, where the generated Nginx vhost reaches it.
+fn render_override(bindings: &[ComposeDomainBinding]) -> CoreResult<String> {
+    let mut services = serde_yaml::Mapping::new();
+    for binding in bindings {
+        let entry = services
+            .entry(Yaml::String(binding.service_name.clone()))
+            .or_insert_with(|| {
+                let mut service = serde_yaml::Mapping::new();
+                service.insert("ports".into(), Yaml::Sequence(Vec::new()));
+                Yaml::Mapping(service)
+            });
+        if let Some(Yaml::Sequence(ports)) = entry.get_mut("ports") {
+            ports.push(Yaml::String(format!(
+                "127.0.0.1:{}:{}",
+                binding.host_port, binding.container_port
+            )));
+        }
+    }
+    let mut document = serde_yaml::Mapping::new();
+    document.insert("services".into(), Yaml::Mapping(services));
+    serde_yaml::to_string(&Yaml::Mapping(document))
+        .map_err(|e| CoreError::External(format!("rendering Compose override: {e}")))
+}
+
+/// Writes vhosts for the desired bindings, removes vhosts of bindings that
+/// were dropped, and reloads Nginx once. A configuration that fails
+/// `nginx -t` is rolled back to the previous files. Certificates are then
+/// requested for HTTPS bindings that lack one; a failed request is a warning,
+/// not a failed deployment, and the domain keeps serving plain HTTP.
+async fn apply_domains(
+    cfg: &AgentConfig,
+    project_slug: &str,
+    root: &Path,
+    bindings: &[ComposeDomainBinding],
+    acme_email: Option<&str>,
+    log: &mut DeployLog,
+) -> CoreResult<Vec<String>> {
+    let previous = read_owned_domains(root).await;
+    if bindings.is_empty() && previous.is_empty() {
+        return Ok(Vec::new());
+    }
+    log.step("configuring domains").await?;
+
+    let mut backups: Vec<(String, Option<String>)> = Vec::new();
+    for binding in bindings {
+        backups.push((
+            binding.domain.clone(),
+            nginx::read_compose_vhost(cfg, &binding.domain).await,
+        ));
+        let tls = binding.https && nginx::certificate_exists(cfg, &binding.domain);
+        let content =
+            nginx::render_compose_vhost(cfg, project_slug, &binding.domain, binding.host_port, tls);
+        nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
+    }
+    for stale in previous
+        .iter()
+        .filter(|domain| !bindings.iter().any(|b| &b.domain == *domain))
+    {
+        backups.push((stale.clone(), nginx::read_compose_vhost(cfg, stale).await));
+        nginx::remove_compose_vhost(cfg, stale).await?;
+    }
+    if let Err(error) = nginx::test_and_reload().await {
+        for (domain, content) in backups {
+            match content {
+                Some(content) => nginx::write_compose_vhost(cfg, &domain, &content)
+                    .await
+                    .ok(),
+                None => nginx::remove_compose_vhost(cfg, &domain).await.ok(),
+            };
+        }
+        return Err(CoreError::External(format!(
+            "generated Nginx configuration was rejected and rolled back: {error}"
+        )));
+    }
+    write_owned_domains(root, bindings).await?;
+
+    let mut warnings = Vec::new();
+    let mut reload = false;
+    for binding in bindings
+        .iter()
+        .filter(|b| b.https && !nginx::certificate_exists(cfg, &b.domain))
+    {
+        let Some(email) = acme_email else { continue };
+        log.step(&format!("requesting certificate for {}", binding.domain))
+            .await?;
+        tokio::fs::create_dir_all(&cfg.acme_webroot)
+            .await
+            .map_err(|e| CoreError::Io(format!("creating ACME webroot: {e}")))?;
+        let webroot = cfg.acme_webroot.to_string_lossy().into_owned();
+        let args = certbot_webroot_args(&webroot, &binding.domain, email);
+        let code = match run_streamed("certbot", &args, &[], log, CERTBOT_TIMEOUT).await {
+            Ok(code) => code,
+            Err(error @ CoreError::Cancelled(_)) => return Err(error),
+            Err(_) => -1,
+        };
+        if code == 0 && nginx::certificate_exists(cfg, &binding.domain) {
+            let content = nginx::render_compose_vhost(
+                cfg,
+                project_slug,
+                &binding.domain,
+                binding.host_port,
+                true,
+            );
+            nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
+            reload = true;
+        } else {
+            warnings.push(format!(
+                "certificate for {} could not be issued; serving HTTP only",
+                binding.domain
+            ));
+        }
+    }
+    if reload {
+        nginx::test_and_reload().await?;
+    }
+    Ok(warnings)
+}
+
+async fn read_owned_domains(root: &Path) -> Vec<String> {
+    let Ok(raw) = tokio::fs::read_to_string(root.join(DOMAINS_FILE)).await else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&raw)
+        .unwrap_or_default()
+        .into_iter()
+        // The file is agent-written, but it names files we delete: re-check.
+        .filter(|domain| validate::is_valid_domain(domain))
+        .collect()
+}
+
+async fn write_owned_domains(root: &Path, bindings: &[ComposeDomainBinding]) -> CoreResult<()> {
+    let domains: Vec<&str> = bindings.iter().map(|b| b.domain.as_str()).collect();
+    let body = serde_json::to_string(&domains)
+        .map_err(|e| CoreError::External(format!("encoding domain list: {e}")))?;
+    tokio::fs::write(root.join(DOMAINS_FILE), body)
+        .await
+        .map_err(|e| CoreError::Io(format!("writing domain list: {e}")))
+}
+
+/// Fetches or writes the project source and returns the Compose file path
+/// plus, for Git, the deployed commit. An existing checkout of the same
+/// remote is updated in place with a shallow fetch instead of a fresh clone.
+async fn materialize_source(
+    root: &Path,
+    code_dir: &Path,
+    source: &ComposeSource,
+    log: &mut DeployLog,
+) -> CoreResult<(PathBuf, Option<String>)> {
     match source {
         ComposeSource::Raw { compose_yaml } => {
-            tokio::fs::create_dir_all(code_dir)
-                .await
-                .map_err(|e| CoreError::Io(e.to_string()))?;
+            reset_dir(code_dir).await?;
             let path = code_dir.join(DEFAULT_COMPOSE_FILE);
             tokio::fs::write(&path, compose_yaml)
                 .await
                 .map_err(|e| CoreError::Io(format!("writing Compose YAML: {e}")))?;
-            Ok(path)
+            Ok((path, None))
         }
         ComposeSource::Git {
             repository_url,
             branch,
             compose_path,
         } => {
-            let destination = code_dir.to_string_lossy().into_owned();
-            let refs = [
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                branch.as_str(),
-                repository_url.as_str(),
-                destination.as_str(),
-            ];
-            let (code, _stdout, stderr) = run_allow_nonzero("git", &refs).await?;
-            if code != 0 {
-                return Err(CoreError::External(format!("Git clone failed: {stderr}")));
+            let auth = git_auth::for_remote(root, repository_url).await?;
+            log.step(&format!("Git access: {}", auth.description))
+                .await?;
+            let env = auth.env();
+            let dir = code_dir.to_string_lossy().into_owned();
+            let reusable = code_dir.join(".git").is_dir()
+                && run("git", &["-C", &dir, "remote", "get-url", "origin"])
+                    .await
+                    .is_ok_and(|url| url.trim() == repository_url);
+            let fetched = reusable && update_checkout(&dir, branch, &env, log).await?;
+            if !fetched {
+                reset_dir(code_dir).await?;
+                tokio::fs::remove_dir(code_dir).await.ok();
+                log.step(&format!("cloning {repository_url} ({branch})"))
+                    .await?;
+                let args = git_clone_args(branch, repository_url, &dir);
+                let code = run_streamed("git", &args, &env, log, GIT_TIMEOUT).await?;
+                if code != 0 {
+                    return Err(CoreError::External(format!(
+                        "Git clone failed (exit code {code}); see the deployment log"
+                    )));
+                }
             }
-            Ok(code_dir.join(compose_path))
+            let commit = run("git", &["-C", &dir, "rev-parse", "HEAD"])
+                .await
+                .ok()
+                .map(|sha| sha.trim().to_string())
+                .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+            if let Some(sha) = &commit {
+                log.step(&format!("source at commit {sha}")).await?;
+            }
+            Ok((code_dir.join(compose_path), commit))
         }
     }
 }
 
-async fn write_environment(code_dir: &Path, environment: &[(String, String)]) -> CoreResult<()> {
+/// Shallow-fetches `branch` into an existing checkout and resets to it.
+/// Returns `false` (caller re-clones) when the fetch fails.
+async fn update_checkout(
+    dir: &str,
+    branch: &str,
+    env: &[(&str, &str)],
+    log: &mut DeployLog,
+) -> CoreResult<bool> {
+    log.step(&format!("fetching {branch}")).await?;
+    let fetch = git_fetch_args(dir, branch);
+    if run_streamed("git", &fetch, env, log, GIT_TIMEOUT).await? != 0 {
+        log.step("fetch failed; re-cloning").await?;
+        return Ok(false);
+    }
+    let reset = ["-C", dir, "reset", "--hard", "FETCH_HEAD"];
+    let clean = ["-C", dir, "clean", "-ffdx"];
+    Ok(
+        run_streamed("git", &reset, env, log, GIT_TIMEOUT).await? == 0
+            && run_streamed("git", &clean, env, log, GIT_TIMEOUT).await? == 0,
+    )
+}
+
+async fn reset_dir(dir: &Path) -> CoreResult<()> {
+    if dir.exists() {
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .map_err(|e| CoreError::Io(format!("clearing previous source: {e}")))?;
+    }
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| CoreError::Io(format!("creating source directory: {e}")))
+}
+
+async fn create_private_dir(dir: &Path) -> CoreResult<()> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| CoreError::Io(format!("creating project root: {e}")))?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .await
+        .map_err(|e| CoreError::Io(format!("protecting project root: {e}")))?;
+    Ok(())
+}
+
+/// Rejects a Compose path that resolves (e.g. through a symlink committed to
+/// the repository) outside the project's code directory.
+async fn ensure_inside(code_dir: &Path, compose_path: &Path) -> CoreResult<()> {
+    let base = tokio::fs::canonicalize(code_dir)
+        .await
+        .map_err(|e| CoreError::Io(format!("resolving source directory: {e}")))?;
+    let resolved = tokio::fs::canonicalize(compose_path)
+        .await
+        .map_err(|_| CoreError::Validation("Compose file not found in source".into()))?;
+    if !resolved.starts_with(&base) {
+        return Err(CoreError::Validation(
+            "Compose path escapes the project source directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Projects deployed before the environment moved out of the source tree
+/// kept it at `code/.env`; adopt it once so a redeploy keeps the values.
+async fn adopt_legacy_env_file(root: &Path, env_path: &Path) {
+    let legacy = root.join("code").join(".env");
+    if !env_path.exists() && legacy.is_file() {
+        tokio::fs::rename(&legacy, env_path).await.ok();
+    }
+}
+
+async fn write_environment(path: &Path, environment: &[(String, String)]) -> CoreResult<()> {
     let mut body = String::new();
     for (key, value) in environment {
         // Newlines are rejected in validation, so one key/value occupies one
@@ -249,18 +849,42 @@ async fn write_environment(code_dir: &Path, environment: &[(String, String)]) ->
         body.push_str(value);
         body.push('\n');
     }
-    let path = code_dir.join(".env");
-    tokio::fs::write(&path, body)
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|e| CoreError::Io(format!("writing environment file: {e}")))?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes())
         .await
         .map_err(|e| CoreError::Io(format!("writing environment file: {e}")))?;
     #[cfg(unix)]
-    tokio::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+    tokio::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .await
         .map_err(|e| CoreError::Io(format!("protecting environment file: {e}")))?;
     Ok(())
 }
 
-async fn validate_compose_file(path: &Path) -> CoreResult<()> {
+/// Reads the existing environment file (only to mask its values in logs).
+/// A missing file becomes an empty one so `--env-file` always resolves.
+async fn read_environment(path: &Path) -> CoreResult<Vec<(String, String)>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(body) => Ok(body
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_environment(path, &[]).await?;
+            Ok(Vec::new())
+        }
+        Err(e) => Err(CoreError::Io(format!("reading environment file: {e}"))),
+    }
+}
+
+async fn validate_compose_file(path: &Path) -> CoreResult<Yaml> {
     let body = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| CoreError::Validation(format!("cannot read Compose file: {e}")))?;
@@ -275,7 +899,8 @@ async fn validate_compose_file(path: &Path) -> CoreResult<()> {
             "Compose must define 1..=64 services".into(),
         ));
     }
-    reject_unsafe_compose_features(&yaml)
+    reject_unsafe_compose_features(&yaml)?;
+    Ok(yaml)
 }
 
 fn reject_unsafe_compose_features(yaml: &Yaml) -> CoreResult<()> {
@@ -341,11 +966,18 @@ fn reject_unsafe_compose_features(yaml: &Yaml) -> CoreResult<()> {
     Ok(())
 }
 
+struct ProjectPaths {
+    code_dir: PathBuf,
+    compose: PathBuf,
+    env: Option<PathBuf>,
+    override_file: Option<PathBuf>,
+}
+
 fn project_root(cfg: &AgentConfig, slug: &str) -> PathBuf {
     cfg.docker_projects_root.join(slug)
 }
 
-fn existing_project_paths(cfg: &AgentConfig, slug: &str) -> CoreResult<(PathBuf, PathBuf)> {
+fn existing_project_paths(cfg: &AgentConfig, slug: &str) -> CoreResult<ProjectPaths> {
     if !validate::is_valid_project_slug(slug) {
         return Err(CoreError::Validation(format!(
             "invalid project slug: {slug}"
@@ -353,7 +985,7 @@ fn existing_project_paths(cfg: &AgentConfig, slug: &str) -> CoreResult<(PathBuf,
     }
     let root = project_root(cfg, slug);
     let code_dir = root.join("code");
-    let marker = std::fs::read_to_string(root.join(".scontrol-compose-path")).map_err(|_| {
+    let marker = std::fs::read_to_string(root.join(COMPOSE_PATH_MARKER)).map_err(|_| {
         CoreError::NotFound(format!("Compose metadata not found for project {slug}"))
     })?;
     let relative = marker.trim();
@@ -368,7 +1000,18 @@ fn existing_project_paths(cfg: &AgentConfig, slug: &str) -> CoreResult<(PathBuf,
             "Compose file not found for project {slug}"
         )));
     }
-    Ok((code_dir, compose))
+    // Same files as the last deployment, so `ps`/`stop`/`down` see the same
+    // project model (including loopback ports published for domains).
+    let env = [root.join(ENV_FILE), code_dir.join(".env")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let override_file = Some(root.join(OVERRIDE_FILE)).filter(|path| path.is_file());
+    Ok(ProjectPaths {
+        code_dir,
+        compose,
+        env,
+        override_file,
+    })
 }
 
 async fn persist_compose_path(root: &Path, code_dir: &Path, compose_path: &Path) -> CoreResult<()> {
@@ -380,28 +1023,84 @@ async fn persist_compose_path(root: &Path, code_dir: &Path, compose_path: &Path)
     if !validate::is_valid_compose_path(&relative) {
         return Err(CoreError::Validation("invalid Compose path".into()));
     }
-    tokio::fs::write(root.join(".scontrol-compose-path"), relative)
+    tokio::fs::write(root.join(COMPOSE_PATH_MARKER), relative)
         .await
         .map_err(|e| CoreError::Io(format!("writing Compose metadata: {e}")))
 }
 
-fn compose_args(slug: &str, code_dir: &Path, compose_path: &Path) -> CoreResult<Vec<String>> {
-    let code = code_dir.to_string_lossy().into_owned();
-    let compose = compose_path.to_string_lossy().into_owned();
-    Ok(vec![
+// Argv builders. Each user-influenced value is one discrete argument, and
+// positional Git values follow `--` so they can never be read as options.
+
+fn git_clone_args<'a>(branch: &'a str, repository_url: &'a str, dir: &'a str) -> [&'a str; 9] {
+    [
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        "--branch",
+        branch,
+        "--",
+        repository_url,
+        dir,
+    ]
+}
+
+fn git_fetch_args<'a>(dir: &'a str, branch: &'a str) -> [&'a str; 9] {
+    [
+        "-C", dir, "fetch", "--depth", "1", "--prune", "origin", "--", branch,
+    ]
+}
+
+fn certbot_webroot_args<'a>(webroot: &'a str, domain: &'a str, email: &'a str) -> [&'a str; 11] {
+    [
+        "certonly",
+        "--webroot",
+        "-w",
+        webroot,
+        "-d",
+        domain,
+        "--non-interactive",
+        "--agree-tos",
+        "--keep-until-expiring",
+        "-m",
+        email,
+    ]
+}
+
+fn compose_up_args(slug: &str, paths: &ProjectPaths, pull_images: bool) -> Vec<String> {
+    let mut args = compose_args(slug, paths);
+    args.extend([
+        "up".into(),
+        "-d".into(),
+        "--build".into(),
+        "--remove-orphans".into(),
+    ]);
+    if pull_images {
+        args.extend(["--pull".into(), "always".into()]);
+    }
+    args
+}
+
+fn compose_args(slug: &str, paths: &ProjectPaths) -> Vec<String> {
+    let mut args = vec![
         "compose".into(),
         "-p".into(),
         slug.into(),
         "--project-directory".into(),
-        code,
-        "--env-file".into(),
-        code_dir.join(".env").to_string_lossy().into_owned(),
-        "-f".into(),
-        compose,
-    ])
+        paths.code_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(env) = &paths.env {
+        args.extend(["--env-file".into(), env.to_string_lossy().into_owned()]);
+    }
+    args.extend(["-f".into(), paths.compose.to_string_lossy().into_owned()]);
+    if let Some(override_file) = &paths.override_file {
+        args.extend(["-f".into(), override_file.to_string_lossy().into_owned()]);
+    }
+    args
 }
 
-async fn write_deploy_log(root: &Path, stdout: &str, stderr: &str) -> CoreResult<()> {
+/// Output of stop/remove actions (deployments have their own logs).
+async fn write_action_log(root: &Path, stdout: &str, stderr: &str) -> CoreResult<()> {
     let logs = root.join("logs");
     tokio::fs::create_dir_all(&logs)
         .await
@@ -409,11 +1108,11 @@ async fn write_deploy_log(root: &Path, stdout: &str, stderr: &str) -> CoreResult
     let path = logs.join("latest.log");
     tokio::fs::write(&path, format!("{stdout}{stderr}"))
         .await
-        .map_err(|e| CoreError::Io(format!("writing deployment log: {e}")))?;
+        .map_err(|e| CoreError::Io(format!("writing action log: {e}")))?;
     #[cfg(unix)]
     tokio::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640))
         .await
-        .map_err(|e| CoreError::Io(format!("protecting deployment log: {e}")))?;
+        .map_err(|e| CoreError::Io(format!("protecting action log: {e}")))?;
     Ok(())
 }
 
@@ -446,5 +1145,224 @@ mod tests {
         assert!(reject_unsafe_compose_features(&safe).is_ok());
         let unsafe_yaml: Yaml = serde_yaml::from_str("services:\n  app:\n    image: nginx\n    volumes: [/var/run/docker.sock:/var/run/docker.sock]").unwrap();
         assert!(reject_unsafe_compose_features(&unsafe_yaml).is_err());
+    }
+
+    fn binding(domain: &str, service: &str, host_port: u16, https: bool) -> ComposeDomainBinding {
+        ComposeDomainBinding {
+            domain: domain.into(),
+            service_name: service.into(),
+            container_port: 3000,
+            host_port,
+            https,
+        }
+    }
+
+    #[test]
+    fn override_publishes_bound_ports_on_loopback_only() {
+        let rendered = render_override(&[
+            binding("a.example.com", "web", 40001, false),
+            binding("b.example.com", "web", 40002, false),
+            binding("api.example.com", "api", 40003, false),
+        ])
+        .unwrap();
+        let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
+        let web_ports = yaml["services"]["web"]["ports"].as_sequence().unwrap();
+        assert_eq!(web_ports.len(), 2);
+        assert_eq!(web_ports[0].as_str(), Some("127.0.0.1:40001:3000"));
+        assert_eq!(
+            yaml["services"]["api"]["ports"][0].as_str(),
+            Some("127.0.0.1:40003:3000")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_conflicting_bindings() {
+        assert!(validate_bindings(&[binding("a.example.com", "web", 40001, false)], None).is_ok());
+        // HTTPS needs an ACME email.
+        assert!(validate_bindings(&[binding("a.example.com", "web", 40001, true)], None).is_err());
+        assert!(validate_bindings(
+            &[binding("a.example.com", "web", 40001, true)],
+            Some("ops@example.com")
+        )
+        .is_ok());
+        assert!(validate_bindings(
+            &[binding("a.example.com", "web", 40001, true)],
+            Some("-oProxyCommand@example.com")
+        )
+        .is_err());
+        // Duplicate host port, privileged host port, injection in names.
+        assert!(validate_bindings(
+            &[
+                binding("a.example.com", "web", 40001, false),
+                binding("b.example.com", "web", 40001, false)
+            ],
+            None
+        )
+        .is_err());
+        assert!(validate_bindings(&[binding("a.example.com", "web", 80, false)], None).is_err());
+        assert!(
+            validate_bindings(&[binding("a.example.com", "web;rm", 40001, false)], None).is_err()
+        );
+        assert!(
+            validate_bindings(&[binding("a.com\nlisten 1", "web", 40001, false)], None).is_err()
+        );
+    }
+
+    #[test]
+    fn bindings_must_target_declared_services() {
+        let compose: Yaml = serde_yaml::from_str("services:\n  web:\n    image: nginx").unwrap();
+        assert!(check_bindings_against_compose(
+            &compose,
+            &[binding("a.example.com", "web", 40001, false)]
+        )
+        .is_ok());
+        assert!(check_bindings_against_compose(
+            &compose,
+            &[binding("a.example.com", "db", 40001, false)]
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn compose_path_symlink_cannot_escape_source() {
+        let base = std::env::temp_dir().join(format!("scontrol-compose-{}", uuid::Uuid::new_v4()));
+        let code = base.join("code");
+        std::fs::create_dir_all(&code).unwrap();
+        std::fs::write(base.join("outside.yml"), "services: {}").unwrap();
+        std::fs::write(code.join("inside.yml"), "services: {}").unwrap();
+        std::os::unix::fs::symlink(base.join("outside.yml"), code.join("escape.yml")).unwrap();
+        assert!(ensure_inside(&code, &code.join("inside.yml")).await.is_ok());
+        assert!(ensure_inside(&code, &code.join("escape.yml"))
+            .await
+            .is_err());
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn environment_file_is_private_and_round_trips() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("scontrol-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join(ENV_FILE);
+        let env = vec![("TOKEN".to_string(), "a=b c".to_string())];
+        write_environment(&path, &env).await.unwrap();
+        assert_eq!(read_environment(&path).await.unwrap(), env);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn parses_compose_ps_json_lines_and_arrays() {
+        let line = r#"{"Service":"web","Name":"shop-web-1","Image":"nginx","State":"running","Status":"Up 2 minutes (healthy)","Health":"healthy","ExitCode":0,"Publishers":[{"URL":"127.0.0.1","TargetPort":80,"PublishedPort":40000,"Protocol":"tcp"},{"URL":"","TargetPort":443,"PublishedPort":0,"Protocol":"tcp"}]}"#;
+        let worker = r#"{"Service":"worker","Name":"shop-worker-1","Image":"app","State":"exited","Status":"Exited (1)","ExitCode":1,"Publishers":null}"#;
+        let services = parse_ps_json(&format!("{line}\n{worker}\n")).unwrap();
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].name, "web");
+        assert_eq!(services[0].container, "shop-web-1");
+        assert_eq!(services[0].health, "healthy");
+        assert_eq!(
+            services[0].ports,
+            vec!["127.0.0.1:40000->80/tcp", "443/tcp"]
+        );
+        assert_eq!(services[1].exit_code, 1);
+        assert!(services[1].ports.is_empty());
+
+        let array = parse_ps_json(&format!("[{line}]")).unwrap();
+        assert_eq!(array.len(), 1);
+        assert!(parse_ps_json("").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_stops_the_running_process_group() {
+        let dir = std::env::temp_dir().join(format!("scontrol-cancel-{}", uuid::Uuid::new_v4()));
+        let (tx, rx) = watch::channel(false);
+        let mut log = DeployLog::create(&dir, uuid::Uuid::new_v4(), 4096, vec![], rx)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tx.send(true).ok();
+        });
+        let started = std::time::Instant::now();
+        let result = run_streamed("sleep", &["30"], &[], &mut log, Duration::from_secs(60)).await;
+        assert!(matches!(result, Err(CoreError::Cancelled(_))));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn timeout_stops_the_running_process_group() {
+        let dir = std::env::temp_dir().join(format!("scontrol-timeout-{}", uuid::Uuid::new_v4()));
+        let mut log = DeployLog::create(
+            &dir,
+            uuid::Uuid::new_v4(),
+            4096,
+            vec![],
+            watch::channel(false).1,
+        )
+        .await
+        .unwrap();
+        let result =
+            run_streamed("sleep", &["30"], &[], &mut log, Duration::from_millis(200)).await;
+        assert!(matches!(result, Err(CoreError::External(m)) if m.contains("timed out")));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn argv_keeps_each_value_discrete_and_positionals_after_double_dash() {
+        // Values a validator would refuse, to show the argv shape alone keeps
+        // them inert: no shell parses them and none can become an option.
+        let hostile = "x; rm -rf / $(id) `id` --upload-pack=evil";
+
+        let clone = git_clone_args(hostile, hostile, "/var/lib/scontrol/docker/app/code");
+        let dash = clone.iter().position(|a| *a == "--").unwrap();
+        assert_eq!(clone[dash + 1], hostile);
+        assert_eq!(clone[dash + 2], "/var/lib/scontrol/docker/app/code");
+        assert_eq!(
+            clone[clone.iter().position(|a| *a == "--branch").unwrap() + 1],
+            hostile
+        );
+
+        let fetch = git_fetch_args("/srv/code", hostile);
+        assert_eq!(&fetch[fetch.len() - 2..], &["--", hostile]);
+
+        let certbot = certbot_webroot_args("/var/lib/scontrol/acme", hostile, hostile);
+        assert_eq!(
+            certbot[certbot.iter().position(|a| *a == "-d").unwrap() + 1],
+            hostile
+        );
+        assert_eq!(certbot[certbot.len() - 1], hostile);
+        assert!(certbot.contains(&"--non-interactive"));
+
+        let paths = ProjectPaths {
+            code_dir: "/data/my app/code".into(),
+            compose: "/data/my app/code/compose file.yml".into(),
+            env: Some("/data/my app/env".into()),
+            override_file: Some("/data/my app/scontrol.override.yml".into()),
+        };
+        let up = compose_up_args("my-app", &paths, true);
+        assert_eq!(&up[..3], &["compose", "-p", "my-app"]);
+        assert!(up.contains(&"/data/my app/code/compose file.yml".to_string()));
+        assert_eq!(
+            up[up.iter().position(|a| a == "--env-file").unwrap() + 1],
+            "/data/my app/env",
+            "the env file is passed by path; values never reach argv"
+        );
+        assert!(up.ends_with(&[
+            "up".into(),
+            "-d".into(),
+            "--build".into(),
+            "--remove-orphans".into(),
+            "--pull".into(),
+            "always".into()
+        ]));
+        assert!(!compose_up_args("my-app", &paths, false).contains(&"--pull".to_string()));
+
+        for args in [clone.to_vec(), fetch.to_vec(), certbot.to_vec()] {
+            assert!(!args
+                .iter()
+                .any(|a| *a == "sh" || *a == "-c" || *a == "bash"));
+        }
     }
 }

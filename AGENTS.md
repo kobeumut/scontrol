@@ -28,6 +28,7 @@ Supporting directories: `install/` (installer, auto-PR script, Nginx config), `s
 
 ### Security
 - Build every host command with `Command::new(..).arg(..)`. Never build a command with `format!` or string concatenation, never use `sh -c`, and never pass a user-controlled command string. This turns unescaped-input bugs from remote-code-execution risks into type and validation errors.
+- Spawn processes only through `panel-agent/src/adapters/exec.rs`, whose `ALLOWED_PROGRAMS` list excludes every shell. A source-scan test enforces this; add a new tool to the list in the same change that uses it.
 - Every adapter takes pre-validated typed arguments. Validate user input with allow-lists before it reaches an adapter: project IDs, service names, hostnames, paths, branches, images, ports.
 - panel-agent runs as root, so keep privileged logic there, typed and validated. panel-api stays unprivileged.
 - Password hashing is Argon2id. Session cookies are AES-GCM encrypted. TOTP 2FA is part of core.
@@ -63,18 +64,29 @@ Docker, mail, and antivirus are Cargo features of `panel-agent` (`docker`, `mail
 Docker is **not** a Portainer-like container dashboard. It is a lightweight PaaS-style deployment workflow inspired by Dokploy's application, Compose, and deployment models.
 
 - The primary unit is a named project/application or Compose project, not an arbitrary `docker run` command.
-- Supported sources are explicit Git or raw Compose. Panel-managed inputs are a validated source/Compose path, a write-only environment file, and a stable project name. Deployments keep status, history, and bounded logs.
-- Deploy with typed argv only, for example `docker compose -p <project> -f <file> up -d --remove-orphans`.
-- Compose files are application-controlled code, but they are still validated. Reject privileged mode and forbidden host bind mounts. Write all files under the application's isolated directory (installer default `/var/lib/scontrol/docker`).
-- Environment values are write-only. Do not persist or return secret values after creation. Store them encrypted or in a dedicated secret store, and redact them from logs.
-- A project domain is an explicit binding to a declared HTTP service and port. The agent generates an Nginx reverse-proxy vhost, and TLS goes through the standard certificate workflow. This binding is not implemented yet (see `TASK.md`).
-- Code map: `panel-agent` `adapters/docker.rs` and `adapters/compose.rs`; `panel-api` `routes/compose_projects.rs` and `db/compose_projects.rs`; migration `0002_compose_projects.sql`.
-- Dokploy is conceptual guidance only. Do not copy its code, and do not treat it as a license source. The research basis is recorded in `TASK.md`.
+- Supported sources are explicit Git or raw Compose. Panel-managed inputs are a validated source/Compose path, a write-only environment file, and a stable project name. Deployments keep status, history, commit SHA, and bounded logs.
+- Deploy with typed argv only, for example `docker compose -p <project> -f <file> up -d --remove-orphans`. Never put credentials on argv; pass them through env, 0600 files, or stdin.
+- Deployments are asynchronous. The `compose_deployments` table is a durable queue: endpoints insert a `queued` row and return `202`, and the workers in `services/deploy_queue.rs` claim rows with `FOR UPDATE SKIP LOCKED`. One project deploys at a time; separate projects run in parallel. Do not run a deployment inside an HTTP handler.
+- Compose files are application-controlled code, but they are still validated. Reject privileged mode, host namespaces, devices, and forbidden host bind mounts, and reject a Compose path that resolves outside the source tree. Write all files under the project's isolated directory (installer default `/var/lib/scontrol/docker/<slug>/`).
+- Environment values are write-only. They reach the agent through `write_compose_environment` (never a queue row, response, audit entry, or log), live in a 0600 `env` file outside `code/`, and are masked in deployment logs.
+- A project domain is an explicit binding to a declared service and container port. The agent publishes that port on `127.0.0.1:<40000–49999>` through a generated `scontrol.override.yml`, writes an Nginx vhost `scontrol-compose-<domain>.conf`, and rolls back if `nginx -t` fails. HTTPS uses `certbot certonly --webroot`. No Traefik.
+- Code map:
+  - `panel-agent`: `adapters/compose.rs`, `adapters/deploy_log.rs`, `adapters/git_auth.rs` (deploy keys, HTTPS tokens, the `GIT_SSH`/`GIT_ASKPASS` helper mode), and `adapters/nginx.rs` (Compose vhosts). `adapters/docker.rs` is legacy container CRUD and is not a product surface.
+  - `panel-api`: `services/deploy_queue.rs`, `services/webhook.rs` (signatures, watch paths), `services/notifications.rs`, `services/secret_box.rs`, `routes/compose_projects.rs` (including the SSE `logs/stream`), `routes/webhooks.rs` (public, signature-authenticated), `routes/notifications.rs`, `db/compose_projects.rs`, `db/notifications.rs`.
+  - Frontend: `frontend/src/ComposeProjects.tsx`, `frontend/src/Notifications.tsx`, and `frontend/src/api.ts`.
+  - Migrations: `0002_compose_projects.sql`, `0003_deploy_queue_and_domains.sql`, `0004_compose_webhooks.sql`, `0005_webhook_watch_paths.sql`, `0006_notification_channels.sql`, and `0007_compose_git_access.sql`.
+- Live container logs use the streamed agent RPC `follow_compose_logs` (see `panel_core::agent_protocol::StreamFrame`). Mask secrets before filtering, and stop the follower when the client goes away.
+- Secrets panel-api must store (notification credentials now, registry/S3/GitHub App later) are sealed with `SecretBox` under `PANEL_SECRET_KEY`, are write-only in the API, and are stripped from stored delivery errors.
+- Private Git credentials stay on the agent. Deploy keys are generated there (only the public key leaves the host), and HTTPS tokens are write-only, sent through `write_git_credentials`, and stored 0600. Git gets them through the agent binary acting as `GIT_SSH` or `GIT_ASKPASS` (`SCONTROL_GIT_HELPER`). Never use `GIT_SSH_COMMAND` or a credential helper string, because Git runs those through `sh -c`.
+- Push webhooks must be authenticated by a body HMAC or by GitLab's token, never by a URL secret alone. The webhook secret is derived (server key + project ID + nonce) and never stored.
+- Cancellation and timeouts stop a step's own process group (`exec::run_streamed`). Never use a host-wide `pkill`.
+- Dokploy is conceptual guidance only. Do not copy its code, and do not treat it as a license source. The research basis and parity roadmap are in `PLAN.md`.
 
 ## Work Tracking
 
 - `TASK.md` is the live implementation checklist. Update it in the same change set whenever work is completed, reprioritized, or newly discovered.
 - The architecture plan is `.kilo/plans/1789208962783-rust-server-panel-plan.md`. Read it together with `TASK.md`.
+- `PLAN.md` is the Dokploy-parity roadmap: research basis, parity matrix, performance budgets, and phases D0–D6. Update its status column when a parity item lands.
 - `MEMORY.md` records durable decisions and their reasons. Update it when a decision changes.
 
 ## Common Commands

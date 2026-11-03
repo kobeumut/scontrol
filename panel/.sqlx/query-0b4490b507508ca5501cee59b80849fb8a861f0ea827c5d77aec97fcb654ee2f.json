@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO compose_deployments (id, project_id, status, log_path, pull_images, trigger)\n           VALUES ($1, $2, 'queued', $3, $4, $5)\n           RETURNING id, project_id, status, log_path, trigger, commit_sha, queued_at,\n                     started_at, finished_at, error_message",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "log_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "trigger",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "commit_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "queued_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "error_message",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "0b4490b507508ca5501cee59b80849fb8a861f0ea827c5d77aec97fcb654ee2f"
+}

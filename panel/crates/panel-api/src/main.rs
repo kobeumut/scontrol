@@ -12,6 +12,8 @@ mod mcp;
 mod routes;
 mod services;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use clap::Parser;
 use config::ApiConfig;
@@ -52,6 +54,23 @@ async fn main() -> anyhow::Result<()> {
     if args.mcp_stdio {
         return mcp::stdio::run(state).await;
     }
+
+    // Only the HTTP server executes deployments; an MCP stdio process just
+    // queues them. A `running` row at startup belongs to a dead process.
+    let interrupted = db::compose_projects::fail_interrupted_deployments(&state.db).await?;
+    if interrupted > 0 {
+        tracing::warn!(interrupted, "marked interrupted deployments as failed");
+    }
+    state.deploy_queue.start_workers(
+        state.db.clone(),
+        state.agent.clone(),
+        state.notifier.clone(),
+        config.deploy_workers,
+    );
+    tracing::info!(
+        workers = config.deploy_workers,
+        "deployment workers started"
+    );
 
     let router = routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

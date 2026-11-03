@@ -4,13 +4,17 @@
 //! commands itself — see `panel-agent` for the privileged side.
 
 use crate::adapters::*;
-use crate::agent_protocol::{AgentRequest, AgentResponse};
+use crate::agent_protocol::{AgentRequest, AgentResponse, StreamFrame};
 use crate::error::{CoreError, CoreResult};
-use crate::types::{ComposeServiceInfo, ContainerInfo, MailboxInfo, ScanResult};
+use crate::types::{
+    ComposeDeployOutcome, ComposeServiceInfo, ContainerInfo, DeploymentLogChunk, MailboxInfo,
+    ScanResult,
+};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
 #[derive(Clone)]
@@ -25,7 +29,12 @@ impl AgentClient {
         }
     }
 
-    async fn call<T: DeserializeOwned>(&self, request: AgentRequest) -> CoreResult<T> {
+    /// Sends `request` and reads the first response line. Returns the
+    /// reader too, for streamed responses that continue on the connection.
+    async fn send(
+        &self,
+        request: AgentRequest,
+    ) -> CoreResult<(serde_json::Value, BufReader<OwnedReadHalf>, OwnedWriteHalf)> {
         let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
             CoreError::External(format!(
                 "connecting to agent at {}: {e}",
@@ -51,10 +60,52 @@ impl AgentClient {
 
         let response: AgentResponse = serde_json::from_str(line.trim())
             .map_err(|e| CoreError::External(format!("decoding agent response: {e}")))?;
+        Ok((response.into_core_result()?, reader, write_half))
+    }
 
-        let data = response.into_core_result()?;
+    async fn call<T: DeserializeOwned>(&self, request: AgentRequest) -> CoreResult<T> {
+        let (data, _, _) = self.send(request).await?;
         serde_json::from_value(data)
             .map_err(|e| CoreError::External(format!("decoding agent payload: {e}")))
+    }
+
+    /// Forwards [`StreamFrame`]s into a channel until `End`, an error, or
+    /// the receiver is dropped; the connection is closed in every case,
+    /// which is what stops the follower on the agent.
+    async fn stream_lines(&self, request: AgentRequest) -> CoreResult<LogLines> {
+        let (_, mut reader, write_half) = self.send(request).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(LOG_LINES_CAPACITY);
+        tokio::spawn(async move {
+            let _write_half = write_half;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = tokio::select! {
+                    read = reader.read_line(&mut line) => read,
+                    _ = tx.closed() => return,
+                };
+                let frame = match read {
+                    Ok(0) => Err(CoreError::External("agent closed the log stream".into())),
+                    Ok(_) => serde_json::from_str::<StreamFrame>(line.trim()).map_err(|e| {
+                        CoreError::External(format!("decoding agent stream frame: {e}"))
+                    }),
+                    Err(e) => Err(CoreError::External(format!("reading log stream: {e}"))),
+                };
+                let item = match frame {
+                    Ok(StreamFrame::Line { text }) => Ok(text),
+                    Ok(StreamFrame::End { error: None }) => return,
+                    Ok(StreamFrame::End {
+                        error: Some(message),
+                    }) => Err(CoreError::External(message)),
+                    Err(error) => Err(error),
+                };
+                let failed = item.is_err();
+                if tx.send(item).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
     }
 }
 
@@ -128,11 +179,31 @@ impl AdapterPort for AgentClient {
         self.call(AgentRequest::ListContainers).await
     }
 
+    async fn write_compose_environment(
+        &self,
+        params: WriteComposeEnvironmentParams,
+    ) -> CoreResult<()> {
+        self.call(AgentRequest::WriteComposeEnvironment(params))
+            .await
+    }
+
     async fn deploy_compose_project(
         &self,
         params: DeployComposeProjectParams,
-    ) -> CoreResult<Vec<ComposeServiceInfo>> {
+    ) -> CoreResult<ComposeDeployOutcome> {
         self.call(AgentRequest::DeployComposeProject(params)).await
+    }
+
+    async fn generate_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<String> {
+        self.call(AgentRequest::GenerateDeployKey(params)).await
+    }
+
+    async fn remove_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<()> {
+        self.call(AgentRequest::RemoveDeployKey(params)).await
+    }
+
+    async fn write_git_credentials(&self, params: WriteGitCredentialsParams) -> CoreResult<()> {
+        self.call(AgentRequest::WriteGitCredentials(params)).await
     }
 
     async fn stop_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()> {
@@ -153,6 +224,22 @@ impl AdapterPort for AgentClient {
 
     async fn compose_project_logs(&self, params: ComposeProjectLogsParams) -> CoreResult<String> {
         self.call(AgentRequest::ComposeProjectLogs(params)).await
+    }
+
+    async fn follow_compose_logs(&self, params: FollowComposeLogsParams) -> CoreResult<LogLines> {
+        self.stream_lines(AgentRequest::FollowComposeLogs(params))
+            .await
+    }
+
+    async fn read_deployment_log(
+        &self,
+        params: DeploymentLogParams,
+    ) -> CoreResult<DeploymentLogChunk> {
+        self.call(AgentRequest::ReadDeploymentLog(params)).await
+    }
+
+    async fn cancel_deployment(&self, params: CancelDeploymentParams) -> CoreResult<bool> {
+        self.call(AgentRequest::CancelDeployment(params)).await
     }
 
     async fn create_mailbox(&self, params: CreateMailboxParams) -> CoreResult<MailboxInfo> {

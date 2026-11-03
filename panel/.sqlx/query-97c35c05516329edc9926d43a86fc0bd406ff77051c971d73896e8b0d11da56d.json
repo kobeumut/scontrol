@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT deploy_public_key, git_token_host FROM compose_projects WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deploy_public_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "git_token_host",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "97c35c05516329edc9926d43a86fc0bd406ff77051c971d73896e8b0d11da56d"
+}

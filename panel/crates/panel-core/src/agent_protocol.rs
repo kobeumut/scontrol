@@ -5,6 +5,11 @@
 //! Transport: newline-delimited JSON over a Unix domain socket
 //! (`/run/scontrol/agent.sock`, mode 0660, group `scontrol`). Each line is a
 //! single [`AgentRequest`] and elicits exactly one [`AgentResponse`] line.
+//!
+//! The one exception is [`AgentRequest::FollowComposeLogs`]: after an `Ok`
+//! response the agent writes [`StreamFrame`] lines until an `End` frame,
+//! then closes the connection. Closing it from the client side stops the
+//! follower.
 
 use crate::adapters::*;
 use crate::error::CoreError;
@@ -30,14 +35,34 @@ pub enum AgentRequest {
     StopContainer(ContainerActionParams),
     RemoveContainer(ContainerActionParams),
     ListContainers,
+    WriteComposeEnvironment(WriteComposeEnvironmentParams),
     DeployComposeProject(DeployComposeProjectParams),
+    GenerateDeployKey(ComposeProjectActionParams),
+    RemoveDeployKey(ComposeProjectActionParams),
+    WriteGitCredentials(WriteGitCredentialsParams),
     StopComposeProject(ComposeProjectActionParams),
     RemoveComposeProject(ComposeProjectActionParams),
     ListComposeProjectServices(ComposeProjectActionParams),
     ComposeProjectLogs(ComposeProjectLogsParams),
+    FollowComposeLogs(FollowComposeLogsParams),
+    ReadDeploymentLog(DeploymentLogParams),
+    CancelDeployment(CancelDeploymentParams),
     CreateMailbox(CreateMailboxParams),
     DeleteMailbox(DeleteMailboxParams),
     ScanPath(ScanPathParams),
+}
+
+/// One line of a streamed response (see the module docs).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum StreamFrame {
+    Line {
+        text: String,
+    },
+    /// Last frame. `error` is set when the stream stopped on a failure.
+    End {
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +84,7 @@ impl AgentResponse {
             Ok(v) => Self::ok(&v),
             Err(e) => AgentResponse::Err {
                 kind: error_kind(&e),
-                message: e.to_string(),
+                message: e.message().to_string(),
             },
         }
     }
@@ -73,6 +98,7 @@ impl AgentResponse {
                 "already_exists" => CoreError::AlreadyExists(message),
                 "permission_denied" => CoreError::PermissionDenied(message),
                 "io" => CoreError::Io(message),
+                "cancelled" => CoreError::Cancelled(message),
                 _ => CoreError::External(message),
             }),
         }
@@ -86,6 +112,7 @@ fn error_kind(e: &CoreError) -> String {
         CoreError::AlreadyExists(_) => "already_exists",
         CoreError::PermissionDenied(_) => "permission_denied",
         CoreError::Io(_) => "io",
+        CoreError::Cancelled(_) => "cancelled",
         CoreError::External(_) => "external",
     }
     .to_string()
@@ -128,5 +155,15 @@ mod tests {
         let resp = AgentResponse::ok(&42u32);
         let value = resp.into_core_result().unwrap();
         assert_eq!(value, serde_json::json!(42));
+    }
+
+    #[test]
+    fn error_message_is_not_prefixed_twice() {
+        let original = CoreError::Cancelled("deployment cancelled".into());
+        let decoded = AgentResponse::from_core_result::<()>(Err(original.clone()))
+            .into_core_result()
+            .unwrap_err();
+        assert_eq!(decoded.to_string(), original.to_string());
+        assert_eq!(decoded.to_string(), "cancelled: deployment cancelled");
     }
 }

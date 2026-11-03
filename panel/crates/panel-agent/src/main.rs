@@ -13,12 +13,13 @@ mod config;
 use adapters::LocalAdapter;
 use clap::Parser;
 use config::AgentConfig;
-use panel_core::adapters::AdapterPort;
-use panel_core::agent_protocol::{AgentRequest, AgentResponse};
+use panel_core::adapters::{AdapterPort, LogLines};
+use panel_core::agent_protocol::{AgentRequest, AgentResponse, StreamFrame};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Parser, Debug)]
@@ -32,8 +33,19 @@ struct Args {
     config: PathBuf,
 }
 
+fn main() -> anyhow::Result<()> {
+    // Git runs this binary back as its askpass/ssh helper during private
+    // clones (see `adapters::git_auth`). Checked before logging starts,
+    // because an askpass helper answers on stdout.
+    #[cfg(feature = "docker")]
+    if let Some(result) = adapters::git_auth::run_as_git_helper() {
+        return result;
+    }
+    serve()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
@@ -85,6 +97,10 @@ async fn handle_connection(stream: UnixStream, adapter: Arc<LocalAdapter>) -> an
         }
 
         let response = match serde_json::from_str::<AgentRequest>(trimmed) {
+            Ok(AgentRequest::FollowComposeLogs(params)) => {
+                let lines = adapter.follow_compose_logs(params).await;
+                return stream_lines(lines, reader, write_half).await;
+            }
             Ok(request) => dispatch(&adapter, request).await,
             Err(e) => AgentResponse::Err {
                 kind: "invalid_request".into(),
@@ -96,6 +112,54 @@ async fn handle_connection(stream: UnixStream, adapter: Arc<LocalAdapter>) -> an
         serialized.push('\n');
         write_half.write_all(serialized.as_bytes()).await?;
     }
+}
+
+async fn write_json<T: serde::Serialize>(
+    write_half: &mut OwnedWriteHalf,
+    value: &T,
+) -> anyhow::Result<()> {
+    let mut serialized = serde_json::to_string(value)?;
+    serialized.push('\n');
+    write_half.write_all(serialized.as_bytes()).await?;
+    Ok(())
+}
+
+/// Writes a streamed response (see `agent_protocol`) and closes the
+/// connection. A client that hangs up, detected by EOF on its side of the
+/// socket or by a failed write, drops `lines`, which stops the follower.
+async fn stream_lines(
+    lines: panel_core::error::CoreResult<LogLines>,
+    mut reader: BufReader<OwnedReadHalf>,
+    mut write_half: OwnedWriteHalf,
+) -> anyhow::Result<()> {
+    let mut lines = match lines {
+        Ok(lines) => lines,
+        Err(error) => {
+            let response = AgentResponse::from_core_result::<()>(Err(error));
+            return write_json(&mut write_half, &response).await;
+        }
+    };
+    write_json(&mut write_half, &AgentResponse::ok(&())).await?;
+    let mut ignored = String::new();
+    let end = loop {
+        let item = tokio::select! {
+            item = lines.recv() => item,
+            read = reader.read_line(&mut ignored) => match read {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => { ignored.clear(); continue; }
+            },
+        };
+        match item {
+            Some(Ok(text)) => write_json(&mut write_half, &StreamFrame::Line { text }).await?,
+            Some(Err(error)) => {
+                break StreamFrame::End {
+                    error: Some(error.message().to_string()),
+                }
+            }
+            None => break StreamFrame::End { error: None },
+        }
+    };
+    write_json(&mut write_half, &end).await
 }
 
 async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentResponse {
@@ -149,8 +213,20 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         AgentRequest::ListContainers => {
             AgentResponse::from_core_result(adapter.list_containers().await)
         }
+        AgentRequest::WriteComposeEnvironment(p) => {
+            AgentResponse::from_core_result(adapter.write_compose_environment(p).await)
+        }
         AgentRequest::DeployComposeProject(p) => {
             AgentResponse::from_core_result(adapter.deploy_compose_project(p).await)
+        }
+        AgentRequest::GenerateDeployKey(p) => {
+            AgentResponse::from_core_result(adapter.generate_deploy_key(p).await)
+        }
+        AgentRequest::RemoveDeployKey(p) => {
+            AgentResponse::from_core_result(adapter.remove_deploy_key(p).await)
+        }
+        AgentRequest::WriteGitCredentials(p) => {
+            AgentResponse::from_core_result(adapter.write_git_credentials(p).await)
         }
         AgentRequest::StopComposeProject(p) => {
             AgentResponse::from_core_result(adapter.stop_compose_project(p).await)
@@ -163,6 +239,17 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         }
         AgentRequest::ComposeProjectLogs(p) => {
             AgentResponse::from_core_result(adapter.compose_project_logs(p).await)
+        }
+        // Streamed requests are handled in `handle_connection`.
+        AgentRequest::FollowComposeLogs(_) => AgentResponse::Err {
+            kind: "invalid_request".into(),
+            message: "follow_compose_logs is a streamed request".into(),
+        },
+        AgentRequest::CancelDeployment(p) => {
+            AgentResponse::from_core_result(adapter.cancel_deployment(p).await)
+        }
+        AgentRequest::ReadDeploymentLog(p) => {
+            AgentResponse::from_core_result(adapter.read_deployment_log(p).await)
         }
         AgentRequest::CreateMailbox(p) => {
             AgentResponse::from_core_result(adapter.create_mailbox(p).await)

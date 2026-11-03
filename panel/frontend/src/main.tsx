@@ -1,56 +1,71 @@
-import { useEffect, useState } from 'react';
+import { FormEvent, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { api, ApiError, Capability, Site, useApi, User } from './api';
+import { ComposeProjects } from './ComposeProjects';
+import { Notifications } from './Notifications';
 import './styles.css';
 
-type Capability = { docker: boolean; mail: boolean; antivirus: boolean; version: string };
-type Site = { id: string; domain: string; status: string; ssl_enabled: boolean; runtime: { kind: string } };
-type ComposeProject = { id: string; name: string; slug: string; status: string; source: { kind: string } };
+function Login({ onSignedIn }: { onSignedIn: () => void }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [totp, setTotp] = useState('');
+  const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState(false);
 
-type ApiState<T> = { loading: boolean; data?: T; error?: string };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true); setError(undefined);
+    try {
+      await api('/auth/login', { method: 'POST', body: { username, password, totp_code: totp || undefined } });
+      onSignedIn();
+    } catch (e) {
+      setError(e instanceof ApiError && e.status === 401 ? 'Wrong username, password or 2FA code.' : (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
-async function api<T>(path: string): Promise<T> {
-  const response = await fetch(`/api${path}`, { credentials: 'same-origin' });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.error || `Request failed (${response.status})`);
-  }
-  return response.json() as Promise<T>;
+  return <form className="card login" onSubmit={submit}>
+    <h2>Sign in</h2>
+    <label>Username<input required autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
+    <label>Password<input required type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+    <label>2FA code <span className="muted small">(if enabled)</span><input inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" value={totp} onChange={(e) => setTotp(e.target.value)} /></label>
+    {error && <p className="state error" role="alert">{error}</p>}
+    <button className="action" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+  </form>;
 }
 
-function useApi<T>(path: string) {
-  const [state, setState] = useState<ApiState<T>>({ loading: true });
-  useEffect(() => {
-    let active = true;
-    api<T>(path).then((data) => active && setState({ loading: false, data }))
-      .catch((error: Error) => active && setState({ loading: false, error: error.message }));
-    return () => { active = false; };
-  }, [path]);
-  return state;
-}
-
-function StateView({ state }: { state: ApiState<unknown> }) {
-  if (state.loading) return <p className="state">Loading operational state…</p>;
-  if (state.error) return <p className="state error">{state.error}. Sign in to access panel data.</p>;
-  return null;
+function Sites() {
+  const sites = useApi<Site[]>('/sites');
+  return <section className="panel">
+    <div className="panel-title"><h2>Hosted sites</h2><button className="action" disabled>New site</button></div>
+    {sites.loading && <p className="state">Loading…</p>}
+    {sites.error && <p className="state error">{sites.error}</p>}
+    {sites.data && <table><thead><tr><th>Domain</th><th>Runtime</th><th>Status</th><th>TLS</th></tr></thead><tbody>
+      {sites.data.length === 0 ? <tr><td colSpan={4} className="empty">No sites provisioned.</td></tr> : sites.data.map((site) => <tr key={site.id}><td>{site.domain}</td><td>{site.runtime.kind}</td><td><span className={`badge ${site.status}`}>{site.status}</span></td><td>{site.ssl_enabled ? 'enabled' : '—'}</td></tr>)}
+    </tbody></table>}
+  </section>;
 }
 
 function App() {
-  const health = useApi<{ status: string; capabilities?: Capability }>('/health/agent');
-  const sites = useApi<Site[]>('/sites/');
-  const projects = useApi<ComposeProject[]>('/compose-projects/');
-  const [active, setActive] = useState<'sites' | 'projects'>('sites');
+  const health = useApi<{ status: string; capabilities?: Capability }>('/health/agent', 30000);
+  const me = useApi<User>('/auth/me');
+  const [active, setActive] = useState<'sites' | 'projects' | 'notifications'>('projects');
+  const docker = health.data?.capabilities?.docker;
+
+  const signOut = async () => {
+    await api('/auth/logout', { method: 'POST' }).catch(() => undefined);
+    me.reload();
+  };
 
   return <main className="shell">
     <header className="masthead">
       <div><span className="mark">S/</span><span className="product">scontrol</span></div>
-      <div className="system-state"><i className={health.data?.status === 'ok' ? 'lamp up' : 'lamp'} /> agent {health.data?.status ?? 'checking'}</div>
+      <div className="system-state">
+        <i className={health.data?.status === 'ok' ? 'lamp up' : 'lamp'} /> agent {health.data?.status ?? 'checking'}
+        {me.data && <> · {me.data.username} <button className="link" onClick={signOut}>sign out</button></>}
+      </div>
     </header>
-
-    <section className="hero">
-      <p className="eyebrow">SERVER OPERATIONS / LOCAL FIRST</p>
-      <h1>Clear control.<br /><em>Minimal surface.</em></h1>
-      <p className="intro">Sites, deployments and host services in one deliberately compact control plane.</p>
-    </section>
 
     <section className="capabilities" aria-label="Installed capabilities">
       {(['docker', 'mail', 'antivirus'] as const).map((feature) => <div className="cap" key={feature}>
@@ -59,25 +74,19 @@ function App() {
       <div className="cap"><span>agent</span><strong>{health.data?.capabilities?.version ?? '—'}</strong></div>
     </section>
 
-    <nav className="tabs" aria-label="Primary content">
-      <button className={active === 'sites' ? 'selected' : ''} onClick={() => setActive('sites')}>Hosted sites</button>
-      <button className={active === 'projects' ? 'selected' : ''} onClick={() => setActive('projects')}>Compose projects</button>
-    </nav>
-
-    {active === 'sites' ? <section className="panel">
-      <div className="panel-title"><h2>Hosted sites</h2><button className="action" disabled>New site</button></div>
-      <StateView state={sites} />
-      {sites.data && <table><thead><tr><th>Domain</th><th>Runtime</th><th>Status</th><th>TLS</th></tr></thead><tbody>
-        {sites.data.length === 0 ? <tr><td colSpan={4} className="empty">No sites provisioned.</td></tr> : sites.data.map((site) => <tr key={site.id}><td>{site.domain}</td><td>{site.runtime.kind}</td><td><span className={`badge ${site.status}`}>{site.status}</span></td><td>{site.ssl_enabled ? 'enabled' : '—'}</td></tr>)}
-      </tbody></table>}
-    </section> : <section className="panel">
-      <div className="panel-title"><h2>Compose projects</h2><button className="action" disabled>Deploy project</button></div>
-      <p className="hint">Dokploy-inspired deployments: isolated source, write-only environment, Compose project identity and bounded logs.</p>
-      <StateView state={projects} />
-      {projects.data && <table><thead><tr><th>Project</th><th>Slug</th><th>Source</th><th>Status</th></tr></thead><tbody>
-        {projects.data.length === 0 ? <tr><td colSpan={4} className="empty">No Compose projects deployed.</td></tr> : projects.data.map((project) => <tr key={project.id}><td>{project.name}</td><td className="mono">{project.slug}</td><td>{project.source.kind}</td><td><span className={`badge ${project.status}`}>{project.status}</span></td></tr>)}
-      </tbody></table>}
-    </section>}
+    {me.loading ? <p className="state">Checking session…</p>
+      : !me.data ? <Login onSignedIn={me.reload} />
+      : <>
+        <nav className="tabs" aria-label="Primary content">
+          <button className={active === 'projects' ? 'selected' : ''} onClick={() => setActive('projects')}>Compose projects</button>
+          <button className={active === 'sites' ? 'selected' : ''} onClick={() => setActive('sites')}>Hosted sites</button>
+          <button className={active === 'notifications' ? 'selected' : ''} onClick={() => setActive('notifications')}>Notifications</button>
+        </nav>
+        {active === 'sites' ? <Sites />
+          : active === 'notifications' ? <Notifications />
+          : docker === false ? <section className="panel"><p className="state">Docker was not selected at install time. Re-run the installer and opt in to enable Compose projects.</p></section>
+          : <ComposeProjects />}
+      </>}
   </main>;
 }
 

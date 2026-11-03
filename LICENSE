@@ -1,0 +1,84 @@
+scontrol Attribution License 1.0
+
+Copyright (c) 2026 Umut ADALI(kobeumut)
+
+1. Permission and scope
+
+Subject to the conditions below, permission is granted, free of charge, to any
+person obtaining a copy of scontrol and its associated documentation (the
+"Software") to use, copy, modify, merge, publish, distribute, and sell copies of
+the Software, and to use it in commercial products and hosted services.
+These permissions apply only to material the copyright holder has the right to
+license. No ownership of the original Software is transferred.
+
+2. Preservation of notices
+
+Every copy or substantial portion of the Software, including modified versions
+and binary distributions, must include this license and retain the original
+copyright and attribution notices. For binary distributions, these notices may
+be included in accompanying license documentation. Recipients must receive the
+same permissions to the original Software under this license; additional terms
+must not remove or override these conditions for that Software.
+
+3. Attribution in commercial use
+
+If you use the Software or a substantial portion of it in a commercial product
+or service, whether distributed or hosted, you must include the following
+attribution, without changing the credited name:
+
+    Based on scontrol by Umut ADALI(kobeumut).
+
+The attribution must be legible and readily accessible to the product's or
+service's users in its About, Credits, Legal, or Licenses section. If no user
+interface exists, include it in the documentation supplied to users. For
+internal commercial use, documentation accessible to the internal users is
+sufficient. A source-code comment alone does not satisfy this condition.
+Merely hosting an unrelated application or website using scontrol does not
+require attribution on that application or website; attribution in the
+scontrol-based management product or service is sufficient.
+
+4. Modified and updated versions
+
+If you distribute, publish, deploy, or provide access to a modified or updated
+version of the Software, commercially or otherwise, you must retain the
+attribution in section 3 in that version's accompanying documentation or
+Credits, Legal, or Licenses section. You must also clearly identify that the
+version has been changed, identify the person or organization responsible for
+those changes, and describe the changes and their date in accompanying release
+notes or a changelog. Do not represent your changes as work by the original
+author. This condition does not require publication of private source code.
+
+5. No endorsement or support obligation
+
+Attribution does not imply endorsement, sponsorship, or approval by the original
+author. No right to use the author's name or any trademark for endorsement is
+granted. The author and contributors have no obligation under this license to
+provide support, maintenance, updates, security fixes, hosting, or compensation.
+
+6. Disclaimer of warranty
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THERE IS NO WARRANTY THAT THE
+SOFTWARE IS SECURE, ERROR-FREE, UNINTERRUPTED, OR SUITABLE FOR YOUR SYSTEMS.
+
+7. Limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE AUTHOR,
+COPYRIGHT HOLDERS, OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE, ITS USE,
+MODIFICATION, DISTRIBUTION, OR OTHER DEALINGS IN THE SOFTWARE, WHETHER IN AN
+ACTION OF CONTRACT, TORT, OR OTHERWISE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE. THIS INCLUDES, WITHOUT LIMITATION, DATA LOSS, SECURITY INCIDENTS,
+SERVICE INTERRUPTION, LOST PROFITS, AND DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+OR CONSEQUENTIAL DAMAGES.
+
+Nothing in this license excludes or limits liability or statutory rights that
+cannot lawfully be excluded or limited under applicable law.
+
+8. Third-party material
+
+Third-party dependencies and separately licensed material remain subject to
+their own licenses and notices. This license does not replace those terms or
+grant rights the copyright holder does not hold.

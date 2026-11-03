@@ -95,10 +95,72 @@ pub struct RemoveCronJobParams {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DeployComposeProjectParams {
     pub project_id: Uuid,
+    /// Names the per-deployment log file the agent streams output into.
+    pub deployment_id: Uuid,
     pub project_slug: String,
     pub source: ComposeSource,
-    pub environment: Vec<(String, String)>,
     pub pull_images: bool,
+    /// Complete desired set of domain bindings. Bindings that existed on the
+    /// previous deployment but are absent here are removed.
+    #[serde(default)]
+    pub domains: Vec<ComposeDomainBinding>,
+    /// Let's Encrypt account email, required when any binding has `https`.
+    #[serde(default)]
+    pub acme_email: Option<String>,
+}
+
+/// Replaces a project's write-only environment file. Sent separately from
+/// deployments so queued deployment jobs never carry secret values.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WriteComposeEnvironmentParams {
+    pub project_slug: String,
+    pub environment: Vec<(String, String)>,
+}
+
+/// HTTPS credentials for a project's private Git remote, usually a
+/// personal access or deploy token. Write-only like the environment: the
+/// agent keeps them in a 0600 file and hands them to Git through an askpass
+/// helper, never argv, and only for the remote's own host.
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GitHttpCredentials {
+    pub username: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for GitHttpCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHttpCredentials")
+            .field("username", &self.username)
+            .field("token", &"********")
+            .finish()
+    }
+}
+
+/// Replaces (`Some`) or removes (`None`) a project's Git HTTPS credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WriteGitCredentialsParams {
+    pub project_slug: String,
+    /// Host of the project's HTTPS remote. The agent offers the token only
+    /// when Git asks on behalf of this host, so a redirect elsewhere never
+    /// receives it.
+    pub host: String,
+    pub credentials: Option<GitHttpCredentials>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CancelDeploymentParams {
+    pub deployment_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeploymentLogParams {
+    pub project_slug: String,
+    pub deployment_id: Uuid,
+    /// Byte offset to resume from; clients poll with the previous
+    /// `next_offset` to tail a running deployment.
+    pub offset: u64,
+    /// Bounded by the agent to 1..=256 KiB.
+    pub max_bytes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -112,6 +174,33 @@ pub struct ComposeProjectLogsParams {
     /// Bounded by the agent to 1..=2,000 lines.
     pub tail_lines: u16,
 }
+
+/// Follow a Compose project's container output live. The agent redacts
+/// environment values before applying `search`, so a search can never
+/// probe for a secret.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FollowComposeLogsParams {
+    pub project_slug: String,
+    /// One service, or every service of the project when `None`.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// History to send before following; bounded by the agent to 0..=2,000.
+    pub tail_lines: u16,
+    /// Case-insensitive substring; only matching lines are sent.
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub timestamps: bool,
+}
+
+/// Lines of a followed log, oldest first. The stream ends when the
+/// containers stop, the agent's follow limit elapses, or on an `Err` item;
+/// dropping the receiver stops the follower on the agent.
+pub type LogLines = tokio::sync::mpsc::Receiver<CoreResult<String>>;
+
+/// Channel capacity for [`LogLines`]: a slow reader applies backpressure to
+/// the follower instead of growing memory.
+pub const LOG_LINES_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CreateContainerParams {
@@ -186,10 +275,19 @@ pub trait AdapterPort: Send + Sync {
     async fn list_containers(&self) -> CoreResult<Vec<ContainerInfo>>;
 
     // Optional: Docker PaaS-style Compose projects
+    async fn write_compose_environment(
+        &self,
+        params: WriteComposeEnvironmentParams,
+    ) -> CoreResult<()>;
     async fn deploy_compose_project(
         &self,
         params: DeployComposeProjectParams,
-    ) -> CoreResult<Vec<ComposeServiceInfo>>;
+    ) -> CoreResult<ComposeDeployOutcome>;
+    /// Creates (or replaces) the project's SSH deploy key and returns the
+    /// public half. The private key never leaves the agent.
+    async fn generate_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<String>;
+    async fn remove_deploy_key(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
+    async fn write_git_credentials(&self, params: WriteGitCredentialsParams) -> CoreResult<()>;
     async fn stop_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
     async fn remove_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
     async fn list_compose_project_services(
@@ -197,6 +295,14 @@ pub trait AdapterPort: Send + Sync {
         params: ComposeProjectActionParams,
     ) -> CoreResult<Vec<ComposeServiceInfo>>;
     async fn compose_project_logs(&self, params: ComposeProjectLogsParams) -> CoreResult<String>;
+    async fn follow_compose_logs(&self, params: FollowComposeLogsParams) -> CoreResult<LogLines>;
+    async fn read_deployment_log(
+        &self,
+        params: DeploymentLogParams,
+    ) -> CoreResult<DeploymentLogChunk>;
+    /// Asks the agent to stop a running deployment. Returns `false` if the
+    /// agent is not running that deployment (finished, or not started yet).
+    async fn cancel_deployment(&self, params: CancelDeploymentParams) -> CoreResult<bool>;
 
     // Optional: Mail
     async fn create_mailbox(&self, params: CreateMailboxParams) -> CoreResult<MailboxInfo>;
@@ -216,7 +322,7 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockAdapter {
         pub calls: Mutex<Vec<String>>,
-        pub fail_next: Mutex<Option<String>>,
+        pub fail_next: Mutex<Option<(String, crate::error::CoreError)>>,
     }
 
     impl MockAdapter {
@@ -225,17 +331,22 @@ pub mod mock {
         }
 
         pub fn fail_next_call(&self, method: &str) {
-            *self.fail_next.lock().unwrap() = Some(method.to_string());
+            self.fail_next_call_with(
+                method,
+                crate::error::CoreError::External(format!("mock failure injected for {method}")),
+            );
+        }
+
+        /// Makes the next call of `method` return exactly `error`.
+        pub fn fail_next_call_with(&self, method: &str, error: crate::error::CoreError) {
+            *self.fail_next.lock().unwrap() = Some((method.to_string(), error));
         }
 
         fn record(&self, method: &str) -> CoreResult<()> {
             self.calls.lock().unwrap().push(method.to_string());
             let mut guard = self.fail_next.lock().unwrap();
-            if guard.as_deref() == Some(method) {
-                *guard = None;
-                return Err(crate::error::CoreError::External(format!(
-                    "mock failure injected for {method}"
-                )));
+            if guard.as_ref().is_some_and(|(m, _)| m == method) {
+                return Err(guard.take().expect("checked above").1);
             }
             Ok(())
         }
@@ -328,17 +439,54 @@ pub mod mock {
             Ok(vec![])
         }
 
+        async fn write_compose_environment(
+            &self,
+            _params: WriteComposeEnvironmentParams,
+        ) -> CoreResult<()> {
+            self.record("write_compose_environment")
+        }
+
         async fn deploy_compose_project(
             &self,
             params: DeployComposeProjectParams,
-        ) -> CoreResult<Vec<ComposeServiceInfo>> {
+        ) -> CoreResult<ComposeDeployOutcome> {
             self.record("deploy_compose_project")?;
-            Ok(vec![ComposeServiceInfo {
-                name: params.project_slug,
-                image: "mock-image".into(),
-                state: "running".into(),
-                ports: vec![],
-            }])
+            Ok(ComposeDeployOutcome {
+                services: vec![ComposeServiceInfo {
+                    name: params.project_slug,
+                    container: String::new(),
+                    image: "mock-image".into(),
+                    state: "running".into(),
+                    status: String::new(),
+                    health: String::new(),
+                    exit_code: 0,
+                    ports: vec![],
+                }],
+                commit_sha: None,
+                warnings: vec![],
+            })
+        }
+
+        async fn generate_deploy_key(
+            &self,
+            params: ComposeProjectActionParams,
+        ) -> CoreResult<String> {
+            self.record("generate_deploy_key")?;
+            Ok(format!(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey scontrol-{}",
+                params.project_slug
+            ))
+        }
+
+        async fn remove_deploy_key(&self, _params: ComposeProjectActionParams) -> CoreResult<()> {
+            self.record("remove_deploy_key")
+        }
+
+        async fn write_git_credentials(
+            &self,
+            _params: WriteGitCredentialsParams,
+        ) -> CoreResult<()> {
+            self.record("write_git_credentials")
         }
 
         async fn stop_compose_project(
@@ -369,6 +517,41 @@ pub mod mock {
         ) -> CoreResult<String> {
             self.record("compose_project_logs")?;
             Ok("mock deployment log".into())
+        }
+
+        async fn follow_compose_logs(
+            &self,
+            params: FollowComposeLogsParams,
+        ) -> CoreResult<LogLines> {
+            self.record("follow_compose_logs")?;
+            let (tx, rx) = tokio::sync::mpsc::channel(LOG_LINES_CAPACITY);
+            let needle = params.search.map(|s| s.to_lowercase());
+            for line in ["web-1  | listening on :80", "web-1  | GET / 200"] {
+                if needle
+                    .as_ref()
+                    .is_none_or(|n| line.to_lowercase().contains(n))
+                {
+                    tx.try_send(Ok(line.to_string())).ok();
+                }
+            }
+            Ok(rx)
+        }
+
+        async fn read_deployment_log(
+            &self,
+            params: DeploymentLogParams,
+        ) -> CoreResult<DeploymentLogChunk> {
+            self.record("read_deployment_log")?;
+            Ok(DeploymentLogChunk {
+                content: String::new(),
+                next_offset: params.offset,
+                eof: true,
+            })
+        }
+
+        async fn cancel_deployment(&self, _params: CancelDeploymentParams) -> CoreResult<bool> {
+            self.record("cancel_deployment")?;
+            Ok(true)
         }
 
         async fn create_mailbox(&self, params: CreateMailboxParams) -> CoreResult<MailboxInfo> {

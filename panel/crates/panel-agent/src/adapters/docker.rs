@@ -28,17 +28,37 @@ pub async fn create_container(
         args.push("-p".into());
         args.push(format!("{host_port}:{container_port}"));
     }
+    // Values go through a 0600 `--env-file`, never `-e KEY=VALUE` on argv
+    // where `ps` shows them to every local user.
+    let mut env_body = String::new();
     for (k, v) in env {
         if !is_valid_identifier(k) {
             return Err(CoreError::Validation(format!("invalid env var name: {k}")));
         }
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
+        if v.contains(['\0', '\n', '\r']) {
+            return Err(CoreError::Validation(format!(
+                "env var {k} must be a single line"
+            )));
+        }
+        env_body.push_str(&format!("{k}={v}\n"));
+    }
+    let env_file = if env.is_empty() {
+        None
+    } else {
+        Some(PrivateTempFile::create(&env_body).await?)
+    };
+    if let Some(file) = &env_file {
+        args.push("--env-file".into());
+        args.push(file.path.to_string_lossy().into_owned());
     }
     args.push(image.into());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let id = run("docker", &arg_refs).await?.trim().to_string();
+    let result = run("docker", &arg_refs).await;
+    if let Some(file) = env_file {
+        file.remove().await;
+    }
+    let id = result?.trim().to_string();
 
     Ok(ContainerInfo {
         id,
@@ -47,6 +67,37 @@ pub async fn create_container(
         status: "running".into(),
         ports: ports.iter().map(|(h, c)| format!("{h}->{c}")).collect(),
     })
+}
+
+/// A 0600 file in the agent's temp directory, removed after use.
+struct PrivateTempFile {
+    path: std::path::PathBuf,
+}
+
+impl PrivateTempFile {
+    async fn create(body: &str) -> CoreResult<Self> {
+        let path = std::env::temp_dir().join(format!("scontrol-env-{}", uuid::Uuid::new_v4()));
+        let mut options = tokio::fs::OpenOptions::new();
+        // `create_new` refuses a pre-planted file or symlink at the path.
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .await
+            .map_err(|e| CoreError::Io(format!("creating env file: {e}")))?;
+        let written = tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes()).await;
+        let file = Self { path };
+        if let Err(e) = written {
+            file.remove().await;
+            return Err(CoreError::Io(format!("writing env file: {e}")));
+        }
+        Ok(file)
+    }
+
+    async fn remove(self) {
+        tokio::fs::remove_file(&self.path).await.ok();
+    }
 }
 
 pub async fn start_container(name: &str) -> CoreResult<()> {

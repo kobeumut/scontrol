@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE compose_deployments\n           SET status = 'failed', finished_at = now(),\n               error_message = 'interrupted: panel-api restarted during the deployment'\n           WHERE status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "5ee40a552505513973cd4e6ba0cb709bde9312f0f46d217029c7c1a05bd8c651"
+}

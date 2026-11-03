@@ -239,6 +239,7 @@ pub enum DeploymentStatus {
     Succeeded,
     Failed,
     Stopped,
+    Cancelled,
 }
 
 impl fmt::Display for DeploymentStatus {
@@ -249,6 +250,7 @@ impl fmt::Display for DeploymentStatus {
             DeploymentStatus::Succeeded => "succeeded",
             DeploymentStatus::Failed => "failed",
             DeploymentStatus::Stopped => "stopped",
+            DeploymentStatus::Cancelled => "cancelled",
         };
         write!(f, "{value}")
     }
@@ -263,6 +265,7 @@ impl std::str::FromStr for DeploymentStatus {
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
             "stopped" => Ok(Self::Stopped),
+            "cancelled" => Ok(Self::Cancelled),
             other => Err(format!("unknown deployment status: {other}")),
         }
     }
@@ -285,9 +288,23 @@ pub struct ComposeProject {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ComposeServiceInfo {
+    /// Compose service name.
     pub name: String,
+    /// Container name (`<project>-<service>-<n>`).
+    #[serde(default)]
+    pub container: String,
     pub image: String,
+    /// `running`, `exited`, `restarting`, ...
     pub state: String,
+    /// Human status, e.g. `Up 5 minutes (healthy)`.
+    #[serde(default)]
+    pub status: String,
+    /// `healthy`, `unhealthy`, `starting`, or empty without a health check.
+    #[serde(default)]
+    pub health: String,
+    #[serde(default)]
+    pub exit_code: i32,
+    /// `127.0.0.1:40000->80/tcp`, or `80/tcp` when not published.
     pub ports: Vec<String>,
 }
 
@@ -297,9 +314,60 @@ pub struct DeploymentInfo {
     pub project_id: Uuid,
     pub status: DeploymentStatus,
     pub log_path: String,
-    pub started_at: DateTime<Utc>,
+    /// What queued it: `manual`, `api`, `mcp` (later: `webhook`).
+    pub trigger: String,
+    /// Git commit the deployment built from; `None` for raw Compose.
+    pub commit_sha: Option<String>,
+    pub queued_at: DateTime<Utc>,
+    /// `None` while the job is still queued.
+    pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
+}
+
+/// What the agent reports after a successful Compose deployment.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ComposeDeployOutcome {
+    pub services: Vec<ComposeServiceInfo>,
+    pub commit_sha: Option<String>,
+    /// Non-fatal problems, e.g. a certificate that could not be issued yet.
+    pub warnings: Vec<String>,
+}
+
+/// An explicit binding from a public domain to one Compose service port.
+/// The agent publishes the container port on `127.0.0.1:<host_port>` only and
+/// generates an Nginx reverse-proxy vhost for the domain; nothing is exposed
+/// on a public interface by the binding itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ComposeDomainBinding {
+    pub domain: String,
+    pub service_name: String,
+    pub container_port: u16,
+    pub host_port: u16,
+    pub https: bool,
+}
+
+/// Persisted form of [`ComposeDomainBinding`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ComposeDomain {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub domain: String,
+    pub service_name: String,
+    pub container_port: u16,
+    pub host_port: u16,
+    pub https: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A slice of a deployment log, read incrementally by byte offset.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeploymentLogChunk {
+    pub content: String,
+    pub next_offset: u64,
+    /// True when `next_offset` reached the current end of the file. A running
+    /// deployment can still append, so clients also check deployment status.
+    pub eof: bool,
 }
 
 /// A Docker-managed container remains available as a low-level compatibility
@@ -349,6 +417,8 @@ pub mod validate {
         Lazy::new(|| Regex::new(r"^[a-z][a-z0-9-]{2,47}$").unwrap());
     static ENV_KEY_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$").unwrap());
+    static SERVICE_NAME_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$").unwrap());
     static GIT_BRANCH_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$").unwrap());
 
@@ -385,6 +455,11 @@ pub mod validate {
             && (path.ends_with(".yml") || path.ends_with(".yaml"))
     }
 
+    /// Compose service names as accepted by Docker Compose.
+    pub fn is_valid_service_name(name: &str) -> bool {
+        SERVICE_NAME_RE.is_match(name)
+    }
+
     pub fn is_valid_env_key(key: &str) -> bool {
         ENV_KEY_RE.is_match(key)
     }
@@ -395,13 +470,75 @@ pub mod validate {
 
     /// Permit HTTPS and SSH GitHub/GitLab/Gitea-style remote URLs, but not
     /// local paths, URL credentials, whitespace, or shell metacharacters.
+    /// SSH remotes may name a login user (`ssh://git@host/org/repo.git` or
+    /// `git@host:org/repo.git`); HTTPS remotes may not, because a user part
+    /// there is how credentials leak into URLs.
     pub fn is_valid_git_url(url: &str) -> bool {
-        url.len() <= 512
-            && !url.chars().any(char::is_whitespace)
-            && !url.contains('@')
-            && (url.starts_with("https://") || url.starts_with("ssh://"))
-            && !url.contains("..")
+        url.len() <= 512 && !url.contains("..") && git_remote(url).is_some()
     }
+
+    /// How the agent authenticates to a Git remote.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GitTransport {
+        Https,
+        Ssh,
+    }
+
+    /// Transport and lower-cased host of a valid Git remote URL.
+    pub fn git_remote(url: &str) -> Option<(GitTransport, String)> {
+        if url.len() > 512 || url.contains("..") {
+            return None;
+        }
+        let (transport, captures) = match GIT_HTTPS_RE.captures(url) {
+            Some(c) => (GitTransport::Https, c),
+            None => (
+                GitTransport::Ssh,
+                GIT_SSH_RE
+                    .captures(url)
+                    .or_else(|| GIT_SCP_RE.captures(url))?,
+            ),
+        };
+        let host = captures.name("host")?.as_str();
+        is_valid_git_host(host).then(|| (transport, host.to_ascii_lowercase()))
+    }
+
+    // A host is a DNS name (dots optional, so `localhost`-style LAN names
+    // work); it never starts with `-`, so ssh cannot read it as an option.
+    static GIT_HTTPS_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^https://(?P<host>[A-Za-z0-9.-]+)(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~%+-]+)+/?$")
+            .unwrap()
+    });
+    static GIT_SSH_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"^ssh://(?:[A-Za-z0-9][A-Za-z0-9._-]{0,31}@)?(?P<host>[A-Za-z0-9.-]+)(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~%+-]+)+/?$",
+        )
+        .unwrap()
+    });
+    static GIT_SCP_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}@(?P<host>[A-Za-z0-9.-]+):[A-Za-z0-9._~+][A-Za-z0-9._~%+/-]*$",
+        )
+        .unwrap()
+    });
+
+    /// A Git remote host name as accepted in remote URLs.
+    pub fn is_valid_git_host(host: &str) -> bool {
+        host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+            })
+    }
+
+    /// A Git HTTPS username (`x-access-token`, `oauth2`, a login name).
+    pub fn is_valid_git_username(username: &str) -> bool {
+        GIT_USERNAME_RE.is_match(username)
+    }
+
+    static GIT_USERNAME_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$").unwrap());
 
     #[cfg(test)]
     mod tests {
@@ -430,6 +567,63 @@ pub mod validate {
             assert!(!is_valid_identifier("my db"));
             assert!(!is_valid_identifier("db'; DROP TABLE users; --"));
             assert!(!is_valid_identifier("1leading_digit"));
+        }
+
+        #[test]
+        fn git_urls_allow_ssh_users_but_not_https_credentials() {
+            for (url, transport, host) in [
+                (
+                    "https://github.com/org/repo.git",
+                    GitTransport::Https,
+                    "github.com",
+                ),
+                (
+                    "https://Git.Example.com:8443/a/b",
+                    GitTransport::Https,
+                    "git.example.com",
+                ),
+                (
+                    "ssh://git@github.com/org/repo.git",
+                    GitTransport::Ssh,
+                    "github.com",
+                ),
+                (
+                    "ssh://gitea.lan:2222/org/repo",
+                    GitTransport::Ssh,
+                    "gitea.lan",
+                ),
+                (
+                    "git@gitlab.com:group/sub/repo.git",
+                    GitTransport::Ssh,
+                    "gitlab.com",
+                ),
+            ] {
+                assert_eq!(
+                    git_remote(url),
+                    Some((transport, host.to_string())),
+                    "{url}"
+                );
+                assert!(is_valid_git_url(url), "{url}");
+            }
+            for url in [
+                "https://user:token@github.com/org/repo.git",
+                "https://token@github.com/org/repo.git",
+                "http://github.com/org/repo.git",
+                "file:///etc/passwd",
+                "/srv/repo.git",
+                "ext::sh -c touch% /tmp/pwned",
+                "ssh://-oProxyCommand=touch/x/y",
+                "git@-oProxyCommand=x:repo",
+                "-u@host:repo",
+                "git@host:-repo",
+                "git@host:../repo",
+                "https://github.com/org/repo.git?x=1",
+                "https://github.com/org/repo .git",
+                "https://github.com",
+                "git@a@host:repo",
+            ] {
+                assert!(!is_valid_git_url(url), "{url}");
+            }
         }
 
         #[test]

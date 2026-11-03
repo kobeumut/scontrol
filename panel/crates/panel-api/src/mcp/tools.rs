@@ -60,6 +60,16 @@ pub fn list_tool_defs() -> Vec<ToolDef> {
             input_schema: schema_for::<ComposeProjectLogsInput>(),
         },
         ToolDef {
+            name: "deploy_compose_project",
+            description: "Queue a deployment of a Compose project with its current source, environment and domains. Returns the queued deployment; follow it with compose_deployment_log.",
+            input_schema: schema_for::<DeployComposeProjectInput>(),
+        },
+        ToolDef {
+            name: "compose_deployment_log",
+            description: "Read a deployment's log incrementally from a byte offset, plus the deployment status.",
+            input_schema: schema_for::<ComposeDeploymentLogInput>(),
+        },
+        ToolDef {
             name: "agent_capabilities",
             description:
                 "Report which optional features (docker, mail, antivirus) the agent has enabled.",
@@ -115,6 +125,21 @@ struct ComposeProjectIdInput {
 struct ComposeProjectLogsInput {
     project_id: Uuid,
     tail_lines: Option<u16>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DeployComposeProjectInput {
+    project_id: Uuid,
+    /// Pull newer images for services that use `image:`.
+    pull_images: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ComposeDeploymentLogInput {
+    project_id: Uuid,
+    deployment_id: Uuid,
+    /// Byte offset returned as `next_offset` by the previous call.
+    offset: Option<u64>,
 }
 
 /// Dispatches a tool call. `actor_user_id` is the panel user the MCP session
@@ -277,6 +302,66 @@ pub async fn call_tool(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(json!({ "logs": logs }))
+        }
+        "deploy_compose_project" => {
+            if !is_admin {
+                return Err("only admins may deploy Docker projects via MCP".into());
+            }
+            let input: DeployComposeProjectInput =
+                serde_json::from_value(arguments).map_err(|e| e.to_string())?;
+            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Compose project not found")?;
+            let deployment = state
+                .deploy_queue
+                .enqueue(
+                    &state.db,
+                    project.id,
+                    &project.slug,
+                    input.pull_images.unwrap_or(false),
+                    "mcp",
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            db::audit::record(
+                &state.db,
+                Some(actor_user_id),
+                "mcp",
+                "deploy_compose_project",
+                Some(&project.slug),
+                json!({ "project_id": project.id, "deployment_id": deployment.id }),
+            )
+            .await
+            .ok();
+            Ok(json!({ "deployment": deployment }))
+        }
+        "compose_deployment_log" => {
+            if !is_admin {
+                return Err("only admins may inspect Docker deployments via MCP".into());
+            }
+            let input: ComposeDeploymentLogInput =
+                serde_json::from_value(arguments).map_err(|e| e.to_string())?;
+            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Compose project not found")?;
+            let deployment =
+                db::compose_projects::find_deployment(&state.db, project.id, input.deployment_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("deployment not found")?;
+            let chunk = state
+                .agent
+                .read_deployment_log(panel_core::adapters::DeploymentLogParams {
+                    project_slug: project.slug,
+                    deployment_id: deployment.id,
+                    offset: input.offset.unwrap_or(0),
+                    max_bytes: 64 * 1024,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "status": deployment.status, "log": chunk }))
         }
         "agent_capabilities" => {
             let caps = state

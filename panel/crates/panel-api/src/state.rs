@@ -1,5 +1,9 @@
 use crate::auth::session::CookieCipher;
 use crate::config::ApiConfig;
+use crate::services::deploy_queue::DeployQueue;
+use crate::services::notifications::Notifier;
+use crate::services::secret_box::SecretBox;
+use crate::services::webhook::WebhookKey;
 use panel_core::adapters::AdapterPort;
 use panel_core::agent_client::AgentClient;
 use sqlx::PgPool;
@@ -11,6 +15,9 @@ pub struct AppState {
     pub agent: Arc<dyn AdapterPort>,
     pub cookie_cipher: CookieCipher,
     pub session_ttl_hours: i64,
+    pub deploy_queue: DeployQueue,
+    pub webhook_key: WebhookKey,
+    pub notifier: Notifier,
 }
 
 impl AppState {
@@ -20,6 +27,9 @@ impl AppState {
             agent: Arc::new(AgentClient::new(config.agent_socket_path.clone())),
             cookie_cipher: CookieCipher::new(&config.cookie_key),
             session_ttl_hours: config.session_ttl_hours,
+            deploy_queue: DeployQueue::new(),
+            webhook_key: WebhookKey::derive(&config.cookie_key),
+            notifier: Notifier::new(SecretBox::derive(&config.secret_key)),
         }
     }
 }

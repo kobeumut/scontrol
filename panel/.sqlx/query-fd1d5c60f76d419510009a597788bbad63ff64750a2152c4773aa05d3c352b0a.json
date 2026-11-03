@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE compose_projects SET status = 'cancelled', updated_at = now()\n               WHERE id = $1 AND status = 'queued' AND NOT EXISTS (\n                   SELECT 1 FROM compose_deployments WHERE project_id = $1 AND status = 'queued'\n               )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fd1d5c60f76d419510009a597788bbad63ff64750a2152c4773aa05d3c352b0a"
+}

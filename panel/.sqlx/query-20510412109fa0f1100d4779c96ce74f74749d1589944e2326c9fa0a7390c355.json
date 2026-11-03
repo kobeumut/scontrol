@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO compose_deployments (id, project_id, status, log_path)\n           VALUES ($1, $2, 'running', $3)\n           RETURNING id, project_id, status, log_path, started_at, finished_at, error_message",
+  "query": "SELECT id, project_id, status, log_path, trigger, commit_sha, queued_at, started_at,\n                  finished_at, error_message\n           FROM compose_deployments WHERE project_id = $1\n           ORDER BY queued_at DESC LIMIT 100",
   "describe": {
     "columns": [
       {
@@ -25,25 +25,38 @@
       },
       {
         "ordinal": 4,
+        "name": "trigger",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "commit_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "queued_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
         "name": "started_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 5,
+        "ordinal": 8,
         "name": "finished_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 9,
         "name": "error_message",
         "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -53,8 +66,11 @@
       false,
       false,
       true,
+      false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "df0f88c91f4fe1dc963ee3d74e211eff76cd8a87b1d6ff5e9a0e28f4b8ce0033"
+  "hash": "20510412109fa0f1100d4779c96ce74f74749d1589944e2326c9fa0a7390c355"
 }

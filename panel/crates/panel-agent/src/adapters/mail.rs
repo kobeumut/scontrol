@@ -1,10 +1,10 @@
 //! Mailbox management for the optional Postfix + Dovecot virtual mail stack
 //! (only compiled in when the `mail` cargo feature is enabled).
 //!
-//! Mailboxes are stored as Dovecot virtual users; `doveadm pw` hashes
-//! passwords (never shelled out with the raw password in a format! string —
-//! it is passed as a `Command` argument) and the resulting map is rebuilt
-//! with `postmap`.
+//! Mailboxes are stored as Dovecot virtual users. Passwords are hashed
+//! in-process as SHA512-CRYPT, so the plaintext never appears on a command
+//! line (`doveadm pw -p` would put it where `ps` can read it), and the
+//! resulting map is rebuilt with `postmap`.
 
 use super::exec::run;
 use panel_core::error::{CoreError, CoreResult};
@@ -38,12 +38,7 @@ pub async fn create_mailbox(
 ) -> CoreResult<MailboxInfo> {
     let (user, domain) = split_address(address)?;
 
-    // Hash the password out-of-band via doveadm; the plaintext password
-    // never appears in a shell string, only as a discrete Command argument.
-    let hashed = run("doveadm", &["pw", "-s", "SHA512-CRYPT", "-p", password])
-        .await?
-        .trim()
-        .to_string();
+    let hashed = hash_password(password)?;
 
     append_line(
         VIRTUAL_USERS_PATH,
@@ -64,6 +59,21 @@ pub async fn create_mailbox(
         domain,
         quota_mb,
     })
+}
+
+/// Dovecot `{SHA512-CRYPT}$6$...` hash with a random salt, the same format
+/// `doveadm pw -s SHA512-CRYPT` prints.
+fn hash_password(password: &str) -> CoreResult<String> {
+    if password.is_empty() || password.len() > 1024 || password.contains(['\0', '\n', '\r']) {
+        return Err(CoreError::Validation(
+            "mailbox password must be 1..=1024 characters on one line".into(),
+        ));
+    }
+    let params = sha_crypt::Sha512Params::new(sha_crypt::ROUNDS_DEFAULT)
+        .map_err(|e| CoreError::External(format!("SHA512-CRYPT parameters: {e:?}")))?;
+    let hash = sha_crypt::sha512_simple(password, &params)
+        .map_err(|e| CoreError::External(format!("hashing mailbox password: {e:?}")))?;
+    Ok(format!("{{SHA512-CRYPT}}{hash}"))
 }
 
 pub async fn delete_mailbox(address: &str) -> CoreResult<()> {
@@ -101,4 +111,28 @@ async fn remove_matching_lines(path: &str, needle: &str) -> CoreResult<()> {
         .await
         .map_err(|e| CoreError::Io(format!("writing {path}: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passwords_hash_in_process_to_dovecot_sha512_crypt() {
+        let hashed = hash_password("correct horse:battery").unwrap();
+        let crypt = hashed.strip_prefix("{SHA512-CRYPT}$6$").unwrap();
+        assert!(!hashed.contains("correct horse"));
+        // The users file is colon-separated; a hash must never add a field.
+        assert!(!crypt.contains(':'));
+        sha_crypt::sha512_check("correct horse:battery", &hashed["{SHA512-CRYPT}".len()..])
+            .unwrap();
+        assert_ne!(
+            hashed,
+            hash_password("correct horse:battery").unwrap(),
+            "salt must be random"
+        );
+        for bad in ["", "two\nlines", "nul\0byte"] {
+            assert!(matches!(hash_password(bad), Err(CoreError::Validation(_))));
+        }
+    }
 }

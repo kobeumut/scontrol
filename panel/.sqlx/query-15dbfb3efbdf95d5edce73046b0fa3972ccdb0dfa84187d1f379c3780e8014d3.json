@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE compose_projects p\n           SET status = CASE WHEN EXISTS (\n                   SELECT 1 FROM compose_deployments d WHERE d.project_id = p.id AND d.status = 'queued'\n               ) THEN 'queued' ELSE 'failed' END,\n               updated_at = now()\n           WHERE p.status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "15dbfb3efbdf95d5edce73046b0fa3972ccdb0dfa84187d1f379c3780e8014d3"
+}

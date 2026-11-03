@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, project_id, status, log_path, started_at, finished_at, error_message FROM compose_deployments WHERE project_id = $1 ORDER BY started_at DESC",
+  "query": "SELECT id, project_id, domain, service_name, container_port, host_port, https, created_at\n           FROM compose_project_domains WHERE project_id = $1 ORDER BY created_at",
   "describe": {
     "columns": [
       {
@@ -15,28 +15,33 @@
       },
       {
         "ordinal": 2,
-        "name": "status",
+        "name": "domain",
         "type_info": "Text"
       },
       {
         "ordinal": 3,
-        "name": "log_path",
+        "name": "service_name",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
-        "name": "started_at",
-        "type_info": "Timestamptz"
+        "name": "container_port",
+        "type_info": "Int4"
       },
       {
         "ordinal": 5,
-        "name": "finished_at",
-        "type_info": "Timestamptz"
+        "name": "host_port",
+        "type_info": "Int4"
       },
       {
         "ordinal": 6,
-        "name": "error_message",
-        "type_info": "Text"
+        "name": "https",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -50,9 +55,10 @@
       false,
       false,
       false,
-      true,
-      true
+      false,
+      false,
+      false
     ]
   },
-  "hash": "a068b428b2e3836a7241696738835186f332031a92bcc933b57f2037ef024eee"
+  "hash": "99e1c71ae8e7544b704ab3dc1c7fee01a0f07cde4648ccd158b965d8b673415a"
 }

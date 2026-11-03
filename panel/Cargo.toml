@@ -32,11 +32,11 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 config = "0.13"
 dotenvy = "0.15"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.3"
-lettre = "0.11"
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1", "tokio1-rustls", "rustls", "ring", "webpki-roots"] }
 rustls = "0.21"
 tokio-rustls = "0.24"
 webpki-roots = "0.22"

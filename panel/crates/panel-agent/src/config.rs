@@ -35,6 +35,32 @@ pub struct AgentConfig {
     #[serde(default = "default_docker_projects_root")]
     pub docker_projects_root: PathBuf,
 
+    /// Webroot served for `/.well-known/acme-challenge/` on every
+    /// panel-generated Compose domain vhost (certbot `--webroot`).
+    #[allow(dead_code)]
+    #[serde(default = "default_acme_webroot")]
+    pub acme_webroot: PathBuf,
+
+    /// Where certbot stores live certificates (`<dir>/<domain>/fullchain.pem`).
+    #[allow(dead_code)]
+    #[serde(default = "default_letsencrypt_live_dir")]
+    pub letsencrypt_live_dir: PathBuf,
+
+    /// Upper bound for one Compose build/deploy (`docker compose up`).
+    #[allow(dead_code)]
+    #[serde(default = "default_deploy_timeout_secs")]
+    pub deploy_timeout_secs: u64,
+
+    /// Per-deployment log cap; output beyond it is dropped with a marker.
+    #[allow(dead_code)]
+    #[serde(default = "default_deployment_log_max_bytes")]
+    pub deployment_log_max_bytes: u64,
+
+    /// Deployment log files kept per project; older ones are pruned.
+    #[allow(dead_code)]
+    #[serde(default = "default_deployment_logs_retained")]
+    pub deployment_logs_retained: usize,
+
     #[serde(default)]
     pub runtime_features: RuntimeFeatures,
 }
@@ -77,6 +103,26 @@ fn default_docker_projects_root() -> PathBuf {
     PathBuf::from("/var/lib/scontrol/docker")
 }
 
+fn default_acme_webroot() -> PathBuf {
+    PathBuf::from("/var/lib/scontrol/acme")
+}
+
+fn default_letsencrypt_live_dir() -> PathBuf {
+    PathBuf::from("/etc/letsencrypt/live")
+}
+
+fn default_deploy_timeout_secs() -> u64 {
+    30 * 60
+}
+
+fn default_deployment_log_max_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
+fn default_deployment_logs_retained() -> usize {
+    20
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -86,6 +132,11 @@ impl Default for AgentConfig {
             nginx_sites_enabled: default_nginx_enabled(),
             systemd_unit_dir: default_systemd_dir(),
             docker_projects_root: default_docker_projects_root(),
+            acme_webroot: default_acme_webroot(),
+            letsencrypt_live_dir: default_letsencrypt_live_dir(),
+            deploy_timeout_secs: default_deploy_timeout_secs(),
+            deployment_log_max_bytes: default_deployment_log_max_bytes(),
+            deployment_logs_retained: default_deployment_logs_retained(),
             runtime_features: RuntimeFeatures {
                 docker: true,
                 mail: true,
