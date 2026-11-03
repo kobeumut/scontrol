@@ -35,6 +35,12 @@ pub struct AgentConfig {
     #[serde(default = "default_docker_projects_root")]
     pub docker_projects_root: PathBuf,
 
+    /// Where Docker keeps named volumes (`<root>/<project>_<volume>/_data`).
+    /// Read by volume backups.
+    #[allow(dead_code)]
+    #[serde(default = "default_docker_volumes_root")]
+    pub docker_volumes_root: PathBuf,
+
     /// Webroot served for `/.well-known/acme-challenge/` on every
     /// panel-generated Compose domain vhost (certbot `--webroot`).
     #[allow(dead_code)]
@@ -135,6 +141,10 @@ fn default_docker_projects_root() -> PathBuf {
     PathBuf::from("/var/lib/scontrol/docker")
 }
 
+fn default_docker_volumes_root() -> PathBuf {
+    PathBuf::from("/var/lib/docker/volumes")
+}
+
 fn default_acme_webroot() -> PathBuf {
     PathBuf::from("/var/lib/scontrol/acme")
 }
@@ -176,6 +186,7 @@ impl Default for AgentConfig {
             nginx_sites_enabled: default_nginx_enabled(),
             systemd_unit_dir: default_systemd_dir(),
             docker_projects_root: default_docker_projects_root(),
+            docker_volumes_root: default_docker_volumes_root(),
             acme_webroot: default_acme_webroot(),
             letsencrypt_live_dir: default_letsencrypt_live_dir(),
             deploy_timeout_secs: default_deploy_timeout_secs(),

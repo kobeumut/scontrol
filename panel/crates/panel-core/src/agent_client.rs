@@ -261,4 +261,28 @@ impl AdapterPort for AgentClient {
     async fn scan_path(&self, params: ScanPathParams) -> CoreResult<ScanResult> {
         self.call(AgentRequest::ScanPath(params)).await
     }
+
+    async fn test_s3_target(&self, params: TestS3Params) -> CoreResult<()> {
+        self.call(AgentRequest::TestS3Target(params)).await
+    }
+
+    async fn list_backups(&self, params: ListBackupsParams) -> CoreResult<Vec<BackupObject>> {
+        self.call(AgentRequest::ListBackups(params)).await
+    }
+
+    async fn backup_database(&self, params: BackupDatabaseParams) -> CoreResult<BackupOutcome> {
+        self.call(AgentRequest::BackupDatabase(params)).await
+    }
+
+    async fn restore_database(&self, params: RestoreDatabaseParams) -> CoreResult<()> {
+        self.call(AgentRequest::RestoreDatabase(params)).await
+    }
+
+    async fn backup_volume(&self, params: BackupVolumeParams) -> CoreResult<BackupOutcome> {
+        self.call(AgentRequest::BackupVolume(params)).await
+    }
+
+    async fn restore_volume(&self, params: RestoreVolumeParams) -> CoreResult<()> {
+        self.call(AgentRequest::RestoreVolume(params)).await
+    }
 }

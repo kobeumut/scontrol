@@ -270,6 +270,30 @@ pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Core
     Ok(())
 }
 
+/// `docker compose stop|start <service>` for one service, used around a
+/// volume backup or restore.
+pub async fn service_action(
+    cfg: &AgentConfig,
+    slug: &str,
+    action: &str,
+    service: &str,
+) -> CoreResult<()> {
+    if !validate::is_valid_service_name(service) || !matches!(action, "stop" | "start") {
+        return Err(CoreError::Validation("invalid service action".into()));
+    }
+    let paths = existing_project_paths(cfg, slug)?;
+    let mut args = compose_args(slug, &paths);
+    args.extend([action.to_string(), service.to_string()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, _, _) = run_allow_nonzero("docker", &refs).await?;
+    if code != 0 {
+        return Err(CoreError::External(format!(
+            "docker compose {action} {service} failed (exit code {code})"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
     if !validate::is_valid_project_slug(&params.project_slug) {
         return Err(CoreError::Validation(format!(
@@ -2394,6 +2418,7 @@ mod tests {
         let tmp = temp_dir("scontrol-static-site");
         let cfg = AgentConfig {
             docker_projects_root: tmp.join("docker"),
+            docker_volumes_root: std::path::PathBuf::from("/nonexistent-volumes"),
             static_sites_root: tmp.join("static"),
             ..Default::default()
         };
@@ -2576,6 +2601,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let cfg = AgentConfig {
             docker_projects_root: base.clone(),
+            docker_volumes_root: std::path::PathBuf::from("/nonexistent-volumes"),
             ..AgentConfig::default()
         };
         write_project_environment(

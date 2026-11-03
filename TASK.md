@@ -136,8 +136,8 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 ### D3: Data
 
 - [ ] Database services (Postgres/MySQL/MariaDB/Mongo/Redis) bound to `127.0.0.1`, with an external port only via an explicit firewall rule.
-- [ ] Streaming S3 backups with credentials in env, retention by count, and restore.
-- [ ] Volume backups (optional stop, then streamed tar).
+- [x] Streaming S3 backups with credentials in env, retention by count, and restore (migration `0011_s3_backups.sql`). `backup_destinations` holds the sealed access/secret key pair; `backup_runs` records each run. The agent (`adapters/s3.rs`: in-process SigV4 + multipart over reqwest; `adapters/backup.rs`) spawns `pg_dump`/`mysqldump`/`mongodump` through `exec::spawn_piped`, gzips stdout in-process and uploads parts of 8 MiB, with no dump file on disk. Passwords go through `PGPASSWORD`/`MYSQL_PWD` or a 0600 config file (MongoDB), never argv, and are not stored. A failed dump deletes its partial object. Retention keeps the newest N per database. Restore streams S3 → gunzip → `psql`/`mysql`/`mongorestore`. API runs are asynchronous (202 + polled run row). UI: `Backups.tsx`. Not done: scheduled (systemd-timer) backups.
+- [x] Volume backups (optional `docker compose stop <service>`, `tar -cf -` of `<docker_volumes_root>/<project>_<volume>/_data` streamed through gzip to S3, service started again even on failure) and restore (`tar -xpf -`).
 - [ ] Scheduled jobs via generated systemd timers, with runs recorded and bounded logs.
 
 ### D4: Observability

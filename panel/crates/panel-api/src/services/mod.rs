@@ -1,3 +1,4 @@
+pub mod backups;
 pub mod deploy_queue;
 pub mod env_layers;
 pub mod github_app;

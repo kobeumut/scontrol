@@ -21,16 +21,22 @@ const ALLOWED_PROGRAMS: &[&str] = &[
     "doveadm",
     "git",
     "kill",
+    "mongodump",
+    "mongorestore",
     "mysql",
+    "mysqldump",
     "nginx",
     "nixpacks",
     "pack",
+    "pg_dump",
     "postmap",
+    "psql",
     "railpack",
     "ssh",
     "ssh-keygen",
     "sudo",
     "systemctl",
+    "tar",
     "ufw",
     "useradd",
     "userdel",
@@ -131,6 +137,38 @@ pub async fn run_with_stdin_env(
         .map_err(|_| CoreError::External(format!("{program} timed out")))?
         .map_err(|e| CoreError::Io(format!("waiting for {program}: {e}")))?;
     checked_stdout(program, output)
+}
+
+/// Starts `program` for a streaming pipeline (backups and restores): the
+/// caller reads `stdout` and/or writes `stdin` itself, and stderr is
+/// captured for diagnostics. `envs` carries credentials, never argv.
+pub fn spawn_piped(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    pipe_stdin: bool,
+) -> CoreResult<tokio::process::Child> {
+    use std::process::Stdio;
+
+    check_program(program)?;
+    tracing::debug!(program, ?args, "exec (piped)");
+    Command::new(program)
+        .args(args)
+        .envs(envs.iter().copied())
+        .stdin(if pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if pipe_stdin {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))
 }
 
 fn checked_stdout(program: &str, output: std::process::Output) -> CoreResult<String> {
@@ -440,11 +478,11 @@ mod tests {
     #[test]
     fn every_spawn_goes_through_exec_with_a_literal_allowed_program() {
         let call = regex::Regex::new(
-            r"\b(run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|follow_lines|exec_replace)\(",
+            r"\b(run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|spawn_piped|follow_lines|exec_replace)\(",
         )
         .unwrap();
         let literal = regex::Regex::new(
-            r#"^\b(?:run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|follow_lines|exec_replace)\(\s*"([^"]+)""#,
+            r#"^\b(?:run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|spawn_piped|follow_lines|exec_replace)\(\s*"([^"]+)""#,
         )
         .unwrap();
         let mut files = Vec::new();

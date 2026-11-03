@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod backups;
 pub mod compose_projects;
 pub mod cron;
 pub mod databases;
