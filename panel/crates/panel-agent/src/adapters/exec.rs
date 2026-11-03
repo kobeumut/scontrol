@@ -31,6 +31,7 @@ const ALLOWED_PROGRAMS: &[&str] = &[
     "ssh-keygen",
     "sudo",
     "systemctl",
+    "systemd-analyze",
     "ufw",
     "useradd",
     "userdel",

@@ -3,6 +3,7 @@ pub mod env_layers;
 pub mod github_app;
 pub mod notifications;
 pub mod registries;
+pub mod scheduled_jobs;
 pub mod secret_box;
 pub mod site_service;
 pub mod webhook;

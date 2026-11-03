@@ -7,6 +7,7 @@ pub mod github_apps;
 pub mod notifications;
 pub mod projects;
 pub mod registries;
+pub mod scheduled_jobs;
 pub mod sites;
 pub mod users;
 

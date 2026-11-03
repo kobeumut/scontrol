@@ -3,6 +3,7 @@ use crate::config::ApiConfig;
 use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
 use crate::services::notifications::Notifier;
+use crate::services::scheduled_jobs::JobRunCollector;
 use crate::services::secret_box::SecretBox;
 use crate::services::webhook::WebhookKey;
 use panel_core::adapters::AdapterPort;
@@ -22,6 +23,8 @@ pub struct AppState {
     /// Seals stored secrets (layered environment variables).
     pub secret_box: SecretBox,
     pub github_apps: GitHubApps,
+    /// Copies scheduled-job runs from the agent (see `services::scheduled_jobs`).
+    pub job_runs: JobRunCollector,
 }
 
 impl AppState {
@@ -36,6 +39,7 @@ impl AppState {
             notifier: Notifier::new(SecretBox::derive(&config.secret_key)),
             secret_box: SecretBox::derive(&config.secret_key),
             github_apps: GitHubApps::new(SecretBox::derive(&config.secret_key)),
+            job_runs: JobRunCollector::new(),
         }
     }
 }

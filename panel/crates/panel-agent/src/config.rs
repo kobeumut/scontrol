@@ -82,6 +82,12 @@ pub struct AgentConfig {
 
     #[serde(default)]
     pub runtime_features: RuntimeFeatures,
+
+    /// The file this configuration was loaded from. Generated scheduled-job
+    /// units pass it back to the agent's helper mode.
+    #[allow(dead_code)]
+    #[serde(skip)]
+    pub config_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +112,9 @@ impl Default for RuntimeFeatures {
         }
     }
 }
+
+/// Where the installer writes `agent.toml`.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/scontrol/agent.toml";
 
 fn default_true() -> bool {
     true
@@ -189,18 +198,24 @@ impl Default for AgentConfig {
                 mail: true,
                 antivirus: true,
             },
+            config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
         }
     }
 }
 
 impl AgentConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let config_path = std::path::absolute(path)?;
         if !path.exists() {
             tracing::warn!(path = %path.display(), "agent config not found, using defaults");
-            return Ok(Self::default());
+            return Ok(Self {
+                config_path,
+                ..Self::default()
+            });
         }
         let raw = std::fs::read_to_string(path)?;
-        let cfg: AgentConfig = toml::from_str(&raw)?;
+        let mut cfg: AgentConfig = toml::from_str(&raw)?;
+        cfg.config_path = config_path;
         Ok(cfg)
     }
 

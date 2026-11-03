@@ -1,34 +1,15 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { RegistrySelect } from './Registries';
 import {
-  api, ApiState, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
+  api, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
   Deployment, Domain, duration, formatTime, GitAccess, gitCheckout, GitHubApp, gitTransport, isActive, isGitHubHttps,
   LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
 } from './api';
+import { ScheduledJobs } from './ScheduledJobs';
+import { ErrorLine, StateView, useAction } from './ui';
 import { LayeredVariables } from './Variables';
 
 type EnvRow = { key: string; value: string };
-
-function StateView({ state }: { state: Pick<ApiState<unknown>, 'loading' | 'error'> }) {
-  if (state.loading) return <p className="state">Loading…</p>;
-  if (state.error) return <p className="state error">{state.error}</p>;
-  return null;
-}
-
-function ErrorLine({ error }: { error?: string }) {
-  return error ? <p className="state error" role="alert">{error}</p> : null;
-}
-
-/** Runs an async action, exposing busy/error state for the button that triggers it. */
-function useAction() {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-  const run = async (action: () => Promise<unknown>) => {
-    setBusy(true); setError(undefined);
-    try { await action(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
-  };
-  return { busy, error, run, fail: setError };
-}
 
 /**
  * Write-only environment editor: values are typed in but never loaded back,
@@ -428,6 +409,7 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <Services projectId={id} refreshKey={latest?.status} />
       {!isStatic && <ContainerLogs projectId={id} />}
       <Domains projectId={id} isStatic={isStatic} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
+      {!isStatic && <ScheduledJobs projectId={id} />}
       <LayeredVariables path={`/compose-projects/${id}/variables`} layer="service" title="Variables"
         hint="Write-only. Merged at each deployment: project → environment → this service, the most specific value wins. Stored values are never shown again." />
       <RegistryPanel projectId={id} />

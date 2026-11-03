@@ -8,6 +8,7 @@
 //! See CLAUDE.md "Shell Command Rule".
 
 use crate::error::CoreResult;
+use crate::schedule::{JobRunInfo, ScheduledJobSpec};
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -264,6 +265,45 @@ pub type LogLines = tokio::sync::mpsc::Receiver<CoreResult<String>>;
 /// the follower instead of growing memory.
 pub const LOG_LINES_CAPACITY: usize = 256;
 
+/// Installs or replaces a job's systemd service and timer
+/// (`scontrol-job-<job_id>.service/.timer`). The agent validates `spec`
+/// again and checks every `OnCalendar=` value with `systemd-analyze`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UpsertScheduledJobParams {
+    pub job_id: Uuid,
+    pub project_slug: String,
+    pub spec: ScheduledJobSpec,
+    /// A disabled job keeps its units but its timer is stopped; "run now"
+    /// still works.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ScheduledJobRef {
+    pub project_slug: String,
+    pub job_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ListScheduledJobRunsParams {
+    /// Jobs to report on; runs of other jobs are never read.
+    pub jobs: Vec<ScheduledJobRef>,
+    /// Only runs whose record changed after this instant; all retained
+    /// runs when `None`.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ScheduledJobRunLogParams {
+    pub project_slug: String,
+    pub job_id: Uuid,
+    pub run_id: Uuid,
+    pub offset: u64,
+    /// Bounded by the agent to 1..=256 KiB.
+    pub max_bytes: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CreateContainerParams {
     pub name: String,
@@ -374,6 +414,21 @@ pub trait AdapterPort: Send + Sync {
     /// agent is not running that deployment (finished, or not started yet).
     async fn cancel_deployment(&self, params: CancelDeploymentParams) -> CoreResult<bool>;
 
+    // Scheduled jobs (Docker): systemd timers running `docker compose exec`.
+    async fn upsert_scheduled_job(&self, params: UpsertScheduledJobParams) -> CoreResult<()>;
+    /// Stops and removes a job's units and run logs. Idempotent.
+    async fn remove_scheduled_job(&self, params: ScheduledJobRef) -> CoreResult<()>;
+    /// Starts a run now. `AlreadyExists` while a run of the job is active.
+    async fn run_scheduled_job(&self, params: ScheduledJobRef) -> CoreResult<()>;
+    async fn list_scheduled_job_runs(
+        &self,
+        params: ListScheduledJobRunsParams,
+    ) -> CoreResult<Vec<JobRunInfo>>;
+    async fn read_scheduled_job_run_log(
+        &self,
+        params: ScheduledJobRunLogParams,
+    ) -> CoreResult<DeploymentLogChunk>;
+
     // Optional: Mail
     async fn create_mailbox(&self, params: CreateMailboxParams) -> CoreResult<MailboxInfo>;
     async fn delete_mailbox(&self, params: DeleteMailboxParams) -> CoreResult<()>;
@@ -399,6 +454,11 @@ pub mod mock {
         /// Every deployment request received, for tests that inspect what
         /// panel-api sent the agent.
         pub deploys: Mutex<Vec<DeployComposeProjectParams>>,
+        /// Every scheduled-job install request received.
+        pub job_upserts: Mutex<Vec<UpsertScheduledJobParams>>,
+        /// Runs `list_scheduled_job_runs` reports (filtered by job and
+        /// `since`), so tests can simulate timer runs.
+        pub job_runs: Mutex<Vec<JobRunInfo>>,
     }
 
     impl MockAdapter {
@@ -640,6 +700,53 @@ pub mod mock {
         async fn cancel_deployment(&self, _params: CancelDeploymentParams) -> CoreResult<bool> {
             self.record("cancel_deployment")?;
             Ok(true)
+        }
+
+        async fn upsert_scheduled_job(&self, params: UpsertScheduledJobParams) -> CoreResult<()> {
+            self.record("upsert_scheduled_job")?;
+            self.job_upserts.lock().unwrap().push(params);
+            Ok(())
+        }
+
+        async fn remove_scheduled_job(&self, _params: ScheduledJobRef) -> CoreResult<()> {
+            self.record("remove_scheduled_job")
+        }
+
+        async fn run_scheduled_job(&self, _params: ScheduledJobRef) -> CoreResult<()> {
+            self.record("run_scheduled_job")
+        }
+
+        async fn list_scheduled_job_runs(
+            &self,
+            params: ListScheduledJobRunsParams,
+        ) -> CoreResult<Vec<JobRunInfo>> {
+            self.record("list_scheduled_job_runs")?;
+            Ok(self
+                .job_runs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|run| params.jobs.iter().any(|job| job.job_id == run.job_id))
+                .filter(|run| params.since.is_none_or(|since| run.updated_at > since))
+                .cloned()
+                .collect())
+        }
+
+        async fn read_scheduled_job_run_log(
+            &self,
+            params: ScheduledJobRunLogParams,
+        ) -> CoreResult<DeploymentLogChunk> {
+            self.record("read_scheduled_job_run_log")?;
+            let content = if params.offset == 0 {
+                "mock job output\n"
+            } else {
+                ""
+            };
+            Ok(DeploymentLogChunk {
+                content: content.into(),
+                next_offset: params.offset + content.len() as u64,
+                eof: true,
+            })
         }
 
         async fn create_mailbox(&self, params: CreateMailboxParams) -> CoreResult<MailboxInfo> {

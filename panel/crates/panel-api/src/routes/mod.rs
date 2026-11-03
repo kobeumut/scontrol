@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod notifications;
 pub mod projects;
 pub mod registries;
+pub mod scheduled_jobs;
 pub mod sites;
 pub mod tls;
 pub mod webhooks;
@@ -28,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/cron", cron::router())
         .nest("/api/projects", projects::router())
         .nest("/api/compose-projects", compose_projects::router())
+        .nest("/api/scheduled-jobs", scheduled_jobs::preview_router())
         .nest("/api/notifications", notifications::router())
         .nest("/api/registries", registries::router())
         .nest("/api/github-apps", github_apps::router())

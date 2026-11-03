@@ -6,6 +6,7 @@
 use crate::adapters::*;
 use crate::agent_protocol::{AgentRequest, AgentResponse, StreamFrame};
 use crate::error::{CoreError, CoreResult};
+use crate::schedule::JobRunInfo;
 use crate::types::{
     ComposeDeployOutcome, ComposeServiceInfo, ContainerInfo, DeploymentLogChunk, MailboxInfo,
     ScanResult,
@@ -248,6 +249,33 @@ impl AdapterPort for AgentClient {
 
     async fn cancel_deployment(&self, params: CancelDeploymentParams) -> CoreResult<bool> {
         self.call(AgentRequest::CancelDeployment(params)).await
+    }
+
+    async fn upsert_scheduled_job(&self, params: UpsertScheduledJobParams) -> CoreResult<()> {
+        self.call(AgentRequest::UpsertScheduledJob(params)).await
+    }
+
+    async fn remove_scheduled_job(&self, params: ScheduledJobRef) -> CoreResult<()> {
+        self.call(AgentRequest::RemoveScheduledJob(params)).await
+    }
+
+    async fn run_scheduled_job(&self, params: ScheduledJobRef) -> CoreResult<()> {
+        self.call(AgentRequest::RunScheduledJob(params)).await
+    }
+
+    async fn list_scheduled_job_runs(
+        &self,
+        params: ListScheduledJobRunsParams,
+    ) -> CoreResult<Vec<JobRunInfo>> {
+        self.call(AgentRequest::ListScheduledJobRuns(params)).await
+    }
+
+    async fn read_scheduled_job_run_log(
+        &self,
+        params: ScheduledJobRunLogParams,
+    ) -> CoreResult<DeploymentLogChunk> {
+        self.call(AgentRequest::ReadScheduledJobRunLog(params))
+            .await
     }
 
     async fn create_mailbox(&self, params: CreateMailboxParams) -> CoreResult<MailboxInfo> {

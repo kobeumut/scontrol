@@ -6,6 +6,7 @@ use crate::db;
 use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
 use crate::services::notifications::Notifier;
+use crate::services::scheduled_jobs::JobRunCollector;
 use crate::services::secret_box::SecretBox;
 use crate::services::webhook::WebhookKey;
 use crate::state::AppState;
@@ -56,6 +57,7 @@ pub fn app_state(pool: PgPool, adapter: Arc<MockAdapter>) -> AppState {
         notifier: Notifier::new(SecretBox::derive(&key)),
         secret_box: SecretBox::derive(&key),
         github_apps: github_apps(),
+        job_runs: JobRunCollector::new(),
     }
 }
 
@@ -74,4 +76,45 @@ pub async fn session_cookie(state: &AppState, user_id: Uuid) -> String {
 /// unless a test builds its own with `GitHubApps::with_api_base`.
 pub fn github_apps() -> GitHubApps {
     GitHubApps::with_api_base(SecretBox::derive(&[42u8; 32]), "http://127.0.0.1:9")
+}
+
+/// A one-route HTTP receiver: answers 200 and hands over each request's
+/// lower-cased headers and body.
+pub async fn http_receiver() -> (String, tokio::sync::mpsc::Receiver<(String, String)>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let (head, body) = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break (head.to_lowercase(), body.to_string());
+                    }
+                }
+            };
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            tx.send((head, body)).await.ok();
+        }
+    });
+    (url, rx)
 }

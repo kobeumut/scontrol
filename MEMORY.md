@@ -41,6 +41,12 @@ Durable project context that is not obvious from the code. Read it together with
 - **Routing uses the host Nginx, not Traefik.** Compose domains publish the service on a loopback port (40000–49999) and get a generated vhost. That avoids an extra always-on proxy container and Docker-label rewriting of user Compose files.
   - How to apply: do not inject labels into, or rewrite, user Compose files. Add routing features (redirects, basic auth, path prefixes) as typed vhost options.
 
+- **Scheduled jobs are systemd timers that run the agent binary, not a command line (decided 2026-11-04, D3).** `ExecStart=` is parsed by systemd with its own quoting and `%` specifiers, so the job's argv never goes into a unit: the unit runs `panel-agent run-scheduled-job <slug> <id>`, and the helper reads the argv from a 0600 `job.json` and runs `docker compose exec -T` with it. Everything else written into a unit is a UUID, a slug, a checked path, or a calendar value from a narrow character set.
+  - Runs are recorded by the helper next to their logs and collected by panel-api, because the helper has no database access and a root process should not get it. The collector upserts so that each finished run is stored, and notified, exactly once.
+  - Stopping the `docker compose exec` client does not stop the process inside the container. Each run carries `SCONTROL_JOB`/`SCONTROL_JOB_RUN` in its environment, and the agent stops container processes with that marker (found through `docker top` host PIDs and `/proc/<pid>/environ`) on timeout, before the next run, and on removal. Never stop them by name or with a container-wide signal.
+  - Jobs run only inside a project's containers. Host jobs as root would be arbitrary root execution from the panel, and the per-site `cron` adapter already covers site users.
+  - How to apply: a new scheduled feature (backups, Docker cleanup) adds a helper mode or reuses this one with typed parameters, never a command in a unit file or crontab.
+
 ## Open Items
 
 The full list is in `TASK.md`. The largest open items as of 2026-11-03 (after D0):

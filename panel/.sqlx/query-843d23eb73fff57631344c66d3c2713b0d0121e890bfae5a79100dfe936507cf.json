@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE job_schedules SET last_run_at = $2, last_run_status = $3\n           WHERE id = $1 AND (last_run_at IS NULL OR last_run_at <= $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "843d23eb73fff57631344c66d3c2713b0d0121e890bfae5a79100dfe936507cf"
+}

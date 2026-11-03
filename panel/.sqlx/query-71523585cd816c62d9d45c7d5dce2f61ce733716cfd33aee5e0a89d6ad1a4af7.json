@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO job_runs\n               (id, job_id, trigger, status, started_at, finished_at, exit_code,\n                error_message, log_bytes, log_truncated)\n           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n           ON CONFLICT (id) DO UPDATE\n           SET status = EXCLUDED.status, finished_at = EXCLUDED.finished_at,\n               exit_code = EXCLUDED.exit_code, error_message = EXCLUDED.error_message,\n               log_bytes = EXCLUDED.log_bytes, log_truncated = EXCLUDED.log_truncated\n           WHERE job_runs.status = 'running'\n             AND (EXCLUDED.status <> 'running' OR EXCLUDED.log_bytes <> job_runs.log_bytes)\n           RETURNING status",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Int4",
+        "Text",
+        "Int8",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "71523585cd816c62d9d45c7d5dce2f61ce733716cfd33aee5e0a89d6ad1a4af7"
+}
