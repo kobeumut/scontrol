@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE compose_projects SET env_layered = TRUE, updated_at = now() WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "760d8eea5b2f777a7e9b7d79c5981f32358d461a9791282cbb1601691790710f"
+}

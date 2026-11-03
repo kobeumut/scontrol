@@ -4,15 +4,20 @@
 //! `202 Accepted` with the deployment record, and clients follow progress
 //! through the deployment status and its incremental log.
 //!
-//! Environment values are accepted only by create/deploy/environment
-//! requests and forwarded straight to the agent; they are never persisted,
-//! included in responses, queue rows, audit JSON, or logs owned by this API.
+//! Environment values are write-only. They are accepted by
+//! create/deploy/environment/variables requests and stored only sealed (the
+//! service layer of `services::env_layers`); they are never included in
+//! responses, queue rows, audit JSON, or logs owned by this API. The queue
+//! worker merges project → environment → service layers and writes the
+//! result to the agent right before each deployment.
 //! Git HTTPS tokens follow the same rule, and a deploy key's private half
 //! never leaves the agent.
 
 use crate::auth::AdminUser;
 use crate::db;
+use crate::db::projects::EnvScope;
 use crate::error::{ApiError, ApiResult};
+use crate::services::env_layers::{self, ServiceVariables, VariableInput};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -20,8 +25,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use panel_core::adapters::{
     CancelDeploymentParams, ComposeProjectActionParams, ComposeProjectLogsParams,
-    DeploymentLogParams, FollowComposeLogsParams, GitHttpCredentials,
-    WriteComposeEnvironmentParams, WriteGitCredentialsParams,
+    DeploymentLogParams, FollowComposeLogsParams, GitHttpCredentials, WriteGitCredentialsParams,
 };
 use panel_core::types::validate::GitTransport;
 use panel_core::types::{
@@ -37,6 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/:id", get(show).delete(remove))
         .route("/:id/deploy", post(deploy))
         .route("/:id/environment", put(replace_environment))
+        .route("/:id/variables", get(variables).put(update_variables))
         .route("/:id/stop", post(stop))
         .route("/:id/services", get(services))
         .route("/:id/logs", get(logs))
@@ -95,7 +100,11 @@ struct CreateProjectBody {
     name: String,
     slug: String,
     source: ComposeSource,
-    /// Write-only values; never returned or persisted in PostgreSQL.
+    /// Environment (of a project) the service belongs to; the owner's
+    /// default project's `production` environment when omitted.
+    #[serde(default)]
+    environment_id: Option<Uuid>,
+    /// Write-only values of the service layer; stored sealed, never returned.
     #[serde(default)]
     environment: Vec<(String, String)>,
     /// Write-only HTTPS token for a private Git remote.
@@ -132,20 +141,32 @@ async fn create(
         }
         None => None,
     };
+    if let Some(environment_id) = body.environment_id {
+        db::projects::find_environment(&state.db, environment_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
+    }
     let project = db::compose_projects::create(
         &state.db,
         Uuid::new_v4(),
         &body.name,
         &body.slug,
         user.id,
+        body.environment_id,
         &body.source,
     )
     .await
     .map_err(|e| conflict_on_unique(e, "a project with this slug already exists"))?;
 
     // The row exists first so the slug is reserved before the agent writes
-    // anything under it; if the agent refuses, the row is rolled back.
-    let mut prepared = write_environment(&state, &project.slug, body.environment).await;
+    // anything under it; if a step fails, the row is rolled back.
+    let mut prepared = env_layers::replace(
+        &state.db,
+        &state.secret_box,
+        EnvScope::Service(project.id),
+        &body.environment,
+    )
+    .await;
     if let (Ok(()), Some(host)) = (&prepared, &token_host) {
         prepared = write_git_token(&state, &project, host, body.git_credentials).await;
     }
@@ -217,8 +238,13 @@ async fn deploy(
     let body = body.map(|Json(body)| body).unwrap_or_default();
     let project = find_project(&state, id).await?;
     if let Some(environment) = body.environment {
-        validate_environment(&environment)?;
-        write_environment(&state, &project.slug, environment).await?;
+        env_layers::replace(
+            &state.db,
+            &state.secret_box,
+            EnvScope::Service(project.id),
+            &environment,
+        )
+        .await?;
     }
     let deployment = state
         .deploy_queue
@@ -259,7 +285,13 @@ async fn replace_environment(
     let project = find_project(&state, id).await?;
     let keys: Vec<&str> = body.environment.iter().map(|(k, _)| k.as_str()).collect();
     let audit = serde_json::json!({ "project_id": project.id, "keys": keys });
-    write_environment(&state, &project.slug, body.environment).await?;
+    env_layers::replace(
+        &state.db,
+        &state.secret_box,
+        EnvScope::Service(project.id),
+        &body.environment,
+    )
+    .await?;
     db::audit::record(
         &state.db,
         Some(user.id),
@@ -271,6 +303,56 @@ async fn replace_environment(
     .await
     .ok();
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Key names of the service's own, environment, and project variables, and
+/// which layer wins per key. Values are never returned.
+async fn variables(
+    AdminUser(_): AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ServiceVariables>> {
+    let project = find_project(&state, id).await?;
+    Ok(Json(
+        env_layers::service_variables(&state.db, &project).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct VariablesBody {
+    pub variables: Vec<VariableInput>,
+}
+
+/// Replaces the service layer. An entry without `value` keeps the stored
+/// value; keys left out are removed. Applies on the next deployment.
+async fn update_variables(
+    AdminUser(user): AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<VariablesBody>,
+) -> ApiResult<Json<ServiceVariables>> {
+    let project = find_project(&state, id).await?;
+    let keys = env_layers::update(
+        &state.db,
+        &state.secret_box,
+        EnvScope::Service(project.id),
+        body.variables,
+    )
+    .await?;
+    db::audit::record(
+        &state.db,
+        Some(user.id),
+        "user",
+        "update_service_variables",
+        Some(&project.slug),
+        serde_json::json!({ "project_id": project.id, "keys": keys }),
+    )
+    .await
+    .ok();
+    let project = find_project(&state, id).await?;
+    Ok(Json(
+        env_layers::service_variables(&state.db, &project).await?,
+    ))
 }
 
 async fn stop(
@@ -1032,21 +1114,6 @@ async fn find_deployment(
         .ok_or_else(|| ApiError::NotFound("deployment not found".into()))
 }
 
-async fn write_environment(
-    state: &AppState,
-    slug: &str,
-    environment: Vec<(String, String)>,
-) -> ApiResult<()> {
-    state
-        .agent
-        .write_compose_environment(WriteComposeEnvironmentParams {
-            project_slug: slug.to_string(),
-            environment,
-        })
-        .await
-        .map_err(Into::into)
-}
-
 fn conflict_on_unique(error: anyhow::Error, message: &str) -> ApiError {
     let unique = error
         .downcast_ref::<sqlx::Error>()
@@ -1103,17 +1170,7 @@ fn validate_source(source: &ComposeSource) -> ApiResult<()> {
 }
 
 fn validate_environment(environment: &[(String, String)]) -> ApiResult<()> {
-    if environment.len() > 256
-        || environment.iter().any(|(key, value)| {
-            !validate::is_valid_env_key(key)
-                || value.contains('\0')
-                || value.contains('\n')
-                || value.len() > 16 * 1024
-        })
-    {
-        return Err(ApiError::BadRequest("invalid project environment".into()));
-    }
-    Ok(())
+    env_layers::validate_pairs(environment)
 }
 
 fn source_kind(source: &ComposeSource) -> &'static str {
@@ -1356,29 +1413,35 @@ mod tests {
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT to_jsonb(d)::text FROM compose_deployments d WHERE project_id = $1::uuid
              UNION ALL
-             SELECT to_jsonb(p)::text FROM compose_projects p WHERE id = $1::uuid",
+             SELECT to_jsonb(p)::text FROM compose_projects p WHERE id = $1::uuid
+             UNION ALL
+             SELECT to_jsonb(v)::text FROM env_variables v WHERE service_id = $1::uuid",
         )
         .bind(&id)
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert!(rows.len() >= 3);
+        assert!(rows.len() >= 4);
 
         for text in bodies.iter().chain(&audit).chain(&rows) {
             for secret in &secrets {
                 assert!(!text.contains(secret.as_str()), "secret leaked into {text}");
             }
         }
-        // The values did reach the agent, through the dedicated RPC only.
+        // The service layer is stored sealed; the agent receives the merged
+        // set from the queue worker at deploy time (not from handlers).
         let calls = adapter.calls.lock().unwrap().clone();
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|c| *c == "write_compose_environment")
-                .count(),
-            3,
+        assert!(
+            !calls.iter().any(|c| c == "write_compose_environment"),
             "{calls:?}"
         );
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM env_variables WHERE service_id = $1::uuid")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, 1);
     }
 
     #[tokio::test]
@@ -1566,6 +1629,7 @@ mod tests {
             "SSE test",
             &format!("p{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
             admin.id,
+            None,
             &panel_core::types::ComposeSource::Raw {
                 compose_yaml: "services:\n  web:\n    image: nginx\n".into(),
             },

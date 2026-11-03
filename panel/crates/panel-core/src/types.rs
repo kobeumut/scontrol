@@ -529,10 +529,151 @@ pub struct ComposeProject {
     pub name: String,
     pub slug: String,
     pub owner_user_id: Uuid,
+    /// The environment (inside a project) this service belongs to; its
+    /// variables inherit project → environment → service.
+    pub environment_id: Uuid,
+    /// False for a service created before environment layering whose own
+    /// variables the panel never saw: deployments keep its env file as is
+    /// (no inheritance) until its environment is saved once.
+    pub env_layered: bool,
     pub source: ComposeSource,
     pub status: DeploymentStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A group of environments (for example one product), owned by a user.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub owner_user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A stage of a project (`production`, `staging`, ...) holding services.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Environment {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Most variables one layer (project, environment, or service) may hold.
+pub const MAX_ENV_VARS_PER_LAYER: usize = 256;
+/// Most variables a merged service environment may hold (three full layers).
+pub const MAX_MERGED_ENV_VARS: usize = 3 * MAX_ENV_VARS_PER_LAYER;
+
+/// Where a variable is defined. Ordered from least to most specific: a
+/// later layer overrides an earlier one on the same key.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvLayer {
+    Project,
+    Environment,
+    Service,
+}
+
+impl EnvLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Environment => "environment",
+            Self::Service => "service",
+        }
+    }
+}
+
+/// A variable as the API shows it: the key and where it comes from, never
+/// the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EnvKeyInfo {
+    pub key: String,
+    /// The layer whose value wins.
+    pub source: EnvLayer,
+    /// Less specific layers that define the key too and are overridden.
+    pub overrides: Vec<EnvLayer>,
+}
+
+/// Key names of one layer as stored; values stay write-only.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EnvLayerKeys {
+    pub layer: EnvLayer,
+    pub keys: Vec<String>,
+}
+
+/// Merges layers project → environment → service: on a shared key the most
+/// specific layer wins. Layers may be given in any order. The result keeps
+/// first-definition order of keys. Also returns values that were overridden
+/// (still secrets: the agent masks them in logs too).
+pub fn merge_env_layers(
+    layers: &[(EnvLayer, Vec<(String, String)>)],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut ordered: Vec<&(EnvLayer, Vec<(String, String)>)> = layers.iter().collect();
+    ordered.sort_by_key(|(layer, _)| *layer);
+    let mut merged: Vec<(String, String)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut shadowed = Vec::new();
+    for (_, vars) in ordered {
+        for (key, value) in vars {
+            match index.get(key) {
+                Some(&at) => {
+                    let previous = std::mem::replace(&mut merged[at].1, value.clone());
+                    if previous != *value {
+                        shadowed.push(previous);
+                    }
+                }
+                None => {
+                    index.insert(key.clone(), merged.len());
+                    merged.push((key.clone(), value.clone()));
+                }
+            }
+        }
+    }
+    (merged, shadowed)
+}
+
+/// Explains, key by key, where each merged variable comes from and which
+/// layers it overrides. Takes key names only, so it never touches values.
+pub fn describe_env_layers(layers: &[EnvLayerKeys]) -> Vec<EnvKeyInfo> {
+    let mut ordered: Vec<&EnvLayerKeys> = layers.iter().collect();
+    ordered.sort_by_key(|l| l.layer);
+    let mut out: Vec<EnvKeyInfo> = Vec::new();
+    for layer in ordered {
+        for key in &layer.keys {
+            match out.iter_mut().find(|info| &info.key == key) {
+                Some(info) if info.source != layer.layer => {
+                    info.overrides.push(info.source);
+                    info.source = layer.layer;
+                }
+                Some(_) => {}
+                None => out.push(EnvKeyInfo {
+                    key: key.clone(),
+                    source: layer.layer,
+                    overrides: Vec::new(),
+                }),
+            }
+        }
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -981,5 +1122,92 @@ pub mod validate {
             assert!(!is_valid_username("UpperCase"));
             assert!(!is_valid_username("has space"));
         }
+    }
+}
+
+#[cfg(test)]
+mod env_layer_tests {
+    use super::*;
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn most_specific_layer_wins_regardless_of_input_order() {
+        let layers = vec![
+            (
+                EnvLayer::Service,
+                vars(&[("DB_URL", "svc-db"), ("ONLY_SVC", "s")]),
+            ),
+            (
+                EnvLayer::Project,
+                vars(&[("DB_URL", "proj-db"), ("LOG", "info"), ("REGION", "eu")]),
+            ),
+            (
+                EnvLayer::Environment,
+                vars(&[("LOG", "debug"), ("DB_URL", "env-db")]),
+            ),
+        ];
+        let (merged, shadowed) = merge_env_layers(&layers);
+        assert_eq!(
+            merged,
+            vars(&[
+                ("DB_URL", "svc-db"),
+                ("LOG", "debug"),
+                ("REGION", "eu"),
+                ("ONLY_SVC", "s"),
+            ])
+        );
+        let mut shadowed = shadowed;
+        shadowed.sort();
+        assert_eq!(shadowed, vec!["env-db", "info", "proj-db"]);
+    }
+
+    #[test]
+    fn empty_layers_merge_to_the_remaining_ones() {
+        let (merged, shadowed) = merge_env_layers(&[
+            (EnvLayer::Project, vars(&[("A", "1")])),
+            (EnvLayer::Environment, Vec::new()),
+        ]);
+        assert_eq!(merged, vars(&[("A", "1")]));
+        assert!(shadowed.is_empty());
+        assert!(merge_env_layers(&[]).0.is_empty());
+    }
+
+    #[test]
+    fn describes_inherited_and_overridden_keys_without_values() {
+        let info = describe_env_layers(&[
+            EnvLayerKeys {
+                layer: EnvLayer::Service,
+                keys: vec!["DB_URL".into()],
+            },
+            EnvLayerKeys {
+                layer: EnvLayer::Project,
+                keys: vec!["DB_URL".into(), "REGION".into()],
+            },
+            EnvLayerKeys {
+                layer: EnvLayer::Environment,
+                keys: vec!["DB_URL".into()],
+            },
+        ]);
+        assert_eq!(
+            info,
+            vec![
+                EnvKeyInfo {
+                    key: "DB_URL".into(),
+                    source: EnvLayer::Service,
+                    overrides: vec![EnvLayer::Project, EnvLayer::Environment],
+                },
+                EnvKeyInfo {
+                    key: "REGION".into(),
+                    source: EnvLayer::Project,
+                    overrides: vec![],
+                },
+            ]
+        );
     }
 }

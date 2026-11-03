@@ -4,6 +4,7 @@ pub mod cron;
 pub mod databases;
 pub mod firewall;
 pub mod notifications;
+pub mod projects;
 pub mod sites;
 pub mod users;
 

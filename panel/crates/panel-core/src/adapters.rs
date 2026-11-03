@@ -111,10 +111,28 @@ pub struct DeployComposeProjectParams {
 
 /// Replaces a project's write-only environment file. Sent separately from
 /// deployments so queued deployment jobs never carry secret values.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WriteComposeEnvironmentParams {
     pub project_slug: String,
+    /// The merged (project → environment → service) variables.
     pub environment: Vec<(String, String)>,
+    /// Values of inherited variables that a more specific layer overrides.
+    /// They are not part of the environment, but they are still secrets, so
+    /// the agent keeps them (0600) only to mask them in logs.
+    #[serde(default)]
+    pub masked_values: Vec<String>,
+}
+
+/// Prints key names only, so a stray `{:?}` never logs a value.
+impl std::fmt::Debug for WriteComposeEnvironmentParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.environment.iter().map(|(k, _)| k.as_str()).collect();
+        f.debug_struct("WriteComposeEnvironmentParams")
+            .field("project_slug", &self.project_slug)
+            .field("environment_keys", &keys)
+            .field("masked_values", &self.masked_values.len())
+            .finish()
+    }
 }
 
 /// HTTPS credentials for a project's private Git remote, usually a
@@ -323,6 +341,9 @@ pub mod mock {
     pub struct MockAdapter {
         pub calls: Mutex<Vec<String>>,
         pub fail_next: Mutex<Option<(String, crate::error::CoreError)>>,
+        /// Every `write_compose_environment` request, so tests can check
+        /// what reached the agent (only tests ever see these values).
+        pub environment_writes: Mutex<Vec<WriteComposeEnvironmentParams>>,
     }
 
     impl MockAdapter {
@@ -441,9 +462,11 @@ pub mod mock {
 
         async fn write_compose_environment(
             &self,
-            _params: WriteComposeEnvironmentParams,
+            params: WriteComposeEnvironmentParams,
         ) -> CoreResult<()> {
-            self.record("write_compose_environment")
+            self.record("write_compose_environment")?;
+            self.environment_writes.lock().unwrap().push(params);
+            Ok(())
         }
 
         async fn deploy_compose_project(

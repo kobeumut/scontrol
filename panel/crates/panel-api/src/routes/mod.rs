@@ -7,6 +7,7 @@ pub mod firewall;
 pub mod health;
 pub mod mcp;
 pub mod notifications;
+pub mod projects;
 pub mod sites;
 pub mod tls;
 pub mod webhooks;
@@ -23,6 +24,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/databases", databases::router())
         .nest("/api/mcp", mcp::router())
         .nest("/api/cron", cron::router())
+        .nest("/api/projects", projects::router())
         .nest("/api/compose-projects", compose_projects::router())
         .nest("/api/notifications", notifications::router())
         .nest("/api/firewall", firewall::router())

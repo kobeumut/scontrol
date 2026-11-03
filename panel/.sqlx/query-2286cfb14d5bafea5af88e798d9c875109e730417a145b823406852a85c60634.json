@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO environments (id, project_id, name, slug) VALUES ($1, $2, $3, $3)\n           ON CONFLICT (project_id, slug) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2286cfb14d5bafea5af88e798d9c875109e730417a145b823406852a85c60634"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO projects (id, name, slug, owner_user_id) VALUES ($1, 'Default', $2, $3)\n           ON CONFLICT (owner_user_id, slug) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f2678047f004966b510b64033077d7e0ff3ac7c3d26ee44c26f6307eecb57172"
+}
