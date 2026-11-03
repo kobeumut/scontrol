@@ -4,6 +4,13 @@ Durum işaretleri: `[x]` tamamlandı, `[-]` devam ediyor, `[ ]` planlandı.
 
 The Dokploy parity roadmap, research basis, and performance budgets are in `PLAN.md`. Phase labels (D0–D6) below refer to it.
 
+## Licensing
+
+- [x] Add root `LICENSE`: custom scontrol Attribution License 1.0, copyright 2026 Umut ADALI(kobeumut), commercial-use attribution, attribution/change notices for modified or updated releases, warranty/liability disclaimers subject to applicable law, and third-party license preservation.
+- [x] Add a Turkish license summary and exact required attribution to `README.md`; record the licensing decision in `MEMORY.md`.
+- [x] Validate exact credit consistency, all eight license sections, and whitespace; `git diff --check -- TASK.md MEMORY.md` passed. No runtime code or package metadata changed, so build/lint/runtime test suites were not rerun for this documentation-only change.
+- [ ] Have a qualified lawyer review the custom license before relying on its enforceability; repository visibility is managed separately.
+
 ## Foundation
 
 - [x] Rust workspace: `panel-core`, `panel-agent`, `panel-api`, `panel-cli`.

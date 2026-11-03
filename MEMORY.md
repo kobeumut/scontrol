@@ -4,6 +4,8 @@ Durable project context that is not obvious from the code. Read it together with
 
 ## Decisions
 
+- **Project license: scontrol Attribution License 1.0 (2026-11-03).** The user approved the exact credit `Umut ADALI(kobeumut)`. Root `LICENSE` permits commercial use and redistribution while requiring accessible commercial-product attribution and preserved credit/change notices for modified or updated releases. A custom license was chosen because ordinary MIT notice preservation does not require visible commercial-product or release attribution. Warranty and liability are disclaimed only to the extent applicable law allows; third-party licenses remain unchanged. The license is not a confidentiality agreement and does not itself change GitHub visibility. Legal review is pending in `TASK.md`.
+
 - **Docker is a Dokploy-style deployment workflow, not a container dashboard.** Per the plan's research summary, HestiaCP and CloudPanel both lack Docker support. A Portainer-style dashboard was rejected in favour of application and Compose deployments (`TASK.md`, Docker section).
   - How to apply: do not add `docker run` or raw container CRUD endpoints. Model work as projects and Compose deployments.
 - **Docker, Mail, and Antivirus are opt-in at install time and compile-time features.** They are off by default. The base install stays small (the plan targets ~50 MB RAM) and installs no packages nobody asked for.
