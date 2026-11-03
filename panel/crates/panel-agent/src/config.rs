@@ -1,0 +1,120 @@
+//! Agent configuration, loaded from `/etc/scontrol/agent.toml`.
+//!
+//! Optional features (`docker`, `mail`, `antivirus`) are gated in two ways:
+//! 1. At compile time via Cargo features (see `Cargo.toml`) — code for a
+//!    feature that was never selected at install time is not even built
+//!    into the binary.
+//! 2. At runtime via this config, in case an operator wants to temporarily
+//!    disable an installed feature without rebuilding.
+
+use serde::Deserialize;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentConfig {
+    /// Path to the Unix domain socket the API server connects to.
+    #[serde(default = "default_socket_path")]
+    pub socket_path: PathBuf,
+
+    /// Root directory under which per-site document roots and system users'
+    /// home directories are created.
+    #[serde(default = "default_sites_root")]
+    pub sites_root: PathBuf,
+
+    #[serde(default = "default_nginx_available")]
+    pub nginx_sites_available: PathBuf,
+    #[serde(default = "default_nginx_enabled")]
+    pub nginx_sites_enabled: PathBuf,
+
+    #[serde(default = "default_systemd_dir")]
+    pub systemd_unit_dir: PathBuf,
+
+    /// Agent-owned, per-project Compose source, environment, and logs.
+    /// Only read in a Docker-feature build.
+    #[allow(dead_code)]
+    #[serde(default = "default_docker_projects_root")]
+    pub docker_projects_root: PathBuf,
+
+    #[serde(default)]
+    pub runtime_features: RuntimeFeatures,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RuntimeFeatures {
+    #[serde(default = "default_true")]
+    pub docker: bool,
+    #[serde(default = "default_true")]
+    pub mail: bool,
+    #[serde(default = "default_true")]
+    pub antivirus: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_socket_path() -> PathBuf {
+    PathBuf::from("/run/scontrol/agent.sock")
+}
+
+fn default_sites_root() -> PathBuf {
+    PathBuf::from("/srv/scontrol/sites")
+}
+
+fn default_nginx_available() -> PathBuf {
+    PathBuf::from("/etc/nginx/sites-available")
+}
+
+fn default_nginx_enabled() -> PathBuf {
+    PathBuf::from("/etc/nginx/sites-enabled")
+}
+
+fn default_systemd_dir() -> PathBuf {
+    PathBuf::from("/etc/systemd/system")
+}
+
+fn default_docker_projects_root() -> PathBuf {
+    PathBuf::from("/var/lib/scontrol/docker")
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: default_socket_path(),
+            sites_root: default_sites_root(),
+            nginx_sites_available: default_nginx_available(),
+            nginx_sites_enabled: default_nginx_enabled(),
+            systemd_unit_dir: default_systemd_dir(),
+            docker_projects_root: default_docker_projects_root(),
+            runtime_features: RuntimeFeatures {
+                docker: true,
+                mail: true,
+                antivirus: true,
+            },
+        }
+    }
+}
+
+impl AgentConfig {
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        if !path.exists() {
+            tracing::warn!(path = %path.display(), "agent config not found, using defaults");
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(path)?;
+        let cfg: AgentConfig = toml::from_str(&raw)?;
+        Ok(cfg)
+    }
+
+    pub fn docker_enabled(&self) -> bool {
+        cfg!(feature = "docker") && self.runtime_features.docker
+    }
+
+    pub fn mail_enabled(&self) -> bool {
+        cfg!(feature = "mail") && self.runtime_features.mail
+    }
+
+    pub fn antivirus_enabled(&self) -> bool {
+        cfg!(feature = "antivirus") && self.runtime_features.antivirus
+    }
+}

@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO sites (id, domain, owner_user_id, owner_username, runtime, document_root, status)\n           VALUES ($1, $2, $3, $4, $5, $6, 'provisioning')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a628abba5260984c9e2afa862a82272d1486a17cb747a09b9a7628a6a5343137"
+}

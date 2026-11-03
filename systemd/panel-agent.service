@@ -1,0 +1,27 @@
+[Unit]
+Description=scontrol privileged host operations agent
+Documentation=https://github.com/REPLACE_ME/scontrol
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=scontrol
+ExecStart=/usr/local/bin/panel-agent --config /etc/scontrol/agent.toml
+Restart=on-failure
+RestartSec=3
+# Agent must manage system services and protected config. Keep hardening that
+# does not interfere with these responsibilities.
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RuntimeDirectory=scontrol
+RuntimeDirectoryMode=0750
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target

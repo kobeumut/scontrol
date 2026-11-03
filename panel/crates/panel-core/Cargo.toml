@@ -1,0 +1,25 @@
+[package]
+name = "panel-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+schemars = { workspace = true }
+regex = { workspace = true }
+once_cell = { workspace = true }
+argon2 = { workspace = true }
+rand_core = { workspace = true }
+
+[features]
+default = []
+test-utils = []

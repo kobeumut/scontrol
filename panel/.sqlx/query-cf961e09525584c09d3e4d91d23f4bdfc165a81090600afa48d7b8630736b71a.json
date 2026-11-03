@@ -1,0 +1,49 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO firewall_rules (port, protocol, allow, description)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (port, protocol) DO UPDATE SET allow = EXCLUDED.allow, description = EXCLUDED.description\n        RETURNING id, port, protocol, allow, description\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "port",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "protocol",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "allow",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "description",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "cf961e09525584c09d3e4d91d23f4bdfc165a81090600afa48d7b8630736b71a"
+}

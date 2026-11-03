@@ -1,0 +1,31 @@
+[Unit]
+Description=scontrol API and MCP server
+Documentation=https://github.com/REPLACE_ME/scontrol
+After=network.target postgresql.service panel-agent.service
+Requires=panel-agent.service
+
+[Service]
+Type=simple
+User=scontrol
+Group=scontrol
+EnvironmentFile=/etc/scontrol/panel-api.env
+ExecStart=/usr/local/bin/panel-api
+Restart=on-failure
+RestartSec=3
+# API is explicitly unprivileged. Privileged actions use panel-agent's Unix
+# socket instead of sudo/root access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/scontrol
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

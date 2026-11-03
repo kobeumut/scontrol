@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch managed scontrol configuration for review PRs
+
+[Path]
+# Only non-secret, reviewable panel configuration is watched. Credentials
+# under /etc/scontrol/panel-api.env are intentionally NOT watched or committed.
+PathChanged=/etc/scontrol/agent.toml
+Unit=scontrol-git-sync.service
+
+[Install]
+WantedBy=multi-user.target

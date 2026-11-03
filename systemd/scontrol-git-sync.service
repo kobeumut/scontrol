@@ -1,0 +1,13 @@
+[Unit]
+Description=Create GitHub review PR for a managed scontrol configuration change
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/lib/scontrol-auto-pr config-change
+# A GitHub outage or branch protection failure must never cause a panel
+# configuration change to fail.
+SuccessExitStatus=0

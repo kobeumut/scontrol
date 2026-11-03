@@ -1,0 +1,19 @@
+# Rust
+/panel/target/
+
+# SQLx local build inputs (offline metadata is intentionally tracked)
+/panel/.env
+
+# Frontend
+/panel/frontend/node_modules/
+/panel/frontend/dist/
+
+# Local/secret configuration
+.env
+*.env
+!.env.example
+
+# OS/editor
+.DS_Store
+
+.kilo/
