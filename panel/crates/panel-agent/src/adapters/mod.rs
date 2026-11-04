@@ -22,6 +22,7 @@ pub mod git_auth;
 #[cfg(feature = "mail")]
 pub mod mail;
 pub mod nginx;
+pub mod observability;
 pub mod php_fpm;
 pub mod s3;
 #[cfg(feature = "docker")]
@@ -699,6 +700,25 @@ impl AdapterPort for LocalAdapter {
                 return Err(Self::feature_disabled("docker"));
             }
             return backup::restore_volume(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn read_nginx_stats(&self, params: ReadNginxStatsParams) -> CoreResult<NginxStatsChunk> {
+        observability::read_stats(&self.config, params).await
+    }
+
+    async fn prune_docker(&self, params: PruneDockerParams) -> CoreResult<DockerPruneOutcome> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return observability::prune_docker(params).await;
         }
         #[cfg(not(feature = "docker"))]
         {

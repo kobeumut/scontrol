@@ -83,6 +83,12 @@ async fn main() -> anyhow::Result<()> {
         state.notifier.clone(),
     );
 
+    let interrupted = db::observability::fail_interrupted_runs(&state.db).await?;
+    if interrupted > 0 {
+        tracing::warn!(interrupted, "marked interrupted docker cleanups as failed");
+    }
+    services::observability::start(state.db.clone(), state.agent.clone());
+
     let router = routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "panel-api listening");

@@ -208,6 +208,7 @@ deployment_log_max_bytes = 5242880
 deployment_logs_retained = 20
 static_sites_root = "/srv/scontrol/static"
 nginx_stream_dir = "/etc/nginx/scontrol-stream"
+nginx_stats_log = "/var/log/nginx/scontrol-access.json.log"
 railpack_frontend = "ghcr.io/railwayapp/railpack-frontend:v${RAILPACK_VERSION}"
 buildpacks_builder = "paketobuildpacks/builder-jammy-base"
 
@@ -295,6 +296,9 @@ configure_nginx() {
   install -m 0644 "${INSTALL_ROOT}/install/nginx-scontrol.conf" /etc/nginx/sites-available/scontrol.conf
   ln -sfn /etc/nginx/sites-available/scontrol.conf /etc/nginx/sites-enabled/scontrol.conf
   rm -f /etc/nginx/sites-enabled/default
+  # JSON access log for request statistics, and its rotation.
+  install -m 0644 "${INSTALL_ROOT}/install/nginx-scontrol-log.conf" /etc/nginx/conf.d/scontrol-log.conf
+  install -m 0644 "${INSTALL_ROOT}/install/logrotate-scontrol-nginx" /etc/logrotate.d/scontrol-nginx
   nginx -t
   systemctl reload nginx
 }

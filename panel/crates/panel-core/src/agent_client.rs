@@ -286,6 +286,14 @@ impl AdapterPort for AgentClient {
             .await
     }
 
+    async fn read_nginx_stats(&self, params: ReadNginxStatsParams) -> CoreResult<NginxStatsChunk> {
+        self.call(AgentRequest::ReadNginxStats(params)).await
+    }
+
+    async fn prune_docker(&self, params: PruneDockerParams) -> CoreResult<DockerPruneOutcome> {
+        self.call(AgentRequest::PruneDocker(params)).await
+    }
+
     async fn create_mailbox(&self, params: CreateMailboxParams) -> CoreResult<MailboxInfo> {
         self.call(AgentRequest::CreateMailbox(params)).await
     }

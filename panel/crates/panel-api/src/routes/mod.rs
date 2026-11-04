@@ -10,6 +10,7 @@ pub mod github_apps;
 pub mod health;
 pub mod mcp;
 pub mod notifications;
+pub mod observability;
 pub mod projects;
 pub mod registries;
 pub mod scheduled_jobs;
@@ -33,6 +34,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/projects", projects::router())
         .nest("/api/compose-projects", compose_projects::router())
         .nest("/api/scheduled-jobs", scheduled_jobs::preview_router())
+        .nest("/api/observability", observability::router())
         .nest("/api/notifications", notifications::router())
         .nest("/api/backups", backups::router())
         .nest("/api/registries", registries::router())

@@ -78,8 +78,8 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Volume backups | Optional stop, then `tar` streamed in-process from the volume mountpoint to S3, then start | D3 | ✅ |
 | Scheduled jobs | Generated systemd timers (`OnCalendar=`, timezone; cron converted, Vixie day-of-month/day-of-week OR kept) running `docker compose exec -T` argv through the agent's helper mode. Runs recorded next to their masked 5 MiB logs and collected into `job_runs`; failures notify `job_failed` | D3 | ✅ (needs live E2E) |
 | Server and container metrics | Agent samples `/proc` and cgroup v2 every 10–30 s, with no process spawn. Kept as a downsampled ring in PostgreSQL. Threshold alerts fire on edge transitions | D4 | ⬜ |
-| Request stats | Nginx JSON `log_format`, read incrementally with offset tracking and aggregated into PostgreSQL | D4 | ⬜ |
-| Docker cleanup | Scheduled `docker image prune` / `builder prune` argv with an `until=` filter; freed space reported | D4 | ⬜ |
+| Request stats | Nginx JSON `log_format`, read incrementally with offset tracking and aggregated into PostgreSQL | D4 | ✅ |
+| Docker cleanup | Scheduled `docker image prune` / `builder prune` argv with an `until=` filter; freed space reported | D4 | ✅ |
 | Rollbacks | Tag each successful build `<slug>/<service>:deploy-<id>` and keep the last N. Rollback = compose up pinned to that tag plus the stored non-secret config snapshot | D5 | ⬜ |
 | Preview deployments | PR webhook → `<slug>-pr-<n>` project on a wildcard subdomain, with limit and TTL cleanup, and a PR comment through the GitHub API | D5 | ⬜ |
 | Templates | A vetted catalogue (TOML + Compose) shipped with the panel, using the same validator as user Compose and variable generators in Rust | D5 | ⬜ |
