@@ -43,6 +43,7 @@ use super::docker_config;
 use super::exec::{follow_lines, run, run_allow_nonzero, run_streamed};
 use super::git_auth;
 use super::nginx::{self, VhostTarget};
+use super::releases;
 use crate::config::AgentConfig;
 use panel_core::adapters::{
     ComposeProjectActionParams, ComposeProjectLogsParams, DeployComposeProjectParams,
@@ -153,8 +154,18 @@ async fn deploy_steps(
     log: &mut DeployLog,
 ) -> CoreResult<ComposeDeployOutcome> {
     let code_dir = root.join("code");
-    log.step("preparing source").await?;
-    let (compose_path, commit_sha) = materialize_source(cfg, params, root, &code_dir, log).await?;
+    let (compose_path, commit_sha) = match &params.rollback {
+        Some(target) => {
+            let path =
+                releases::prepare_rollback(root, &code_dir, &params.project_slug, target, log)
+                    .await?;
+            (path, None)
+        }
+        None => {
+            log.step("preparing source").await?;
+            materialize_source(cfg, params, root, &code_dir, log).await?
+        }
+    };
     ensure_inside(&code_dir, &compose_path).await?;
     let agent_files = [
         env_path.to_path_buf(),
@@ -166,13 +177,16 @@ async fn deploy_steps(
     persist_compose_path(root, &code_dir, &compose_path).await?;
 
     let override_path = root.join(OVERRIDE_FILE);
-    if params.domains.is_empty() {
+    let override_body = if params.domains.is_empty() {
         let _ = tokio::fs::remove_file(&override_path).await;
+        None
     } else {
-        tokio::fs::write(&override_path, render_override(&params.domains)?)
+        let body = render_override(&params.domains)?;
+        tokio::fs::write(&override_path, &body)
             .await
             .map_err(|e| CoreError::Io(format!("writing Compose override: {e}")))?;
-    }
+        Some(body)
+    };
 
     let paths = ProjectPaths {
         code_dir,
@@ -185,10 +199,13 @@ async fn deploy_steps(
         &params.source,
         ComposeSource::Application(spec) if matches!(spec.build, ApplicationBuild::Builder { .. })
     );
+    // A rollback only swaps containers: its images are pinned local tags.
+    let rollback = params.rollback.is_some();
     let args = compose_up_args(
         &params.project_slug,
         &paths,
-        params.pull_images && !builds_locally,
+        !rollback,
+        params.pull_images && !builds_locally && !rollback,
     );
     log.step("starting services with docker compose").await?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -215,12 +232,101 @@ async fn deploy_steps(
         log,
     )
     .await?;
+    let mut warnings = warnings;
+    let keep = cfg.rollback_releases_retained;
+    let (snapshot, current) = match &params.rollback {
+        Some(target) => {
+            if let Err(error) = releases::mark_current(root, target.deployment_id).await {
+                warnings.push(format!("marking the release as current failed: {error}"));
+            }
+            (None, target.deployment_id)
+        }
+        // Database services are never rolled back: an older engine image
+        // may not read data a newer one has written.
+        None if matches!(params.source, ComposeSource::Database(_)) || keep == 0 => {
+            (None, params.deployment_id)
+        }
+        None => {
+            let snapshot = record_release(
+                params,
+                root,
+                &paths,
+                &compose,
+                override_body.as_deref(),
+                log,
+            )
+            .await;
+            match snapshot {
+                Ok(snapshot) => (Some(snapshot), params.deployment_id),
+                Err(error) => {
+                    warnings.push(format!(
+                        "rollback to this deployment is unavailable: {error}"
+                    ));
+                    (None, params.deployment_id)
+                }
+            }
+        }
+    };
+    let retained_releases = if keep == 0 {
+        Vec::new()
+    } else {
+        releases::prune(root, &params.project_slug, current, keep).await
+    };
     let services = list_services_for(cfg, &params.project_slug).await?;
     Ok(ComposeDeployOutcome {
         services,
         commit_sha,
         warnings,
+        snapshot,
+        retained_releases,
     })
+}
+
+/// Pins the images of a successful deployment and records its release.
+async fn record_release(
+    params: &DeployComposeProjectParams,
+    root: &Path,
+    paths: &ProjectPaths,
+    compose: &Yaml,
+    override_body: Option<&str>,
+    log: &mut DeployLog,
+) -> CoreResult<panel_core::types::DeploymentSnapshot> {
+    let compose_body = tokio::fs::read_to_string(&paths.compose)
+        .await
+        .map_err(|e| CoreError::Io(format!("reading deployed Compose file: {e}")))?;
+    let compose_path = paths
+        .compose
+        .strip_prefix(&paths.code_dir)
+        .map_err(|_| CoreError::Validation("Compose path escaped project code directory".into()))?
+        .to_string_lossy()
+        .into_owned();
+    let mut containers = Vec::new();
+    if let Some(services) = compose.get("services").and_then(Yaml::as_mapping) {
+        for name in services.keys().filter_map(Yaml::as_str) {
+            let ids = service_container_ids(&params.project_slug, paths, name).await?;
+            containers.push((name.to_string(), ids.into_iter().next()));
+        }
+    }
+    let env_keys = read_environment(&root.join(ENV_FILE))
+        .await?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    releases::record(
+        releases::DeployedRelease {
+            slug: &params.project_slug,
+            deployment_id: params.deployment_id,
+            root,
+            compose_path: &compose_path,
+            compose_body: &compose_body,
+            compose,
+            override_body,
+            env_keys,
+            containers,
+        },
+        log,
+    )
+    .await
 }
 
 /// Replaces the project's environment file; the next deployment uses it.
@@ -420,6 +526,8 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
     if !owned.is_empty() {
         nginx::test_and_reload().await?;
     }
+    // The containers are gone, so the release tags can go with them.
+    releases::remove_all(&root, &params.project_slug).await;
     tokio::fs::remove_dir_all(&root)
         .await
         .map_err(|e| CoreError::Io(format!("removing project files: {e}")))?;
@@ -721,7 +829,48 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
             "database credentials sent for a service that is not a database".into(),
         ));
     }
+    if let Some(target) = &params.rollback {
+        validate_rollback_target(params, target)?;
+    }
     validate_bindings(&params.domains, params.acme_email.as_deref())
+}
+
+/// A rollback restarts pinned images of a Compose release. Static sites and
+/// database services have none, and every tag must be one this project
+/// recorded for the target deployment (checked again against the release).
+fn validate_rollback_target(
+    params: &DeployComposeProjectParams,
+    target: &panel_core::types::RollbackTarget,
+) -> CoreResult<()> {
+    if matches!(
+        params.source,
+        ComposeSource::Static(_) | ComposeSource::Database(_)
+    ) {
+        return Err(CoreError::Validation(
+            "static sites and database services cannot be rolled back".into(),
+        ));
+    }
+    if target.deployment_id == params.deployment_id
+        || target.compose_sha256.len() != 64
+        || !target.compose_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        || target.images.len() > 64
+    {
+        return Err(CoreError::Validation("invalid rollback target".into()));
+    }
+    for image in &target.images {
+        let expected = panel_core::types::deployment_image_tag(
+            &params.project_slug,
+            &image.service,
+            target.deployment_id,
+        );
+        if expected.as_deref() != Some(image.tag.as_str()) {
+            return Err(CoreError::Validation(format!(
+                "rollback image for service {} is not a tag of the target deployment",
+                image.service
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_database_deployment(
@@ -1055,6 +1204,8 @@ async fn deploy_static(
         services: vec![static_service_info(&params.deployment_id.to_string())],
         commit_sha: commit,
         warnings,
+        snapshot: None,
+        retained_releases: Vec::new(),
     })
 }
 
@@ -1492,7 +1643,7 @@ async fn checkout(
 /// Writes a panel-generated file inside a checkout. Whatever the repository
 /// put at that path (a symlink to a host file, a directory) is removed first
 /// and the file is created fresh, so the write can never follow a link.
-async fn write_generated_file(path: &Path, body: &str) -> CoreResult<()> {
+pub(crate) async fn write_generated_file(path: &Path, body: &str) -> CoreResult<()> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(meta) if meta.is_dir() => {
             return Err(CoreError::Validation(format!(
@@ -1873,7 +2024,7 @@ pub(crate) async fn write_private_file(path: &Path, body: &str) -> CoreResult<()
 
 /// Reads the existing environment file (only to mask its values in logs).
 /// A missing file becomes an empty one so `--env-file` always resolves.
-async fn read_environment(path: &Path) -> CoreResult<Vec<(String, String)>> {
+pub(crate) async fn read_environment(path: &Path) -> CoreResult<Vec<(String, String)>> {
     match tokio::fs::read_to_string(path).await {
         Ok(body) => Ok(body
             .lines()
@@ -2263,14 +2414,18 @@ fn certbot_webroot_args<'a>(webroot: &'a str, domain: &'a str, email: &'a str) -
     ]
 }
 
-fn compose_up_args(slug: &str, paths: &ProjectPaths, pull_images: bool) -> Vec<String> {
+fn compose_up_args(
+    slug: &str,
+    paths: &ProjectPaths,
+    build: bool,
+    pull_images: bool,
+) -> Vec<String> {
     let mut args = compose_args(slug, paths);
-    args.extend([
-        "up".into(),
-        "-d".into(),
-        "--build".into(),
-        "--remove-orphans".into(),
-    ]);
+    args.extend(["up".into(), "-d".into()]);
+    if build {
+        args.push("--build".into());
+    }
+    args.push("--remove-orphans".into());
     if pull_images {
         args.extend(["--pull".into(), "always".into()]);
     }
@@ -2901,6 +3056,7 @@ mod tests {
             acme_email: None,
             git_credentials: None,
             database,
+            rollback: None,
         };
         let good = DatabaseDeployment {
             loopback_port: 25000,
@@ -2921,11 +3077,74 @@ mod tests {
         let domain = vec![binding("db.example.com", "db", 40000, false)];
         assert!(validate_project_params(&params(Some(good.clone()), domain)).is_err());
 
-        let mut raw = params(Some(good), vec![]);
+        let mut raw = params(Some(good.clone()), vec![]);
         raw.source = ComposeSource::Raw {
             compose_yaml: "services: {}".into(),
         };
         assert!(validate_project_params(&raw).is_err());
+
+        // Database services are never rolled back.
+        let mut rollback = params(Some(good), vec![]);
+        let target = uuid::Uuid::new_v4();
+        rollback.rollback = Some(panel_core::types::RollbackTarget {
+            deployment_id: target,
+            compose_sha256: "a".repeat(64),
+            images: vec![],
+        });
+        assert!(validate_project_params(&rollback).is_err());
+    }
+
+    #[test]
+    fn rollback_targets_name_only_tags_of_the_target_deployment() {
+        use panel_core::types::{deployment_image_tag, PinnedImage, RollbackTarget};
+        let target = uuid::Uuid::new_v4();
+        let pinned = |tag: String| PinnedImage {
+            service: "web".into(),
+            tag,
+            image_id: format!("sha256:{}", "0".repeat(64)),
+        };
+        let params = |images: Vec<PinnedImage>| DeployComposeProjectParams {
+            project_id: uuid::Uuid::new_v4(),
+            deployment_id: uuid::Uuid::new_v4(),
+            project_slug: "shop".into(),
+            source: ComposeSource::Raw {
+                compose_yaml: "services:\n  web:\n    image: nginx".into(),
+            },
+            pull_images: false,
+            domains: vec![],
+            acme_email: None,
+            git_credentials: None,
+            database: None,
+            rollback: Some(RollbackTarget {
+                deployment_id: target,
+                compose_sha256: "a".repeat(64),
+                images,
+            }),
+        };
+        let own = deployment_image_tag("shop", "web", target).unwrap();
+        assert!(validate_project_params(&params(vec![pinned(own)])).is_ok());
+        for foreign in [
+            "nginx:latest".to_string(),
+            deployment_image_tag("other", "web", target).unwrap(),
+            deployment_image_tag("shop", "web", uuid::Uuid::new_v4()).unwrap(),
+        ] {
+            assert!(
+                validate_project_params(&params(vec![pinned(foreign.clone())])).is_err(),
+                "{foreign}"
+            );
+        }
+        let mut bad_hash = params(vec![]);
+        bad_hash.rollback.as_mut().unwrap().compose_sha256 = "zz".into();
+        assert!(validate_project_params(&bad_hash).is_err());
+        let mut static_site = params(vec![]);
+        static_site.source = ComposeSource::Static(Box::new(panel_core::types::StaticSiteSpec {
+            repository_url: "https://github.com/acme/site.git".into(),
+            branch: "main".into(),
+            publish_path: "dist".into(),
+            build: None,
+            spa: false,
+        }));
+        assert!(validate_project_params(&static_site).is_err());
     }
 
     #[tokio::test]
@@ -3190,7 +3409,7 @@ mod tests {
             env: Some("/data/my app/env".into()),
             override_file: Some("/data/my app/scontrol.override.yml".into()),
         };
-        let up = compose_up_args("my-app", &paths, true);
+        let up = compose_up_args("my-app", &paths, true, true);
         assert_eq!(&up[..3], &["compose", "-p", "my-app"]);
         assert!(up.contains(&"/data/my app/code/compose file.yml".to_string()));
         assert_eq!(
@@ -3206,7 +3425,11 @@ mod tests {
             "--pull".into(),
             "always".into()
         ]));
-        assert!(!compose_up_args("my-app", &paths, false).contains(&"--pull".to_string()));
+        assert!(!compose_up_args("my-app", &paths, true, false).contains(&"--pull".to_string()));
+        // A rollback neither builds nor pulls.
+        let rollback = compose_up_args("my-app", &paths, false, false);
+        assert!(rollback.ends_with(&["up".into(), "-d".into(), "--remove-orphans".into()]));
+        assert!(!rollback.iter().any(|a| a == "--build" || a == "--pull"));
 
         for args in [clone.to_vec(), fetch.to_vec(), certbot.to_vec()] {
             assert!(!args

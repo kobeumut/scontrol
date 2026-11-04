@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use panel_core::types::{
-    ComposeDomain, ComposeProject, ComposeSource, DeploymentInfo, DeploymentStatus,
+    ComposeDomain, ComposeProject, ComposeSource, DeploymentInfo, DeploymentSnapshot,
+    DeploymentStatus,
 };
 use sqlx::PgPool;
 use std::str::FromStr;
@@ -49,6 +50,8 @@ struct DeploymentRecord {
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
     error_message: Option<String>,
+    rollback_of: Option<Uuid>,
+    rollback_available: bool,
 }
 
 impl DeploymentRecord {
@@ -64,6 +67,8 @@ impl DeploymentRecord {
             started_at: self.started_at,
             finished_at: self.finished_at,
             error_message: self.error_message,
+            rollback_of: self.rollback_of,
+            rollback_available: self.rollback_available,
         })
     }
 }
@@ -100,6 +105,8 @@ pub struct ClaimedDeployment {
     pub id: Uuid,
     pub project_id: Uuid,
     pub pull_images: bool,
+    /// Set for a rollback: the deployment whose release it starts again.
+    pub rollback_of: Option<Uuid>,
 }
 
 pub async fn create(
@@ -204,19 +211,23 @@ pub async fn enqueue_deployment(
     log_path: &str,
     pull_images: bool,
     trigger: &str,
+    rollback_of: Option<Uuid>,
 ) -> anyhow::Result<DeploymentInfo> {
     let mut tx = pool.begin().await?;
     let record = sqlx::query_as!(
         DeploymentRecord,
-        r#"INSERT INTO compose_deployments (id, project_id, status, log_path, pull_images, trigger)
-           VALUES ($1, $2, 'queued', $3, $4, $5)
+        r#"INSERT INTO compose_deployments
+               (id, project_id, status, log_path, pull_images, trigger, rollback_of)
+           VALUES ($1, $2, 'queued', $3, $4, $5, $6)
            RETURNING id, project_id, status, log_path, trigger, commit_sha, queued_at,
-                     started_at, finished_at, error_message"#,
+                     started_at, finished_at, error_message, rollback_of,
+                     (status = 'succeeded' AND snapshot IS NOT NULL AND release_retained) AS "rollback_available!""#,
         id,
         project_id,
         log_path,
         pull_images,
         trigger,
+        rollback_of,
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -255,7 +266,7 @@ pub async fn claim_next_deployment(pool: &PgPool) -> sqlx::Result<Option<Claimed
                LIMIT 1
                FOR UPDATE SKIP LOCKED
            )
-           RETURNING id, project_id, pull_images"#
+           RETURNING id, project_id, pull_images, rollback_of"#
     )
     .fetch_optional(&mut *tx)
     .await?;
@@ -272,7 +283,72 @@ pub async fn claim_next_deployment(pool: &PgPool) -> sqlx::Result<Option<Claimed
         id: row.id,
         project_id: row.project_id,
         pull_images: row.pull_images,
+        rollback_of: row.rollback_of,
     }))
+}
+
+/// Stores the snapshot of a deployment's release (if it recorded one) and
+/// mirrors which releases the agent still keeps, in one transaction.
+pub async fn record_releases(
+    pool: &PgPool,
+    project_id: Uuid,
+    deployment_id: Uuid,
+    snapshot: Option<&DeploymentSnapshot>,
+    retained: &[Uuid],
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    if let Some(snapshot) = snapshot {
+        sqlx::query!(
+            "UPDATE compose_deployments SET snapshot = $1 WHERE id = $2 AND project_id = $3",
+            serde_json::to_value(snapshot)?,
+            deployment_id,
+            project_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query!(
+        r#"UPDATE compose_deployments SET release_retained = (id = ANY($2))
+           WHERE project_id = $1 AND (release_retained OR id = ANY($2))"#,
+        project_id,
+        retained,
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// What a rollback needs from its target deployment.
+pub struct ReleaseRecord {
+    pub status: DeploymentStatus,
+    pub commit_sha: Option<String>,
+    pub snapshot: Option<DeploymentSnapshot>,
+    pub retained: bool,
+}
+
+pub async fn find_release(
+    pool: &PgPool,
+    project_id: Uuid,
+    deployment_id: Uuid,
+) -> anyhow::Result<Option<ReleaseRecord>> {
+    let row = sqlx::query!(
+        r#"SELECT status, commit_sha, snapshot, release_retained
+           FROM compose_deployments WHERE id = $1 AND project_id = $2"#,
+        deployment_id,
+        project_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok(ReleaseRecord {
+            status: DeploymentStatus::from_str(&row.status).map_err(anyhow::Error::msg)?,
+            commit_sha: row.commit_sha,
+            snapshot: row.snapshot.map(serde_json::from_value).transpose()?,
+            retained: row.release_retained,
+        })
+    })
+    .transpose()
 }
 
 /// Records a deployment's result and mirrors it onto the project, unless
@@ -379,7 +455,8 @@ pub async fn find_deployment(
     let record = sqlx::query_as!(
         DeploymentRecord,
         r#"SELECT id, project_id, status, log_path, trigger, commit_sha, queued_at, started_at,
-                  finished_at, error_message
+                  finished_at, error_message, rollback_of,
+                  (status = 'succeeded' AND snapshot IS NOT NULL AND release_retained) AS "rollback_available!"
            FROM compose_deployments WHERE id = $1 AND project_id = $2"#,
         id,
         project_id,
@@ -396,7 +473,8 @@ pub async fn list_deployments(
     let records = sqlx::query_as!(
         DeploymentRecord,
         r#"SELECT id, project_id, status, log_path, trigger, commit_sha, queued_at, started_at,
-                  finished_at, error_message
+                  finished_at, error_message, rollback_of,
+                  (status = 'succeeded' AND snapshot IS NOT NULL AND release_retained) AS "rollback_available!"
            FROM compose_deployments WHERE project_id = $1
            ORDER BY queued_at DESC LIMIT 100"#,
         project_id,
@@ -538,7 +616,8 @@ pub async fn find_queued_deployment(
     let record = sqlx::query_as!(
         DeploymentRecord,
         r#"SELECT id, project_id, status, log_path, trigger, commit_sha, queued_at, started_at,
-                  finished_at, error_message
+                  finished_at, error_message, rollback_of,
+                  (status = 'succeeded' AND snapshot IS NOT NULL AND release_retained) AS "rollback_available!"
            FROM compose_deployments
            WHERE project_id = $1 AND status = 'queued'
            ORDER BY queued_at LIMIT 1"#,

@@ -80,7 +80,7 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Server and container metrics | Agent samples `/proc` and cgroup v2 every 10–30 s, with no process spawn. Kept as a downsampled ring in PostgreSQL. Threshold alerts fire on edge transitions | D4 | ⬜ |
 | Request stats | Nginx JSON `log_format`, read incrementally with offset tracking and aggregated into PostgreSQL | D4 | ⬜ |
 | Docker cleanup | Scheduled `docker image prune` / `builder prune` argv with an `until=` filter; freed space reported | D4 | ⬜ |
-| Rollbacks | Tag each successful build `<slug>/<service>:deploy-<id>` and keep the last N. Rollback = compose up pinned to that tag plus the stored non-secret config snapshot | D5 | ⬜ |
+| Rollbacks | Tag each successful build `<slug>/<service>:deploy-<id>` and keep the last N. Rollback = compose up pinned to that tag plus the stored non-secret config snapshot. Static sites and database services are not rolled back yet | D5 | 🟡 |
 | Preview deployments | PR webhook → `<slug>-pr-<n>` project on a wildcard subdomain, with limit and TTL cleanup, and a PR comment through the GitHub API | D5 | ⬜ |
 | Templates | A vetted catalogue (TOML + Compose) shipped with the panel, using the same validator as user Compose and variable generators in Rust | D5 | ⬜ |
 | Redirects, basic auth, path prefix, custom certs | Typed vhost options: `return 301/302`, `auth_basic_user_file`, `location /prefix/`, certificate files stored 0600 | D5 | ⬜ |

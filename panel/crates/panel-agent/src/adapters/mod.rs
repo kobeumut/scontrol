@@ -23,6 +23,8 @@ pub mod git_auth;
 pub mod mail;
 pub mod nginx;
 pub mod php_fpm;
+#[cfg(feature = "docker")]
+pub mod releases;
 pub mod s3;
 #[cfg(feature = "docker")]
 pub mod scheduled_jobs;

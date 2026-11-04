@@ -107,6 +107,17 @@ export type VariableInput = { key: string; value?: string };
 export type Deployment = {
   id: string; project_id: string; status: DeploymentStatus; trigger: string; commit_sha: string | null;
   queued_at: string; started_at: string | null; finished_at: string | null; error_message: string | null;
+  /** For a rollback: the deployment whose release it started again. */
+  rollback_of?: string | null;
+  /** Succeeded, recorded a release, and the agent still keeps its images. */
+  rollback_available?: boolean;
+};
+
+export type PinnedImage = { service: string; tag: string; image_id: string };
+/** Non-secret record of a deployed release: key names, never values. */
+export type DeploymentSnapshot = {
+  compose_path: string; compose_sha256: string; compose_file: string; override_file: string | null;
+  env_keys: string[]; images: PinnedImage[];
 };
 
 export type ServiceInfo = {

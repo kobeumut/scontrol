@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE compose_deployments SET release_retained = (id = ANY($2))\n           WHERE project_id = $1 AND (release_retained OR id = ANY($2))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "72d45d77188cb5182cfa1ceab11d1e62bfbfb94310bae4592989d60d2a7d703a"
+}

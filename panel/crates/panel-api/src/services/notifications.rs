@@ -272,6 +272,9 @@ impl Notification {
             "Project: {} ({})\nTrigger: {}",
             project.name, project.slug, deployment.trigger
         );
+        if let Some(target) = deployment.rollback_of {
+            body.push_str(&format!("\nRolled back to deployment: {target}"));
+        }
         if let Some(sha) = &deployment.commit_sha {
             body.push_str(&format!("\nCommit: {}", &sha[..sha.len().min(12)]));
         }
@@ -284,7 +287,15 @@ impl Notification {
         }
         Some(Self {
             event,
-            title: format!("Deployment {verb}: {}", project.name),
+            title: format!(
+                "{} {verb}: {}",
+                if deployment.rollback_of.is_some() {
+                    "Rollback"
+                } else {
+                    "Deployment"
+                },
+                project.name
+            ),
             body,
             data: json!({
                 "project": { "id": project.id, "name": project.name, "slug": project.slug },
@@ -293,6 +304,7 @@ impl Notification {
                     "status": deployment.status,
                     "trigger": deployment.trigger,
                     "commit_sha": deployment.commit_sha,
+                    "rollback_of": deployment.rollback_of,
                     "error_message": deployment.error_message,
                     "queued_at": deployment.queued_at,
                     "started_at": deployment.started_at,

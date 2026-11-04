@@ -65,6 +65,11 @@ pub fn list_tool_defs() -> Vec<ToolDef> {
             input_schema: schema_for::<DeployComposeProjectInput>(),
         },
         ToolDef {
+            name: "rollback_compose_project",
+            description: "Queue a rollback of a Compose project to an earlier succeeded deployment whose release is still kept (rollback_available in its deployment list). Starts that deployment's pinned images again with the current environment and domains; nothing is fetched, built, or pulled.",
+            input_schema: schema_for::<RollbackComposeProjectInput>(),
+        },
+        ToolDef {
             name: "compose_deployment_log",
             description: "Read a deployment's log incrementally from a byte offset, plus the deployment status.",
             input_schema: schema_for::<ComposeDeploymentLogInput>(),
@@ -125,6 +130,13 @@ struct ComposeProjectIdInput {
 struct ComposeProjectLogsInput {
     project_id: Uuid,
     tail_lines: Option<u16>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RollbackComposeProjectInput {
+    project_id: Uuid,
+    /// The earlier deployment to roll back to.
+    deployment_id: Uuid,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -331,6 +343,37 @@ pub async fn call_tool(
                 "deploy_compose_project",
                 Some(&project.slug),
                 json!({ "project_id": project.id, "deployment_id": deployment.id }),
+            )
+            .await
+            .ok();
+            Ok(json!({ "deployment": deployment }))
+        }
+        "rollback_compose_project" => {
+            if !is_admin {
+                return Err("only admins may roll back Docker projects via MCP".into());
+            }
+            let input: RollbackComposeProjectInput =
+                serde_json::from_value(arguments).map_err(|e| e.to_string())?;
+            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Compose project not found")?;
+            let deployment = state
+                .deploy_queue
+                .enqueue_rollback(&state.db, &project, input.deployment_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            db::audit::record(
+                &state.db,
+                Some(actor_user_id),
+                "mcp",
+                "rollback_compose_project",
+                Some(&project.slug),
+                json!({
+                    "project_id": project.id,
+                    "deployment_id": deployment.id,
+                    "rollback_of": input.deployment_id,
+                }),
             )
             .await
             .ok();

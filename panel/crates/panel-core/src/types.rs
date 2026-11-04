@@ -338,6 +338,77 @@ pub fn built_image_tag(project_slug: &str) -> String {
     format!("scontrol-app/{project_slug}:latest")
 }
 
+/// Local tag that pins the image one service ran in a deployment, so a
+/// rollback can start exactly that image again:
+/// `<slug>/<service>:deploy-<deployment>`. `None` when the service name is
+/// not a valid lowercase image path component (the release is then not
+/// recorded rather than tagged under a different name).
+pub fn deployment_image_tag(
+    project_slug: &str,
+    service: &str,
+    deployment_id: Uuid,
+) -> Option<String> {
+    static COMPONENT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$").unwrap()
+    });
+    if !validate::is_valid_project_slug(project_slug)
+        || !validate::is_valid_service_name(service)
+        || !COMPONENT_RE.is_match(service)
+    {
+        return None;
+    }
+    let tag = format!("{project_slug}/{service}:deploy-{deployment_id}");
+    validate::is_valid_image_reference(&tag).then_some(tag)
+}
+
+/// One service image pinned by a successful deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PinnedImage {
+    pub service: String,
+    /// [`deployment_image_tag`] of the service in that deployment.
+    pub tag: String,
+    /// Content ID the tag pointed to when it was recorded (`sha256:<hex>`).
+    pub image_id: String,
+}
+
+/// Non-secret record of what a successful deployment ran, stored with its
+/// deployment row and used to roll back to it. It never holds a value of
+/// the environment or any other credential: environment and build-arg
+/// values, inline secret/config content, extension fields, and comments
+/// are dropped from the Compose file, and every known secret value is
+/// masked. A rollback reads the current environment file instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeploymentSnapshot {
+    /// Compose file path relative to the source tree.
+    pub compose_path: String,
+    /// SHA-256 (hex) of the deployed Compose file. The agent's own copy of
+    /// the release must still match it for a rollback to run.
+    pub compose_sha256: String,
+    /// The deployed Compose file, sanitized as described above.
+    pub compose_file: String,
+    /// The generated override (loopback ports for domains), if any.
+    #[serde(default)]
+    pub override_file: Option<String>,
+    /// Names of the environment variables the deployment had.
+    #[serde(default)]
+    pub env_keys: Vec<String>,
+    /// Images pinned per service. Services without a running container
+    /// (one-off tasks) and without a `build` section keep their Compose
+    /// image.
+    #[serde(default)]
+    pub images: Vec<PinnedImage>,
+}
+
+/// The release a rollback deployment starts again. Built by panel-api from
+/// the stored [`DeploymentSnapshot`]; the agent checks it against its own
+/// release record before it runs anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RollbackTarget {
+    pub deployment_id: Uuid,
+    pub compose_sha256: String,
+    pub images: Vec<PinnedImage>,
+}
+
 /// Where an application's container image comes from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -864,6 +935,13 @@ pub struct DeploymentInfo {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
+    /// For a rollback: the deployment whose release it started again.
+    #[serde(default)]
+    pub rollback_of: Option<Uuid>,
+    /// The deployment succeeded, recorded a snapshot, and the agent still
+    /// keeps its pinned images, so it can be rolled back to.
+    #[serde(default)]
+    pub rollback_available: bool,
 }
 
 /// What the agent reports after a successful Compose deployment.
@@ -873,6 +951,14 @@ pub struct ComposeDeployOutcome {
     pub commit_sha: Option<String>,
     /// Non-fatal problems, e.g. a certificate that could not be issued yet.
     pub warnings: Vec<String>,
+    /// The release recorded for this deployment (not for rollbacks, static
+    /// sites, or database services).
+    #[serde(default)]
+    pub snapshot: Option<DeploymentSnapshot>,
+    /// Deployments of the project whose releases the agent still keeps,
+    /// newest first. Older ones were pruned with their image tags.
+    #[serde(default)]
+    pub retained_releases: Vec<Uuid>,
 }
 
 /// An explicit binding from a public domain to one Compose service port.
@@ -1659,5 +1745,24 @@ mod spec_tests {
         assert!(bad.validate().is_err());
         assert_eq!(built_image_tag("shop"), "scontrol-app/shop:latest");
         assert!(validate::is_valid_image_reference(&built_image_tag("shop")));
+    }
+
+    #[test]
+    fn deployment_image_tags_are_valid_references_or_refused() {
+        let id = Uuid::parse_str("0b7c3f1e-8a51-4d0c-9b8e-2f4a6c1d9e70").unwrap();
+        let tag = deployment_image_tag("shop", "web", id).unwrap();
+        assert_eq!(tag, "shop/web:deploy-0b7c3f1e-8a51-4d0c-9b8e-2f4a6c1d9e70");
+        assert!(validate::is_valid_image_reference(&tag));
+        assert!(deployment_image_tag("shop", "api_worker-2", id).is_some());
+        // Not a lowercase image path component, or an invalid slug: refused
+        // rather than tagged under a rewritten name.
+        for service in ["Web", "web.", "-web", "a b", "web:latest", "../x", ""] {
+            assert!(
+                deployment_image_tag("shop", service, id).is_none(),
+                "{service}"
+            );
+        }
+        assert!(deployment_image_tag("Shop", "web", id).is_none());
+        assert!(deployment_image_tag("shop/x", "web", id).is_none());
     }
 }

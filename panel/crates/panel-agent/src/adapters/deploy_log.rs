@@ -31,6 +31,11 @@ pub struct DeployLog {
 }
 
 impl DeployLog {
+    /// The values this log masks, longest first (see [`maskable_secrets`]).
+    pub fn secrets(&self) -> &[String] {
+        &self.secrets
+    }
+
     pub async fn create(
         logs_dir: &Path,
         deployment_id: Uuid,

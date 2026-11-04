@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, project_id, status, log_path, trigger, commit_sha, queued_at, started_at,\n                  finished_at, error_message\n           FROM compose_deployments WHERE project_id = $1\n           ORDER BY queued_at DESC LIMIT 100",
+  "query": "SELECT id, project_id, status, log_path, trigger, commit_sha, queued_at, started_at,\n                  finished_at, error_message, rollback_of,\n                  (status = 'succeeded' AND snapshot IS NOT NULL AND release_retained) AS \"rollback_available!\"\n           FROM compose_deployments\n           WHERE project_id = $1 AND status = 'queued'\n           ORDER BY queued_at LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,16 @@
         "ordinal": 9,
         "name": "error_message",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "rollback_of",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "rollback_available!",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -69,8 +79,10 @@
       false,
       true,
       true,
-      true
+      true,
+      true,
+      null
     ]
   },
-  "hash": "20510412109fa0f1100d4779c96ce74f74749d1589944e2326c9fa0a7390c355"
+  "hash": "62bc3ef3ec993f2c1a95c64523ca5ee5f105b4fdbf872947347c6f7a2c2b116e"
 }

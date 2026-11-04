@@ -206,6 +206,7 @@ letsencrypt_live_dir = "/etc/letsencrypt/live"
 deploy_timeout_secs = 1800
 deployment_log_max_bytes = 5242880
 deployment_logs_retained = 20
+rollback_releases_retained = 5
 static_sites_root = "/srv/scontrol/static"
 nginx_stream_dir = "/etc/nginx/scontrol-stream"
 railpack_frontend = "ghcr.io/railwayapp/railpack-frontend:v${RAILPACK_VERSION}"
