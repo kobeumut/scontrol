@@ -127,6 +127,13 @@ impl DeployQueue {
         .await
     }
 
+    /// Wakes idle workers after a job was queued in a caller's transaction
+    /// ([`db::compose_projects::enqueue_deployment_in`]), once it committed.
+    pub fn notify(&self) {
+        self.wake.notify_waiters();
+        self.wake.notify_one();
+    }
+
     async fn enqueue_job(
         &self,
         db: &PgPool,

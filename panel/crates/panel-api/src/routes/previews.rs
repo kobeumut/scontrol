@@ -630,6 +630,158 @@ mod tests {
             .is_empty());
     }
 
+    /// Close racing with queueing and claiming (review of PR #12): a
+    /// closing preview's jobs are never claimed, a job claimed before the
+    /// close is cancelled and waited out, and a transition blocked behind a
+    /// close queues nothing.
+    #[tokio::test]
+    async fn closing_previews_never_start_a_deployment() {
+        let _guard = test_support::QUEUE_TESTS.lock().await;
+        let (state, adapter, router, _cookie, project, secret, _slug) = setup().await;
+        let pool = state.db.clone();
+        let count_jobs = |status: &'static str, project_id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM compose_deployments WHERE project_id = $1 AND status = $2",
+                )
+                .bind(project_id)
+                .bind(status)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        // 1. A job queued for a closing preview (e.g. through the manual
+        //    deploy endpoint) is never claimed, and teardown cancels it.
+        let (_, opened) = deliver(&router, project, &secret, pr_event("opened", 7, 1)).await;
+        assert_eq!(opened["created"], true, "{opened}");
+        let first = db::previews::find_by_pr(&pool, project, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        db::previews::mark_closing(&pool, first.id, "closed")
+            .await
+            .unwrap();
+        let claimed =
+            db::compose_projects::claim_next_deployment_of(&pool, Some(first.preview_project_id))
+                .await
+                .unwrap();
+        assert!(claimed.is_none(), "a closing preview's job was claimed");
+        assert!(
+            preview_service::teardown(&pool, adapter.as_ref(), &state.previews, &first)
+                .await
+                .unwrap()
+        );
+        assert!(db::previews::find_by_pr(&pool, project, 7)
+            .await
+            .unwrap()
+            .is_none());
+
+        // 2. A job claimed before the close keeps the preview until it stops.
+        let (_, opened) = deliver(&router, project, &secret, pr_event("opened", 8, 1)).await;
+        assert_eq!(opened["created"], true, "{opened}");
+        let second = db::previews::find_by_pr(&pool, project, 8)
+            .await
+            .unwrap()
+            .unwrap();
+        let claimed =
+            db::compose_projects::claim_next_deployment_of(&pool, Some(second.preview_project_id))
+                .await
+                .unwrap()
+                .expect("the preview job is claimable while active");
+        assert_eq!(claimed.project_id, second.preview_project_id);
+        db::previews::mark_closing(&pool, second.id, "closed")
+            .await
+            .unwrap();
+        let row = db::previews::find_by_pr(&pool, project, 8)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !preview_service::teardown(&pool, adapter.as_ref(), &state.previews, &row)
+                .await
+                .unwrap()
+        );
+        assert!(adapter
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "cancel_deployment"));
+        db::compose_projects::finish_deployment(
+            &pool,
+            claimed.id,
+            panel_core::types::DeploymentStatus::Cancelled,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            preview_service::teardown(&pool, adapter.as_ref(), &state.previews, &row)
+                .await
+                .unwrap()
+        );
+
+        // 3. A push that arrives while a close holds the parent lock waits
+        //    for it, sees `closing`, and queues nothing.
+        let (_, opened) = deliver(&router, project, &secret, pr_event("opened", 9, 1)).await;
+        assert_eq!(opened["created"], true, "{opened}");
+        let third = db::previews::find_by_pr(&pool, project, 9)
+            .await
+            .unwrap()
+            .unwrap();
+        let job: Uuid = opened["deployment"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        db::compose_projects::finish_deployment(
+            &pool,
+            job,
+            panel_core::types::DeploymentStatus::Succeeded,
+            None,
+            Some(SHA),
+        )
+        .await
+        .unwrap();
+        let mut close = pool.begin().await.unwrap();
+        db::previews::lock_parent(&mut close, project)
+            .await
+            .unwrap();
+        let push = {
+            let (router, secret) = (router.clone(), secret.clone());
+            tokio::spawn(async move {
+                deliver(&router, project, &secret, pr_event("synchronize", 9, 1)).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !push.is_finished(),
+            "the push did not wait for the parent lock"
+        );
+        sqlx::query("UPDATE preview_deployments SET status = 'closing', close_reason = 'closed' WHERE id = $1")
+            .bind(third.id)
+            .execute(&mut *close)
+            .await
+            .unwrap();
+        close.commit().await.unwrap();
+        let (status, pushed) = push.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{pushed}");
+        assert!(pushed.get("deployment").is_none(), "{pushed}");
+        assert_eq!(count_jobs("queued", third.preview_project_id).await, 0);
+        assert_eq!(count_jobs("running", third.preview_project_id).await, 0);
+
+        preview_service::close_all(&pool, adapter.as_ref(), &state.previews, project, "removed")
+            .await
+            .unwrap();
+        assert!(db::previews::list_for_parent(&pool, project)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn ttl_sweep_expires_idle_previews_only() {
         let _guard = test_support::QUEUE_TESTS.lock().await;

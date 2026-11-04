@@ -42,7 +42,9 @@ use panel_core::error::CoreError;
 use panel_core::previews::{
     self, is_expired, PrProvider, PreviewPlan, PreviewStatus, PullRequestEvent, ResourceLimits,
 };
-use panel_core::types::{validate, ApplicationBuild, ComposeProject, ComposeSource};
+use panel_core::types::{
+    validate, ApplicationBuild, ComposeProject, ComposeSource, DeploymentInfo,
+};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::str::FromStr;
@@ -659,6 +661,30 @@ pub async fn handle_event(
         }
         _ => None,
     };
+    // The job is queued in the transition's transaction, under the parent
+    // lock: a concurrent close either sees it (and cancels it) or makes
+    // this transition see `closing` and queue nothing.
+    let mut queued: Option<(DeploymentInfo, bool)> = None;
+    if matches!(plan, PreviewPlan::Create | PreviewPlan::Redeploy) {
+        let project_id = preview_project.expect("set for create and redeploy");
+        let pending = if plan == PreviewPlan::Redeploy {
+            db::compose_projects::find_queued_deployment_in(&mut tx, project_id).await?
+        } else {
+            None
+        };
+        queued = Some(match pending {
+            Some(existing) => (existing, true),
+            None => {
+                let id = Uuid::new_v4();
+                let log_path = format!("agent://compose/{slug}/logs/{id}.log");
+                let info = db::compose_projects::enqueue_deployment_in(
+                    &mut tx, id, project_id, &log_path, false, "preview", None,
+                )
+                .await?;
+                (info, false)
+            }
+        });
+    }
     tx.commit().await?;
 
     let audit = |action: &'static str, extra: Value| {
@@ -683,16 +709,11 @@ pub async fn handle_event(
         PreviewPlan::Create | PreviewPlan::Redeploy => {
             let project_id = preview_project.expect("set for create and redeploy");
             let created = plan == PreviewPlan::Create;
-            if !created {
-                if let Some(queued) =
-                    db::compose_projects::find_queued_deployment(db, project_id).await?
-                {
-                    return Ok(json!({ "preview": slug, "coalesced": true, "deployment": queued }));
-                }
+            let (deployment, coalesced) = queued.expect("queued for create and redeploy");
+            if coalesced {
+                return Ok(json!({ "preview": slug, "coalesced": true, "deployment": deployment }));
             }
-            let deployment = queue
-                .enqueue(db, project_id, &slug, false, "preview")
-                .await?;
+            queue.notify();
             audit(
                 if created {
                     "create_preview"
@@ -780,19 +801,35 @@ pub async fn teardown(
     previews: &Previews,
     row: &PreviewRow,
 ) -> ApiResult<bool> {
+    // Under the claim lock: a worker either claimed a job before this (it is
+    // `running` here and gets cancelled) or can no longer claim one (queued
+    // jobs are cancelled and the claim skips closing previews).
+    let mut tx = db.begin().await?;
+    db::compose_projects::lock_deploy_claims(&mut tx).await?;
+    let still_closing: Option<String> =
+        sqlx::query_scalar("SELECT status FROM preview_deployments WHERE id = $1")
+            .bind(row.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if still_closing.as_deref() != Some("closing") {
+        // Already removed (row gone) by a concurrent teardown.
+        tx.commit().await?;
+        return Ok(still_closing.is_none());
+    }
     sqlx::query(
         "UPDATE compose_deployments SET status = 'cancelled', finished_at = now() \
          WHERE project_id = $1 AND status = 'queued'",
     )
     .bind(row.preview_project_id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
     let running: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM compose_deployments WHERE project_id = $1 AND status = 'running' LIMIT 1",
     )
     .bind(row.preview_project_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     if let Some(deployment_id) = running {
         agent
             .cancel_deployment(CancelDeploymentParams { deployment_id })
