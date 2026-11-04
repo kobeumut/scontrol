@@ -93,6 +93,27 @@ pub struct AgentConfig {
     #[serde(default = "default_nginx_stream_dir")]
     pub nginx_stream_dir: PathBuf,
 
+    /// Seconds between metrics samples, clamped to 10–30.
+    #[serde(default = "default_metrics_interval_secs")]
+    pub metrics_interval_secs: u64,
+
+    /// `/proc` as the metrics sampler reads it (overridable for tests).
+    #[serde(default = "default_metrics_proc_root")]
+    pub metrics_proc_root: PathBuf,
+
+    /// `/sys/block`: block devices listed here are whole disks.
+    #[serde(default = "default_metrics_sys_block_dir")]
+    pub metrics_sys_block_dir: PathBuf,
+
+    /// The cgroup v2 mount, holding container `docker-<id>.scope` groups.
+    #[serde(default = "default_cgroup_root")]
+    pub cgroup_root: PathBuf,
+
+    /// Docker's data root; Compose labels are read from
+    /// `<root>/containers/<id>/config.v2.json`.
+    #[serde(default = "default_docker_data_root")]
+    pub docker_data_root: PathBuf,
+
     #[serde(default)]
     pub runtime_features: RuntimeFeatures,
 
@@ -189,6 +210,26 @@ fn default_nginx_stream_dir() -> PathBuf {
     PathBuf::from("/etc/nginx/scontrol-stream")
 }
 
+fn default_metrics_interval_secs() -> u64 {
+    panel_core::metrics::DEFAULT_SAMPLE_INTERVAL_SECS
+}
+
+fn default_metrics_proc_root() -> PathBuf {
+    PathBuf::from("/proc")
+}
+
+fn default_metrics_sys_block_dir() -> PathBuf {
+    PathBuf::from("/sys/block")
+}
+
+fn default_cgroup_root() -> PathBuf {
+    PathBuf::from("/sys/fs/cgroup")
+}
+
+fn default_docker_data_root() -> PathBuf {
+    PathBuf::from("/var/lib/docker")
+}
+
 fn default_railpack_frontend() -> String {
     "ghcr.io/railwayapp/railpack-frontend:v0.43.0".into()
 }
@@ -216,6 +257,11 @@ impl Default for AgentConfig {
             railpack_frontend: default_railpack_frontend(),
             buildpacks_builder: default_buildpacks_builder(),
             nginx_stream_dir: default_nginx_stream_dir(),
+            metrics_interval_secs: default_metrics_interval_secs(),
+            metrics_proc_root: default_metrics_proc_root(),
+            metrics_sys_block_dir: default_metrics_sys_block_dir(),
+            cgroup_root: default_cgroup_root(),
+            docker_data_root: default_docker_data_root(),
             runtime_features: RuntimeFeatures {
                 docker: true,
                 mail: true,

@@ -606,6 +606,11 @@ pub trait AdapterPort: Send + Sync {
     async fn restore_database(&self, params: RestoreDatabaseParams) -> CoreResult<()>;
     async fn backup_volume(&self, params: BackupVolumeParams) -> CoreResult<BackupOutcome>;
     async fn restore_volume(&self, params: RestoreVolumeParams) -> CoreResult<()>;
+
+    // Observability: the agent samples `/proc` and cgroup v2 in-process.
+    /// The sampler's latest snapshot; `None` until it has two readings to
+    /// compute rates from.
+    async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>>;
 }
 
 #[cfg(feature = "test-utils")]
@@ -632,6 +637,8 @@ pub mod mock {
         /// Runs `list_scheduled_job_runs` reports (filtered by job and
         /// `since`), so tests can simulate timer runs.
         pub job_runs: Mutex<Vec<JobRunInfo>>,
+        /// What `metrics_snapshot` returns, so tests can drive the collector.
+        pub metrics: Mutex<Option<crate::metrics::MetricsSnapshot>>,
     }
 
     impl MockAdapter {
@@ -993,6 +1000,11 @@ pub mod mock {
 
         async fn restore_volume(&self, _params: RestoreVolumeParams) -> CoreResult<()> {
             self.record("restore_volume")
+        }
+
+        async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>> {
+            self.record("metrics_snapshot")?;
+            Ok(self.metrics.lock().unwrap().clone())
         }
     }
 }

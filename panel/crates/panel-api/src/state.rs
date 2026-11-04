@@ -2,6 +2,7 @@ use crate::auth::session::CookieCipher;
 use crate::config::ApiConfig;
 use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
+use crate::services::metrics::MetricsCollector;
 use crate::services::notifications::Notifier;
 use crate::services::scheduled_jobs::JobRunCollector;
 use crate::services::secret_box::SecretBox;
@@ -25,6 +26,8 @@ pub struct AppState {
     pub github_apps: GitHubApps,
     /// Copies scheduled-job runs from the agent (see `services::scheduled_jobs`).
     pub job_runs: JobRunCollector,
+    /// Stores agent metrics and evaluates alerts (see `services::metrics`).
+    pub metrics: MetricsCollector,
 }
 
 impl AppState {
@@ -40,6 +43,7 @@ impl AppState {
             secret_box: SecretBox::derive(&config.secret_key),
             github_apps: GitHubApps::new(SecretBox::derive(&config.secret_key)),
             job_runs: JobRunCollector::new(),
+            metrics: MetricsCollector::new(),
         }
     }
 }

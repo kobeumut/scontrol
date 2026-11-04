@@ -4,6 +4,7 @@ import { api, ApiError, Capability, Site, useApi, User } from './api';
 import { ComposeProjects } from './ComposeProjects';
 import { Databases } from './Databases';
 import { GitHubApps } from './GitHubApps';
+import { Monitoring } from './Monitoring';
 import { Notifications } from './Notifications';
 import { Projects } from './Projects';
 import { Backups } from './Backups';
@@ -55,7 +56,7 @@ function Sites() {
 function App() {
   const health = useApi<{ status: string; capabilities?: Capability }>('/health/agent', 30000);
   const me = useApi<User>('/auth/me');
-  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications'>('projects');
+  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications' | 'monitoring'>('projects');
   const docker = health.data?.capabilities?.docker;
 
   const signOut = async () => {
@@ -88,11 +89,13 @@ function App() {
           <button className={active === 'databases' ? 'selected' : ''} onClick={() => setActive('databases')}>Databases</button>
           <button className={active === 'backups' ? 'selected' : ''} onClick={() => setActive('backups')}>Backups</button>
           <button className={active === 'registries' ? 'selected' : ''} onClick={() => setActive('registries')}>Registries</button>
+          <button className={active === 'monitoring' ? 'selected' : ''} onClick={() => setActive('monitoring')}>Monitoring</button>
           <button className={active === 'sites' ? 'selected' : ''} onClick={() => setActive('sites')}>Hosted sites</button>
           <button className={active === 'github' ? 'selected' : ''} onClick={() => setActive('github')}>GitHub Apps</button>
           <button className={active === 'notifications' ? 'selected' : ''} onClick={() => setActive('notifications')}>Notifications</button>
         </nav>
         {active === 'sites' ? <Sites />
+          : active === 'monitoring' ? <Monitoring docker={docker !== false} />
           : active === 'notifications' ? <Notifications />
             : active === 'github' ? <GitHubApps />
             : active === 'backups' ? <Backups docker={docker !== false} />

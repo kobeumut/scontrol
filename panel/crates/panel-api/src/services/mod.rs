@@ -3,6 +3,7 @@ pub mod database_services;
 pub mod deploy_queue;
 pub mod env_layers;
 pub mod github_app;
+pub mod metrics;
 pub mod notifications;
 pub mod registries;
 pub mod scheduled_jobs;

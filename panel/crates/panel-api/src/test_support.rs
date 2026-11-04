@@ -5,6 +5,7 @@ use crate::auth::session::{self, CookieCipher};
 use crate::db;
 use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
+use crate::services::metrics::MetricsCollector;
 use crate::services::notifications::Notifier;
 use crate::services::scheduled_jobs::JobRunCollector;
 use crate::services::secret_box::SecretBox;
@@ -58,6 +59,7 @@ pub fn app_state(pool: PgPool, adapter: Arc<MockAdapter>) -> AppState {
         secret_box: SecretBox::derive(&key),
         github_apps: github_apps(),
         job_runs: JobRunCollector::new(),
+        metrics: MetricsCollector::new(),
     }
 }
 
@@ -117,4 +119,58 @@ pub async fn http_receiver() -> (String, tokio::sync::mpsc::Receiver<(String, St
         }
     });
     (url, rx)
+}
+
+/// Metrics tests share the global metric tables, so they run one at a time.
+pub static METRICS_TESTS: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+/// Empties the metric tables and restores default alert settings.
+pub async fn reset_metrics(pool: &PgPool) {
+    for statement in [
+        "DELETE FROM server_metrics",
+        "DELETE FROM container_metrics",
+        "DELETE FROM metric_alert_state",
+        "UPDATE metric_alert_settings SET enabled = TRUE, cpu_pct = 85, memory_pct = 85, \
+         disk_pct = 85, container_memory_pct = 90, hysteresis_pct = 5, trigger_samples = 3, \
+         clear_samples = 3",
+    ] {
+        sqlx::query(statement).execute(pool).await.unwrap();
+    }
+}
+
+/// A bare Compose project row (with its project and environment); returns
+/// `(id, slug)`.
+pub async fn compose_project(pool: &PgPool) -> (Uuid, String) {
+    let owner = user(pool, true).await;
+    let suffix = &Uuid::new_v4().simple().to_string()[..10];
+    let (project_id, environment_id, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let slug = format!("m-{suffix}");
+    sqlx::query("INSERT INTO projects (id, name, slug, owner_user_id) VALUES ($1, $2, $2, $3)")
+        .bind(project_id)
+        .bind(&slug)
+        .bind(owner.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO environments (id, project_id, name, slug) VALUES ($1, $2, 'production', 'production')",
+    )
+    .bind(environment_id)
+    .bind(project_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO compose_projects (id, name, slug, owner_user_id, source, environment_id) \
+         VALUES ($1, $2, $2, $3, '{\"kind\":\"raw\",\"compose_yaml\":\"services: {}\"}', $4)",
+    )
+    .bind(id)
+    .bind(&slug)
+    .bind(owner.id)
+    .bind(environment_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    (id, slug)
 }

@@ -1,4 +1,4 @@
-//! Deployment and scheduled-job notifications: Slack, Discord, Telegram,
+//! Deployment, scheduled-job, and metric-alert notifications: Slack, Discord, Telegram,
 //! ntfy, Gotify, a generic signed webhook, and SMTP.
 //!
 //! Each channel has non-secret settings (`ChannelConfig`, stored as JSON)
@@ -29,6 +29,8 @@ pub const EVENTS: &[&str] = &[
     "deploy_failed",
     "deploy_cancelled",
     "job_failed",
+    "metric_alert",
+    "metric_resolved",
 ];
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -405,6 +407,27 @@ impl Notifier {
             {
                 tracing::warn!(%deployment_id, %error, "deployment notification failed");
             }
+        });
+    }
+
+    /// Sends `notification` to every channel subscribed to its event, in
+    /// the background. Never fails the caller.
+    pub fn broadcast(&self, db: PgPool, notification: Notification) {
+        let notifier = self.clone();
+        tokio::spawn(async move {
+            let channels = match db::notifications::list_for_event(&db, notification.event).await {
+                Ok(channels) => channels,
+                Err(error) => {
+                    tracing::warn!(event = notification.event, %error, "notification lookup failed");
+                    return;
+                }
+            };
+            futures::future::join_all(
+                channels
+                    .iter()
+                    .map(|channel| notifier.deliver_and_record(&db, channel, &notification)),
+            )
+            .await;
         });
     }
 

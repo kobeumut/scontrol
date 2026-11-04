@@ -57,3 +57,13 @@ td.actions{white-space:nowrap}td.actions .link{margin-left:10px}td.actions .link
 .calendar-line{display:block}
 .modal-backdrop{position:fixed;inset:0;background:rgba(24,32,28,.45);display:flex;align-items:flex-start;justify-content:center;padding:48px 16px;overflow:auto;z-index:10}
 .modal{background:var(--paper);border:1px solid var(--ink);width:min(960px,100%);padding:20px 22px 24px}.modal table{margin-top:6px}
+/* Monitoring: stat tiles, line charts with crosshair tooltip, alert form. */
+.stat-row{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);margin:8px 0}.stat{padding:14px 16px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:4px}.stat:last-child{border-right:0}
+.stat span{font:11px 'DM Mono',monospace;text-transform:uppercase;color:var(--muted)}.stat strong{font-size:26px;letter-spacing:-1px;font-weight:700}.stat small{font-size:12px;color:var(--muted)}
+.chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:8px 0 14px}
+.chart{position:relative;margin:0;border:1px solid var(--line);background:#f7f6f0;padding:10px 10px 4px}.chart figcaption{display:flex;justify-content:space-between;gap:8px;font:11px 'DM Mono',monospace;text-transform:uppercase;color:var(--ink);margin-bottom:4px}
+.chart svg{display:block;width:100%;height:auto;overflow:visible}.chart .grid{stroke:var(--line);stroke-width:1;opacity:.6}.chart .axis{font:9px 'DM Mono',monospace;fill:var(--muted)}.chart .crosshair{stroke:var(--ink);stroke-width:1;opacity:.4}.chart .end-label{font:9px 'DM Mono',monospace;fill:var(--ink);paint-order:stroke;stroke:#f7f6f0;stroke-width:3px}
+.legend{display:flex;gap:12px;color:var(--muted)}.legend i{display:inline-block;width:16px;border-top:2px solid;margin-right:5px;vertical-align:middle}.legend i.dashed{border-top-style:dashed}
+.chart-tip{position:absolute;top:30px;transform:translateX(-50%);background:var(--ink);color:var(--paper);font:11px/1.5 'DM Mono',monospace;padding:6px 8px;pointer-events:none;white-space:nowrap;z-index:2}.chart-tip .muted{color:#b9c0b4}.chart-tip i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+table.compact td{padding:9px 10px}.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}label.inline{flex-direction:row;align-items:center;gap:8px}label.inline select{width:auto}
+@media(max-width:680px){.stat-row,.chart-grid,.grid4{grid-template-columns:1fr 1fr}.stat{border-bottom:1px solid var(--line)}}
