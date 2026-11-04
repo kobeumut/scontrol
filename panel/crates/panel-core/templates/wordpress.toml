@@ -1,0 +1,18 @@
+id = "wordpress"
+name = "WordPress"
+description = "WordPress with a dedicated MariaDB database."
+category = "cms"
+compose = "wordpress.yml"
+suggested_domain = { service = "wordpress", port = 80 }
+
+[[variables]]
+name = "DB_ROOT_PASSWORD"
+label = "Database root password"
+generator = "password"
+length = 32
+
+[[variables]]
+name = "DB_PASSWORD"
+label = "Database password"
+generator = "password"
+length = 32

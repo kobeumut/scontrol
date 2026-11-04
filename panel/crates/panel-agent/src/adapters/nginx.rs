@@ -6,6 +6,8 @@ use super::exec::run;
 use crate::config::AgentConfig;
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::Runtime;
+#[cfg(feature = "docker")]
+use panel_core::vhost::{Redirect, VhostOptions};
 
 /// Deterministic local TCP port for a proxied (Node.js/Python) site, derived
 /// from the domain so restarts / re-provisioning are idempotent.
@@ -141,10 +143,25 @@ fn compose_vhost_name(domain: &str) -> String {
 }
 
 #[cfg(feature = "docker")]
-fn render_proxy_location(host_port: u16) -> String {
+fn render_proxy_location(host_port: u16, options: &VhostOptions, dir: &std::path::Path) -> String {
+    let auth = render_auth(options, dir);
+    let (location, upstream_path, extra) = match &options.path_prefix {
+        // `proxy_pass` with a URI part replaces the matched prefix, so the
+        // container sees the app at `/`.
+        Some(prefix) => (
+            prefix.clone(),
+            "/",
+            format!(
+                "    location = {} {{\n        return 301 {prefix};\n    }}\n\n",
+                prefix.trim_end_matches('/')
+            ),
+        ),
+        None => ("/".to_string(), "", String::new()),
+    };
     format!(
-        "    location / {{\n\
-        proxy_pass http://127.0.0.1:{host_port};\n\
+        "{extra}    location {location} {{\n\
+{auth}\
+        proxy_pass http://127.0.0.1:{host_port}{upstream_path};\n\
         proxy_http_version 1.1;\n\
         proxy_set_header Upgrade $http_upgrade;\n\
         proxy_set_header Connection \"upgrade\";\n\
@@ -156,6 +173,38 @@ fn render_proxy_location(host_port: u16) -> String {
         client_max_body_size 64m;\n\
     }}\n"
     )
+}
+
+/// `auth_basic` lines for a location block (empty without basic auth). The
+/// user file is the agent-written 0600 `htpasswd` of the domain.
+#[cfg(feature = "docker")]
+fn render_auth(options: &VhostOptions, dir: &std::path::Path) -> String {
+    if !options.basic_auth {
+        return String::new();
+    }
+    format!(
+        "        auth_basic \"Restricted\";\n        auth_basic_user_file {};\n",
+        dir.join("htpasswd").to_string_lossy()
+    )
+}
+
+/// The `return 301/302` of a redirect option. The target was validated by
+/// `VhostOptions::validate` and is re-checked here, since it is spliced into
+/// a config file.
+#[cfg(feature = "docker")]
+fn render_redirect(redirect: &Redirect) -> String {
+    if !panel_core::vhost::is_valid_redirect_target(&redirect.target)
+        || !matches!(redirect.status, 301 | 302)
+    {
+        return "    return 500;\n".into();
+    }
+    let status = redirect.status;
+    if redirect.preserve_path {
+        let base = redirect.target.trim_end_matches('/');
+        format!("    return {status} {base}$request_uri;\n")
+    } else {
+        format!("    return {status} {};\n", redirect.target)
+    }
 }
 
 /// What a project domain serves: a loopback port published by a container,
@@ -173,10 +222,13 @@ pub enum VhostTarget<'a> {
 
 #[cfg(feature = "docker")]
 impl VhostTarget<'_> {
-    fn render(&self) -> String {
+    fn render(&self, options: &VhostOptions, dir: &std::path::Path) -> String {
+        if let Some(redirect) = &options.redirect {
+            return render_redirect(redirect);
+        }
         match self {
-            VhostTarget::Proxy(port) => render_proxy_location(*port),
-            VhostTarget::Static { root, spa } => render_static_location(root, *spa),
+            VhostTarget::Proxy(port) => render_proxy_location(*port, options, dir),
+            VhostTarget::Static { root, spa } => render_static_location(root, *spa, options, dir),
         }
     }
 }
@@ -185,7 +237,13 @@ impl VhostTarget<'_> {
 /// (the publisher copies none, so this is defence in depth), dotfiles are
 /// hidden, and nothing is executed.
 #[cfg(feature = "docker")]
-fn render_static_location(root: &std::path::Path, spa: bool) -> String {
+fn render_static_location(
+    root: &std::path::Path,
+    spa: bool,
+    options: &VhostOptions,
+    dir: &std::path::Path,
+) -> String {
+    let auth = render_auth(options, dir);
     let fallback = if spa { "/index.html" } else { "=404" };
     format!(
         "    root {root};\n\
@@ -198,6 +256,7 @@ fn render_static_location(root: &std::path::Path, spa: bool) -> String {
     }}\n\
 \n\
     location / {{\n\
+{auth}\
         try_files $uri $uri/ {fallback};\n\
     }}\n",
         root = root.to_string_lossy(),
@@ -214,12 +273,14 @@ pub fn render_compose_vhost(
     domain: &str,
     target: &VhostTarget<'_>,
     tls: bool,
+    options: &VhostOptions,
+    secrets_dir: &std::path::Path,
 ) -> String {
     let acme_root = cfg.acme_webroot.to_string_lossy();
     let http_body = if tls {
         "    location / {\n        return 301 https://$host$request_uri;\n    }\n".to_string()
     } else {
-        target.render()
+        target.render(options, secrets_dir)
     };
     let mut out = format!(
         "# Managed by scontrol for Compose project {project_slug}. Do not edit by hand.\n\
@@ -236,8 +297,13 @@ server {{\n\
 {http_body}}}\n"
     );
     if tls {
-        let live = cfg.letsencrypt_live_dir.join(domain);
-        let body = target.render();
+        let (cert, key) = if options.custom_cert {
+            (secrets_dir.join("cert.pem"), secrets_dir.join("key.pem"))
+        } else {
+            let live = cfg.letsencrypt_live_dir.join(domain);
+            (live.join("fullchain.pem"), live.join("privkey.pem"))
+        };
+        let body = target.render(options, secrets_dir);
         out.push_str(&format!(
             "\nserver {{\n\
     listen 443 ssl http2;\n\
@@ -249,11 +315,27 @@ server {{\n\
     ssl_session_cache shared:scontrol_ssl:10m;\n\
 \n\
 {body}}}\n",
-            cert = live.join("fullchain.pem").to_string_lossy(),
-            key = live.join("privkey.pem").to_string_lossy(),
+            cert = cert.to_string_lossy(),
+            key = key.to_string_lossy(),
         ));
     }
     out
+}
+
+/// Whether the domain can serve TLS: its uploaded certificate files exist,
+/// or certbot has a live certificate.
+#[cfg(feature = "docker")]
+pub fn certificate_available(
+    cfg: &AgentConfig,
+    domain: &str,
+    options: &VhostOptions,
+    secrets_dir: &std::path::Path,
+) -> bool {
+    if options.custom_cert {
+        secrets_dir.join("cert.pem").is_file() && secrets_dir.join("key.pem").is_file()
+    } else {
+        certificate_exists(cfg, domain)
+    }
 }
 
 /// Whether certbot has a live certificate for `domain`.
@@ -347,14 +429,31 @@ mod tests {
     #[test]
     fn compose_vhost_proxies_to_loopback_and_serves_acme() {
         let cfg = AgentConfig::default();
+        let dir = std::path::Path::new("/var/lib/scontrol/docker/shop/vhost/shop.example.com");
         let target = VhostTarget::Proxy(40001);
-        let plain = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, false);
+        let plain = render_compose_vhost(
+            &cfg,
+            "shop",
+            "shop.example.com",
+            &target,
+            false,
+            &VhostOptions::default(),
+            dir,
+        );
         assert!(plain.contains("server_name shop.example.com;"));
         assert!(plain.contains("proxy_pass http://127.0.0.1:40001;"));
         assert!(plain.contains("location ^~ /.well-known/acme-challenge/"));
         assert!(!plain.contains("listen 443"));
 
-        let tls = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, true);
+        let tls = render_compose_vhost(
+            &cfg,
+            "shop",
+            "shop.example.com",
+            &target,
+            true,
+            &VhostOptions::default(),
+            dir,
+        );
         assert!(tls.contains("return 301 https://$host$request_uri;"));
         assert!(tls.contains("/etc/letsencrypt/live/shop.example.com/fullchain.pem"));
         assert_eq!(tls.matches("proxy_pass").count(), 1);
@@ -364,9 +463,18 @@ mod tests {
     #[test]
     fn static_vhost_serves_the_release_without_symlinks_or_dotfiles() {
         let cfg = AgentConfig::default();
+        let dir = std::path::Path::new("/var/lib/scontrol/docker/shop/vhost/shop.example.com");
         let root = std::path::Path::new("/var/lib/scontrol/static/site/releases/abc");
         let spa = VhostTarget::Static { root, spa: true };
-        let plain = render_compose_vhost(&cfg, "site", "site.example.com", &spa, false);
+        let plain = render_compose_vhost(
+            &cfg,
+            "site",
+            "site.example.com",
+            &spa,
+            false,
+            &VhostOptions::default(),
+            dir,
+        );
         assert!(plain.contains("root /var/lib/scontrol/static/site/releases/abc;"));
         assert!(plain.contains("disable_symlinks on;"));
         assert!(plain.contains("location ~ /\\. {"));
@@ -374,9 +482,100 @@ mod tests {
         assert!(plain.contains("location ^~ /.well-known/acme-challenge/"));
         assert!(!plain.contains("proxy_pass"));
         let files = VhostTarget::Static { root, spa: false };
-        let tls = render_compose_vhost(&cfg, "site", "site.example.com", &files, true);
+        let tls = render_compose_vhost(
+            &cfg,
+            "site",
+            "site.example.com",
+            &files,
+            true,
+            &VhostOptions::default(),
+            dir,
+        );
         assert!(tls.contains("try_files $uri $uri/ =404;"));
         assert_eq!(tls.matches("root /var/lib/scontrol/static").count(), 1);
         assert!(tls.contains("listen 443 ssl http2;"));
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn vhost_options_render_redirect_auth_prefix_and_custom_cert() {
+        let cfg = AgentConfig::default();
+        let dir = std::path::Path::new("/var/lib/scontrol/docker/shop/vhost/shop.example.com");
+        let target = VhostTarget::Proxy(40001);
+
+        let redirect = VhostOptions {
+            redirect: Some(Redirect {
+                status: 302,
+                target: "https://new.example.com/".into(),
+                preserve_path: true,
+            }),
+            ..Default::default()
+        };
+        let out = render_compose_vhost(
+            &cfg,
+            "shop",
+            "shop.example.com",
+            &target,
+            false,
+            &redirect,
+            dir,
+        );
+        assert!(out.contains("return 302 https://new.example.com$request_uri;"));
+        assert!(!out.contains("proxy_pass"));
+        let plain = VhostOptions {
+            redirect: Some(Redirect {
+                status: 301,
+                target: "https://x.example.com/a".into(),
+                preserve_path: false,
+            }),
+            ..Default::default()
+        };
+        let out = render_compose_vhost(
+            &cfg,
+            "shop",
+            "shop.example.com",
+            &target,
+            false,
+            &plain,
+            dir,
+        );
+        assert!(out.contains("return 301 https://x.example.com/a;"));
+
+        // A target that bypassed validation never reaches the file.
+        let evil = VhostOptions {
+            redirect: Some(Redirect {
+                status: 301,
+                target: "https://a.com;\n}".into(),
+                preserve_path: false,
+            }),
+            ..Default::default()
+        };
+        let out =
+            render_compose_vhost(&cfg, "shop", "shop.example.com", &target, false, &evil, dir);
+        assert!(out.contains("return 500;") && !out.contains("a.com"));
+
+        let auth = VhostOptions {
+            basic_auth: true,
+            path_prefix: Some("/admin/".into()),
+            ..Default::default()
+        };
+        let out =
+            render_compose_vhost(&cfg, "shop", "shop.example.com", &target, false, &auth, dir);
+        assert!(out.contains("location /admin/ {"));
+        assert!(out.contains("proxy_pass http://127.0.0.1:40001/;"));
+        assert!(out.contains("location = /admin {"));
+        assert!(out.contains(&format!("auth_basic_user_file {}/htpasswd;", dir.display())));
+        // The ACME challenge stays reachable without credentials.
+        let acme = out.find("acme-challenge").unwrap();
+        assert!(out.find("auth_basic ").unwrap() > acme);
+
+        let cert = VhostOptions {
+            custom_cert: true,
+            ..Default::default()
+        };
+        let out = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, true, &cert, dir);
+        assert!(out.contains(&format!("ssl_certificate {}/cert.pem;", dir.display())));
+        assert!(out.contains(&format!("ssl_certificate_key {}/key.pem;", dir.display())));
+        assert!(!out.contains("letsencrypt"));
     }
 }

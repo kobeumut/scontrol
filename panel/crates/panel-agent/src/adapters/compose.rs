@@ -44,6 +44,7 @@ use super::exec::{follow_lines, run, run_allow_nonzero, run_streamed};
 use super::git_auth;
 use super::nginx::{self, VhostTarget};
 use super::releases;
+use super::vhost_secrets;
 use crate::config::AgentConfig;
 use panel_core::adapters::{
     ComposeProjectActionParams, ComposeProjectLogsParams, DeployComposeProjectParams,
@@ -938,6 +939,15 @@ fn validate_bindings(
                 binding.domain
             )));
         }
+        binding.options.validate().map_err(|e| {
+            CoreError::Validation(format!("vhost options of {}: {e}", binding.domain))
+        })?;
+        if binding.options.custom_cert && !binding.https {
+            return Err(CoreError::Validation(format!(
+                "a custom certificate on {} needs HTTPS enabled",
+                binding.domain
+            )));
+        }
         if !domains.insert(binding.domain.as_str()) || !host_ports.insert(binding.host_port) {
             return Err(CoreError::Validation(format!(
                 "duplicate domain or host port: {}",
@@ -1026,6 +1036,11 @@ async fn apply_domains(
         Some((root, spa)) => VhostTarget::Static { root, spa },
         None => VhostTarget::Proxy(binding.host_port),
     };
+    if static_site.is_some() && bindings.iter().any(|b| b.options.path_prefix.is_some()) {
+        return Err(CoreError::Validation(
+            "a path prefix is only available for container services".into(),
+        ));
+    }
     let previous = read_owned_domains(root).await;
     if bindings.is_empty() && previous.is_empty() {
         return Ok(Vec::new());
@@ -1038,9 +1053,18 @@ async fn apply_domains(
             binding.domain.clone(),
             nginx::read_compose_vhost(cfg, &binding.domain).await,
         ));
-        let tls = binding.https && nginx::certificate_exists(cfg, &binding.domain);
-        let content =
-            nginx::render_compose_vhost(cfg, project_slug, &binding.domain, &target(binding), tls);
+        let dir = vhost_secrets::secrets_dir(root, &binding.domain);
+        let tls = binding.https
+            && nginx::certificate_available(cfg, &binding.domain, &binding.options, &dir);
+        let content = nginx::render_compose_vhost(
+            cfg,
+            project_slug,
+            &binding.domain,
+            &target(binding),
+            tls,
+            &binding.options,
+            &dir,
+        );
         nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
     }
     for stale in previous
@@ -1050,6 +1074,12 @@ async fn apply_domains(
         backups.push((stale.clone(), nginx::read_compose_vhost(cfg, stale).await));
         nginx::remove_compose_vhost(cfg, stale).await?;
     }
+    // Secrets of dropped domains go only after Nginx accepted the change.
+    let dropped: Vec<String> = previous
+        .iter()
+        .filter(|domain| !bindings.iter().any(|b| &b.domain == *domain))
+        .cloned()
+        .collect();
     if let Err(error) = nginx::test_and_reload().await {
         for (domain, content) in backups {
             match content {
@@ -1064,6 +1094,9 @@ async fn apply_domains(
         )));
     }
     write_owned_domains(root, bindings).await?;
+    for domain in &dropped {
+        vhost_secrets::remove_domain_secrets(root, domain).await;
+    }
 
     let mut warnings = Vec::new();
     let mut reload = false;
@@ -1071,6 +1104,21 @@ async fn apply_domains(
         .iter()
         .filter(|b| b.https && !nginx::certificate_exists(cfg, &b.domain))
     {
+        if binding.options.custom_cert {
+            // The uploaded certificate replaces ACME for this domain.
+            if !nginx::certificate_available(
+                cfg,
+                &binding.domain,
+                &binding.options,
+                &vhost_secrets::secrets_dir(root, &binding.domain),
+            ) {
+                warnings.push(format!(
+                    "no custom certificate uploaded for {}; serving HTTP only",
+                    binding.domain
+                ));
+            }
+            continue;
+        }
         let Some(email) = acme_email else { continue };
         log.step(&format!("requesting certificate for {}", binding.domain))
             .await?;
@@ -1091,6 +1139,8 @@ async fn apply_domains(
                 &binding.domain,
                 &target(binding),
                 true,
+                &binding.options,
+                &vhost_secrets::secrets_dir(root, &binding.domain),
             );
             nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
             reload = true;
@@ -3180,6 +3230,30 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn every_catalogue_template_passes_the_compose_validator() {
+        for template in panel_core::templates::catalogue() {
+            let env = panel_core::templates::generate_variables(&template, &Default::default())
+                .unwrap_or_else(|e| panic!("{}: {e}", template.meta.id));
+            // Interpolate like Compose would, so the YAML parses as deployed.
+            let mut text = template.compose_yaml.clone();
+            for (key, value) in &env {
+                text = text.replace(&format!("${{{key}}}"), value);
+            }
+            let yaml: Yaml =
+                serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", template.meta.id));
+            compose_policy(&yaml, &[])
+                .unwrap_or_else(|e| panic!("{} rejected: {e}", template.meta.id));
+            if let Some(domain) = &template.meta.suggested_domain {
+                assert!(
+                    yaml["services"].get(domain.service.as_str()).is_some(),
+                    "{} suggests a missing service",
+                    template.meta.id
+                );
+            }
+        }
+    }
+
     fn binding(domain: &str, service: &str, host_port: u16, https: bool) -> ComposeDomainBinding {
         ComposeDomainBinding {
             domain: domain.into(),
@@ -3187,6 +3261,7 @@ mod tests {
             container_port: 3000,
             host_port,
             https,
+            options: Default::default(),
         }
     }
 

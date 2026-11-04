@@ -333,4 +333,28 @@ impl AdapterPort for AgentClient {
     async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>> {
         self.call(AgentRequest::MetricsSnapshot).await
     }
+
+    async fn write_vhost_secrets(&self, params: WriteVhostSecretsParams) -> CoreResult<()> {
+        self.call(AgentRequest::WriteVhostSecrets(params)).await
+    }
+
+    async fn open_terminal(&self, params: OpenTerminalParams) -> CoreResult<TerminalSessionInfo> {
+        self.call(AgentRequest::OpenTerminal(params)).await
+    }
+
+    async fn read_terminal(&self, params: TerminalReadParams) -> CoreResult<TerminalOutput> {
+        self.call(AgentRequest::ReadTerminal(params)).await
+    }
+
+    async fn write_terminal(&self, params: TerminalWriteParams) -> CoreResult<()> {
+        self.call(AgentRequest::WriteTerminal(params)).await
+    }
+
+    async fn resize_terminal(&self, params: TerminalResizeParams) -> CoreResult<()> {
+        self.call(AgentRequest::ResizeTerminal(params)).await
+    }
+
+    async fn close_terminal(&self, params: TerminalCloseParams) -> CoreResult<()> {
+        self.call(AgentRequest::CloseTerminal(params)).await
+    }
 }

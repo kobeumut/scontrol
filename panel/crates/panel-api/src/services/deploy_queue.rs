@@ -365,6 +365,7 @@ async fn execute(
                     container_port: d.container_port,
                     host_port: d.host_port,
                     https: d.https,
+                    options: d.options,
                 })
                 .collect(),
             acme_email,

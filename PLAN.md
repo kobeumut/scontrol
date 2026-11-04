@@ -81,9 +81,9 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Request stats | Nginx JSON `log_format`, read incrementally with offset tracking and aggregated into PostgreSQL | D4 | ✅ |
 | Docker cleanup | Scheduled `docker image prune` / `builder prune` argv with an `until=` filter; freed space reported | D4 | ✅ |
 | Rollbacks | Tag each successful build `<slug>/<service>:deploy-<id>` and keep the last N. Rollback = compose up pinned to that tag plus the stored non-secret config snapshot. Static sites and database services are not rolled back yet | D5 | ✅ || Preview deployments | PR webhook → `<slug>-pr-<n>` project on a wildcard subdomain, with limit and TTL cleanup, and a PR comment through the GitHub API | D5 | ⬜ |
-| Templates | A vetted catalogue (TOML + Compose) shipped with the panel, using the same validator as user Compose and variable generators in Rust | D5 | ⬜ |
-| Redirects, basic auth, path prefix, custom certs | Typed vhost options: `return 301/302`, `auth_basic_user_file`, `location /prefix/`, certificate files stored 0600 | D5 | ⬜ |
-| Web terminal | Agent-side PTY running `docker exec` argv only, behind admin RBAC and audit. No host root shell | D5 | ⬜ |
+| Templates | A vetted catalogue (TOML + Compose) shipped with the panel, using the same validator as user Compose and variable generators in Rust | D5 | ✅ (WordPress, Ghost, Directus, Plausible, Uptime Kuma; Next.js not yet) |
+| Redirects, basic auth, path prefix, custom certs | Typed vhost options: `return 301/302`, `auth_basic_user_file`, `location /prefix/`, certificate files stored 0600 | D5 | ✅ |
+| Web terminal | Agent-side PTY running `docker exec` argv only, behind admin RBAC and audit. No host root shell | D5 | ✅ |
 | Multi-server | The same agent on remote hosts over mTLS, or an SSH-forwarded Unix socket with one persistent connection | D6 | ⬜ |
 | RBAC and API keys | A resource/action permission table checked in Axum extractors, with project and environment scoping. API keys hashed with Argon2. Nothing paywalled | D6 | ⬜ |
 | Swarm cluster management | — | — | ✖ (multi-host by placement, not Swarm) |

@@ -1,0 +1,24 @@
+id = "ghost"
+name = "Ghost"
+description = "Ghost publishing platform with MySQL."
+category = "cms"
+compose = "ghost.yml"
+suggested_domain = { service = "ghost", port = 2368 }
+
+[[variables]]
+name = "SITE_URL"
+label = "Public URL (for example https://blog.example.com)"
+generator = "input"
+default = "http://localhost:2368"
+
+[[variables]]
+name = "DB_ROOT_PASSWORD"
+label = "Database root password"
+generator = "password"
+length = 32
+
+[[variables]]
+name = "DB_PASSWORD"
+label = "Database password"
+generator = "password"
+length = 32

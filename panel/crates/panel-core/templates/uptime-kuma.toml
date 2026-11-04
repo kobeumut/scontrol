@@ -1,0 +1,6 @@
+id = "uptime-kuma"
+name = "Uptime Kuma"
+description = "Self-hosted uptime monitoring."
+category = "monitoring"
+compose = "uptime-kuma.yml"
+suggested_domain = { service = "uptime-kuma", port = 3001 }

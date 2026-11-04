@@ -5,6 +5,7 @@ pub mod compose_projects;
 pub mod cron;
 pub mod database_services;
 pub mod databases;
+pub mod domain_options;
 pub mod firewall;
 pub mod github_apps;
 pub mod health;
@@ -16,6 +17,8 @@ pub mod projects;
 pub mod registries;
 pub mod scheduled_jobs;
 pub mod sites;
+pub mod templates;
+pub mod terminal;
 pub mod tls;
 pub mod webhooks;
 
@@ -43,6 +46,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/github-apps", github_apps::router())
         .nest("/api/firewall", firewall::router())
         .nest("/api/tls", tls::router())
+        .nest("/api/templates", templates::router())
         .nest("/api/webhooks", webhooks::router())
         .nest("/api/admin", admin::router())
         // `/health` serves Nginx/systemd probes; the SPA calls everything
