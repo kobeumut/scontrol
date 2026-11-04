@@ -446,7 +446,8 @@ async fn api_keys_are_scoped_hashed_and_revocable() {
         .await
         .unwrap();
     assert!(stored.starts_with("$argon2id$"));
-    assert!(!stored.contains(token.rsplit('_').next().unwrap()));
+    let (_, secret) = crate::auth::api_keys::parse(&token).unwrap();
+    assert!(!stored.contains(secret));
     let (_, keys) = call(
         &w.router,
         Auth::Cookie(&cookie),
@@ -795,6 +796,24 @@ async fn services_run_on_the_agent_of_their_server() {
     assert_eq!(service["project"]["server_id"], server_id.to_string());
     let service_id = service["project"]["id"].as_str().unwrap().to_string();
 
+    // Without a server the service stays on this host, even with an empty
+    // remote server online: adding a server changes nothing for old clients.
+    let mut unplaced = body(server_id);
+    unplaced.as_object_mut().unwrap().remove("server_id");
+    let (status, local_service) = call(
+        &w.router,
+        Auth::Cookie(&cookie),
+        Method::POST,
+        "/api/compose-projects",
+        Some(unplaced),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        local_service["project"]["server_id"],
+        db::servers::LOCAL_SERVER_ID.to_string()
+    );
+
     w.local.calls.lock().unwrap().clear();
     let (status, _) = call(
         &w.router,
@@ -815,16 +834,75 @@ async fn services_run_on_the_agent_of_their_server() {
         "the local agent is not touched"
     );
 
-    // Features without multi-server support refuse instead of guessing.
+    // Scheduled jobs of the service live on its server too: installed by
+    // its agent, and their runs collected from it.
+    let (status, job) = call(&w.router, Auth::Cookie(&cookie), Method::POST, &format!("/api/compose-projects/{service_id}/jobs"), Some(json!({
+        "name": "nightly", "service_name": "web", "command": ["php", "artisan", "schedule:run"],
+        "schedule": { "kind": "cron", "expression": "0 3 * * *" }, "timezone": "UTC", "timeout_secs": 60,
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{job}");
+    assert_eq!(remote.job_upserts.lock().unwrap().len(), 1);
+    assert!(w.local.job_upserts.lock().unwrap().is_empty());
+    let remote_agent: Arc<dyn panel_core::adapters::AdapterPort> = remote.clone();
+    crate::services::scheduled_jobs::collect_server(
+        &w.state.db,
+        remote_agent.as_ref(),
+        &w.state.notifier,
+        server_id,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(remote
+        .calls
+        .lock()
+        .unwrap()
+        .contains(&"list_scheduled_job_runs".to_string()));
+    assert!(!w
+        .local
+        .calls
+        .lock()
+        .unwrap()
+        .contains(&"list_scheduled_job_runs".to_string()));
+
+    // A database service placed on the server is run by its agent.
+    let (status, database) = call(&w.router, Auth::Cookie(&cookie), Method::POST, "/api/database-services", Some(json!({
+        "name": "db", "slug": format!("d{}", &Uuid::new_v4().simple().to_string()[..10]),
+        "engine": "postgres", "environment_id": w.p_prod, "server_id": server_id, "deploy": false,
+    }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{database}");
+    let database_id = database["service"]["project"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (status, _) = call(
         &w.router,
         Auth::Cookie(&cookie),
-        Method::GET,
-        &format!("/api/compose-projects/{service_id}/jobs"),
+        Method::POST,
+        &format!("/api/database-services/{database_id}/stop"),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        remote
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "stop_compose_project")
+            .count(),
+        2
+    );
+    let (status, _) = call(
+        &w.router,
+        Auth::Cookie(&cookie),
+        Method::DELETE,
+        &format!("/api/database-services/{database_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 
     // A server with services cannot be removed; draining stops placement.
     let (status, _) = call(
@@ -991,4 +1069,331 @@ async fn a_role_admin_cannot_mint_installation_admins() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// A custom role with exactly `permissions`, bound to `user` on project `p`.
+async fn bind_custom(
+    state: &AppState,
+    user: Uuid,
+    p: Uuid,
+    permissions: &[panel_core::rbac::Permission],
+) {
+    let name = format!("c-{}", &Uuid::new_v4().simple().to_string()[..10]);
+    let role = db::rbac::save_role(&state.db, None, &name, "", permissions)
+        .await
+        .unwrap()
+        .unwrap();
+    db::rbac::create_binding(
+        &state.db,
+        user,
+        role,
+        panel_core::rbac::Scope::Project { project_id: p },
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+async fn service_variable_keys(state: &AppState, service: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT key FROM env_variables WHERE service_id = $1 ORDER BY key")
+        .bind(service)
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn deploying_with_an_environment_needs_variables_update() {
+    let w = world().await;
+    let user = test_support::user(&w.state.db, false).await;
+    bind(
+        &w.state,
+        user.id,
+        "deployer",
+        panel_core::rbac::Scope::Project { project_id: w.p },
+    )
+    .await;
+    let cookie = test_support::session_cookie(&w.state, user.id).await;
+    let deploy = format!("/api/compose-projects/{}/deploy", w.svc_prod);
+    let with_env = json!({ "environment": [["INJECTED", "x"]] });
+
+    let (status, _) = call(
+        &w.router,
+        Auth::Cookie(&cookie),
+        Method::POST,
+        &deploy,
+        Some(with_env.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        service_variable_keys(&w.state, w.svc_prod).await.is_empty(),
+        "nothing was written"
+    );
+    let (status, _) = call(
+        &w.router,
+        Auth::Cookie(&cookie),
+        Method::POST,
+        &deploy,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // A deploy-only key of an admin is held to the same boundary.
+    let admin = test_support::user(&w.state.db, true).await;
+    let admin_cookie = test_support::session_cookie(&w.state, admin.id).await;
+    let (status, created) = call(&w.router, Auth::Cookie(&admin_cookie), Method::POST, "/api/api-keys", Some(json!({
+        "name": "deploy-only",
+        "grants": [{ "permission": "services:deploy", "scope": { "kind": "project", "project_id": w.p } }],
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = created["token"].as_str().unwrap().to_string();
+    let (status, _) = call(
+        &w.router,
+        Auth::Bearer(&token),
+        Method::POST,
+        &deploy,
+        Some(with_env),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(service_variable_keys(&w.state, w.svc_prod).await.is_empty());
+    let (status, _) = call(
+        &w.router,
+        Auth::Bearer(&token),
+        Method::POST,
+        &deploy,
+        Some(json!({ "pull_images": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn configuration_access_cannot_deploy_through_side_doors() {
+    use panel_core::rbac::Permission;
+    let w = world().await;
+    let user = test_support::user(&w.state.db, false).await;
+    bind_custom(
+        &w.state,
+        user.id,
+        w.p,
+        &[
+            Permission::ServicesRead,
+            Permission::ServicesUpdate,
+            Permission::ServicesCreate,
+        ],
+    )
+    .await;
+    let cookie = test_support::session_cookie(&w.state, user.id).await;
+    let auth = || Auth::Cookie(&cookie);
+    let base = format!("/api/compose-projects/{}", w.svc_prod);
+    let domain = |name: &str| {
+        format!(
+            "{name}-{}.example.com",
+            &Uuid::new_v4().simple().to_string()[..8]
+        )
+    };
+    let deployments = |state: AppState, id: Uuid| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM compose_deployments WHERE project_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+    };
+
+    let (status, _) = call(
+        &w.router,
+        auth(),
+        Method::POST,
+        &format!("{base}/deploy"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Adding a domain redeploys by default: refused before anything changes.
+    let (status, _) = call(
+        &w.router,
+        auth(),
+        Method::POST,
+        &format!("{base}/domains"),
+        Some(json!({ "domain": domain("a"), "service_name": "web", "container_port": 80 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, domains) = call(
+        &w.router,
+        auth(),
+        Method::GET,
+        &format!("{base}/domains"),
+        None,
+    )
+    .await;
+    assert!(domains.as_array().unwrap().is_empty());
+
+    // Without the redeploy, configuring is allowed.
+    let (status, added) = call(&w.router, auth(), Method::POST, &format!("{base}/domains"),
+        Some(json!({ "domain": domain("b"), "service_name": "web", "container_port": 80, "redeploy": false }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{added}");
+    assert!(added["deployment"].is_null());
+    let domain_id = added["id"].as_str().unwrap().to_string();
+    let (status, _) = call(
+        &w.router,
+        auth(),
+        Method::DELETE,
+        &format!("{base}/domains/{domain_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(
+        &w.router,
+        auth(),
+        Method::DELETE,
+        &format!("{base}/domains/{domain_id}?redeploy=false"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deployments(w.state.clone(), w.svc_prod).await, 0);
+
+    // A webhook secret triggers deployments.
+    let (status, _) = call(
+        &w.router,
+        auth(),
+        Method::POST,
+        &format!("{base}/webhook"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Creating with the default first deployment, or with variables.
+    let create = |deploy: bool, environment: Value| {
+        json!({
+            "name": "web", "slug": format!("c{}", &Uuid::new_v4().simple().to_string()[..10]),
+            "source": { "kind": "raw", "compose_yaml": "services:\n  web:\n    image: nginx\n" },
+            "environment_id": w.p_prod, "deploy": deploy, "environment": environment,
+        })
+    };
+    let (status, _) = call(
+        &w.router,
+        auth(),
+        Method::POST,
+        "/api/compose-projects",
+        Some(create(true, json!([]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(
+        &w.router,
+        auth(),
+        Method::POST,
+        "/api/compose-projects",
+        Some(create(false, json!([["K", "v"]]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = call(
+        &w.router,
+        auth(),
+        Method::POST,
+        "/api/compose-projects",
+        Some(create(false, json!([]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(body["deployment"].is_null());
+}
+
+#[tokio::test]
+async fn mcp_tools_use_the_same_permissions_as_the_api() {
+    let w = world().await;
+    let admin = test_support::user(&w.state.db, true).await;
+    let admin_cookie = test_support::session_cookie(&w.state, admin.id).await;
+    let (status, created) = call(&w.router, Auth::Cookie(&admin_cookie), Method::POST, "/api/api-keys", Some(json!({
+        "name": "mcp",
+        "grants": [
+            { "permission": "services:deploy", "scope": { "kind": "project", "project_id": w.p } },
+            { "permission": "services:read", "scope": { "kind": "project", "project_id": w.p } },
+        ],
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = created["token"].as_str().unwrap().to_string();
+    let tool = |name: &str, arguments: Value| {
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        })
+    };
+    let is_error = |response: &Value| response["result"]["isError"].as_bool().unwrap();
+
+    let (status, response) = call(
+        &w.router,
+        Auth::Bearer(&token),
+        Method::POST,
+        "/api/mcp",
+        Some(tool(
+            "deploy_compose_project",
+            json!({ "project_id": w.svc_prod }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!is_error(&response), "{response}");
+    let (_, response) = call(
+        &w.router,
+        Auth::Bearer(&token),
+        Method::POST,
+        "/api/mcp",
+        Some(tool(
+            "deploy_compose_project",
+            json!({ "project_id": w.svc_q }),
+        )),
+    )
+    .await;
+    assert!(is_error(&response));
+    assert!(response.to_string().contains("permission denied"));
+    let (_, response) = call(
+        &w.router,
+        Auth::Bearer(&token),
+        Method::POST,
+        "/api/mcp",
+        Some(tool("list_compose_projects", json!({}))),
+    )
+    .await;
+    let listed = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(listed.contains(&w.svc_prod.to_string()) && !listed.contains(&w.svc_q.to_string()));
+    let (_, response) = call(
+        &w.router,
+        Auth::Bearer(&token),
+        Method::POST,
+        "/api/mcp",
+        Some(tool("list_sites", json!({}))),
+    )
+    .await;
+    assert!(is_error(&response));
+    assert!(response
+        .to_string()
+        .contains("not available with an API key"));
+
+    // A session user without bindings is refused too.
+    let user = test_support::user(&w.state.db, false).await;
+    let cookie = test_support::session_cookie(&w.state, user.id).await;
+    let (_, response) = call(
+        &w.router,
+        Auth::Cookie(&cookie),
+        Method::POST,
+        "/api/mcp",
+        Some(tool(
+            "deploy_compose_project",
+            json!({ "project_id": w.svc_prod }),
+        )),
+    )
+    .await;
+    assert!(is_error(&response));
 }

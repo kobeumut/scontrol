@@ -14,6 +14,9 @@ use std::time::{Duration, SystemTime};
 /// Connections served at once; more wait for a slot.
 const MAX_CONNECTIONS: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A remote connection idle this long is closed; the panel reuses idle
+/// connections for at most a minute.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Reloads the TLS identity when the certificate or CA file changes, so a
 /// rotated certificate takes effect without a restart.
@@ -83,8 +86,17 @@ where
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let identity = Arc::new(TlsIdentity::new(config.clone()));
-    // Fail at startup, not on the first connection, when files are missing.
-    identity.current()?;
+    // Right after `remote-init` the certificate is not installed yet: wait
+    // for it (checking every 30 s) instead of failing, so installing
+    // `agent.pem` and `ca.pem` is enough, without a restart.
+    let mut reported = false;
+    while let Err(error) = identity.current() {
+        if !reported {
+            tracing::warn!(%error, "remote listener waiting for its certificate files");
+            reported = true;
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     tracing::info!(listen = %config.listen, "remote mTLS listener started");
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));

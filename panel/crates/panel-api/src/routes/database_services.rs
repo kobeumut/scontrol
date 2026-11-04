@@ -10,7 +10,7 @@
 //! `POST /:id/credentials` (marked `no-store`); audit rows, errors, list
 //! views, and queue rows never contain them.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, Authenticated, Principal, ServiceAccess};
 use crate::db;
 use crate::db::database_services::DatabaseServiceRow;
 use crate::error::{ApiError, ApiResult};
@@ -23,6 +23,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use panel_core::adapters::{ComposeProjectActionParams, SetDatabaseExposureParams};
 use panel_core::error::CoreError;
+use panel_core::rbac::{Permission, Target};
 use panel_core::types::{
     validate, ComposeProject, ComposeSource, DatabaseExposure, DatabaseServiceSpec, DeploymentInfo,
     DeploymentStatus, ManagedDatabaseEngine,
@@ -51,7 +52,7 @@ struct EngineInfo {
     has_database_and_user: bool,
 }
 
-async fn engines(AdminUser(_): AdminUser) -> Json<Vec<EngineInfo>> {
+async fn engines(_: Authenticated) -> Json<Vec<EngineInfo>> {
     Json(
         ManagedDatabaseEngine::ALL
             .into_iter()
@@ -107,12 +108,19 @@ async fn find(state: &AppState, id: Uuid) -> ApiResult<(ComposeProject, Database
 }
 
 async fn list(
-    AdminUser(_): AdminUser,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<DatabaseServiceView>>> {
     let rows = db::database_services::list(&state.db).await?;
     let mut views = Vec::with_capacity(rows.len());
     for row in rows {
+        // Only the services whose environment grants `services:read`.
+        let Some(service) = crate::auth::find_service_ref(&state.db, row.project_id).await? else {
+            continue;
+        };
+        if !principal.allows(Permission::ServicesRead, service.target()) {
+            continue;
+        }
         if let Some(project) = db::compose_projects::find_by_id(&state.db, row.project_id).await? {
             if let Ok(v) = view(project, &row) {
                 views.push(v);
@@ -123,7 +131,7 @@ async fn list(
 }
 
 async fn show(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<DatabaseServiceView>> {
@@ -151,6 +159,12 @@ struct CreateBody {
     /// default `production` environment when omitted.
     #[serde(default)]
     environment_id: Option<Uuid>,
+    /// Server to run on; this host when omitted, unless it is draining or
+    /// full (then, as with `auto_place`, the least loaded eligible server).
+    #[serde(default)]
+    server_id: Option<Uuid>,
+    #[serde(default)]
+    auto_place: bool,
     /// Queue the first deployment right away (default true).
     #[serde(default = "default_true")]
     deploy: bool,
@@ -167,7 +181,7 @@ struct Created {
 }
 
 async fn create(
-    AdminUser(user): AdminUser,
+    Authenticated(user): Authenticated,
     State(state): State<AppState>,
     Json(body): Json<CreateBody>,
 ) -> ApiResult<(StatusCode, Json<Created>)> {
@@ -190,12 +204,26 @@ async fn create(
         cpu_limit_millis: body.cpu_limit_millis,
     };
     spec.validate().map_err(ApiError::BadRequest)?;
-    if let Some(environment_id) = body.environment_id {
-        db::projects::find_environment(&state.db, environment_id)
-            .await?
-            .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
+    let target = match body.environment_id {
+        Some(environment_id) => {
+            let environment = db::projects::find_environment(&state.db, environment_id)
+                .await?
+                .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
+            Target::Environment {
+                project: environment.project_id,
+                environment: environment.id,
+            }
+        }
+        None => Target::Global,
+    };
+    user.require(Permission::ServicesCreate, target)?;
+    if body.deploy {
+        user.require(Permission::ServicesDeploy, target)?;
     }
     let source = ComposeSource::Database(Box::new(spec));
+    let server_id =
+        crate::routes::compose_projects::place(&state, body.server_id, body.auto_place, &source)
+            .await?;
     let project = db::compose_projects::create(
         &state.db,
         Uuid::new_v4(),
@@ -218,6 +246,14 @@ async fn create(
         }
     })?;
 
+    if server_id != db::servers::LOCAL_SERVER_ID {
+        if let Err(error) = db::servers::place_service(&state.db, project.id, server_id).await {
+            db::compose_projects::delete(&state.db, project.id)
+                .await
+                .ok();
+            return Err(error.into());
+        }
+    }
     let generated = credentials::generate(body.engine);
     let sealed = credentials::seal(&state.secret_box, project.id, &generated);
     drop(generated);
@@ -246,7 +282,7 @@ async fn create(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "create_database_service",
         Some(&project.slug),
         serde_json::json!({
@@ -288,10 +324,16 @@ struct CredentialsView {
 /// Returns the credentials (audited, never cached). POST rather than GET so
 /// a link, prefetch, or crawler cannot trigger it.
 async fn reveal_credentials(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::VariablesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
+    // The one place a stored secret is shown: an interactive session only.
+    if user.api_key_id.is_some() {
+        return Err(ApiError::Forbidden);
+    }
     let (project, row) = find(&state, id).await?;
     let ComposeSource::Database(spec) = &project.source else {
         return Err(ApiError::NotFound("database service not found".into()));
@@ -316,7 +358,7 @@ async fn reveal_credentials(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "reveal_database_credentials",
         Some(&project.slug),
         serde_json::json!({ "project_id": project.id }),
@@ -333,7 +375,9 @@ async fn reveal_credentials(
 }
 
 async fn start(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<DeploymentInfo>)> {
@@ -344,37 +388,45 @@ async fn start(
         .deploy_queue
         .enqueue(&state.db, project.id, &project.slug, false, "manual")
         .await?;
-    audit(&state, user.id, "start_database_service", &project).await;
+    audit(&state, &user, "start_database_service", &project).await;
     Ok((StatusCode::ACCEPTED, Json(deployment)))
 }
 
 async fn stop(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (project, _) = find(&state, id).await?;
     refuse_while_running(&project)?;
     state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .stop_compose_project(ComposeProjectActionParams {
             project_slug: project.slug.clone(),
         })
         .await?;
     db::compose_projects::set_status(&state.db, id, DeploymentStatus::Stopped).await?;
-    audit(&state, user.id, "stop_database_service", &project).await;
+    audit(&state, &user, "stop_database_service", &project).await;
     Ok(Json(serde_json::json!({ "stopped": true })))
 }
 
 async fn restart(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (project, _) = find(&state, id).await?;
     refuse_while_running(&project)?;
     state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .restart_compose_project(ComposeProjectActionParams {
             project_slug: project.slug.clone(),
         })
@@ -388,12 +440,14 @@ async fn restart(
     if project.status == DeploymentStatus::Stopped {
         db::compose_projects::set_status(&state.db, id, DeploymentStatus::Succeeded).await?;
     }
-    audit(&state, user.id, "restart_database_service", &project).await;
+    audit(&state, &user, "restart_database_service", &project).await;
     Ok(Json(serde_json::json!({ "restarted": true })))
 }
 
 async fn remove(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesDelete>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -403,7 +457,9 @@ async fn remove(
     // agent's files. The named data volume is kept (as for every service),
     // so data survives an accidental removal; remove it on the host.
     match state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .remove_compose_project(ComposeProjectActionParams {
             project_slug: project.slug.clone(),
         })
@@ -413,18 +469,22 @@ async fn remove(
         Err(error) => return Err(error.into()),
     }
     db::compose_projects::delete(&state.db, id).await?;
-    audit(&state, user.id, "remove_database_service", &project).await;
+    audit(&state, &user, "remove_database_service", &project).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
 /// Opens (or changes) outside access: a host Nginx stream proxy on
 /// `public_port` to the loopback port, and UFW rules for `allow_from`.
 async fn expose(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(mut exposure): Json<DatabaseExposure>,
 ) -> ApiResult<Json<DatabaseServiceView>> {
+    // Outside access opens a port in the server's firewall.
+    user.require(Permission::ServersManage, Target::Global)?;
     let (project, row) = find(&state, id).await?;
     exposure.normalize().map_err(ApiError::BadRequest)?;
     let port = i32::from(exposure.public_port);
@@ -457,7 +517,7 @@ async fn expose(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "expose_database_service",
         Some(&project.slug),
         serde_json::json!({
@@ -473,14 +533,16 @@ async fn expose(
 }
 
 async fn close(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<DatabaseServiceView>> {
     let (project, row) = find(&state, id).await?;
     apply_exposure(&state, &project, &row, None).await?;
     db::database_services::set_exposure(&state.db, id, None, &[]).await?;
-    audit(&state, user.id, "close_database_service", &project).await;
+    audit(&state, &user, "close_database_service", &project).await;
     let (project, row) = find(&state, id).await?;
     Ok(Json(view(project, &row)?))
 }
@@ -492,7 +554,9 @@ async fn apply_exposure(
     exposure: Option<DatabaseExposure>,
 ) -> ApiResult<()> {
     state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .set_database_exposure(SetDatabaseExposureParams {
             project_slug: project.slug.clone(),
             loopback_port: row.loopback_port as u16,
@@ -516,11 +580,11 @@ fn refuse_while_running(project: &ComposeProject) -> ApiResult<()> {
     Ok(())
 }
 
-async fn audit(state: &AppState, user_id: Uuid, action: &str, project: &ComposeProject) {
+async fn audit(state: &AppState, principal: &Principal, action: &str, project: &ComposeProject) {
     db::audit::record(
         &state.db,
-        Some(user_id),
-        "user",
+        Some(principal.id),
+        principal.actor_kind(),
         action,
         Some(&project.slug),
         serde_json::json!({ "project_id": project.id }),

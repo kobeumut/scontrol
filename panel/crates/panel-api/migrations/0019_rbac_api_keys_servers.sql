@@ -113,3 +113,34 @@ CREATE TABLE api_keys (
 );
 
 CREATE INDEX idx_api_keys_user_id ON api_keys(user_id);
+
+-- Per-server observability. Existing rows belong to the local server.
+-- Host metrics and alert state are kept per server; container metrics are
+-- already per service (and a service is on one server).
+ALTER TABLE server_metrics
+    ADD COLUMN server_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'
+        REFERENCES servers(id) ON DELETE CASCADE;
+ALTER TABLE server_metrics DROP CONSTRAINT server_metrics_pkey;
+ALTER TABLE server_metrics ADD PRIMARY KEY (server_id, resolution_secs, bucket);
+
+ALTER TABLE metric_alert_state
+    ADD COLUMN server_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'
+        REFERENCES servers(id) ON DELETE CASCADE;
+ALTER TABLE metric_alert_state DROP CONSTRAINT metric_alert_state_pkey;
+ALTER TABLE metric_alert_state ADD PRIMARY KEY (server_id, key);
+
+-- One Nginx access-log cursor per server (request statistics share one
+-- table: a domain is served by one server).
+ALTER TABLE nginx_log_cursor
+    ADD COLUMN server_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'
+        REFERENCES servers(id) ON DELETE CASCADE;
+ALTER TABLE nginx_log_cursor DROP COLUMN id;
+ALTER TABLE nginx_log_cursor ADD PRIMARY KEY (server_id);
+
+-- Docker cleanups run on every server; one at a time per server.
+ALTER TABLE docker_cleanup_runs
+    ADD COLUMN server_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'
+        REFERENCES servers(id) ON DELETE CASCADE;
+DROP INDEX idx_docker_cleanup_one_running;
+CREATE UNIQUE INDEX idx_docker_cleanup_one_running ON docker_cleanup_runs (server_id)
+    WHERE status = 'running';

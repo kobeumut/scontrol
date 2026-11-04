@@ -51,7 +51,7 @@ export function Servers({ canManage }: { canManage: boolean }) {
       <h2>Servers</h2>
       {canManage && !adding && <button className="action" onClick={() => { setAdding(true); setBundle(undefined); }}>Add server</button>}
     </div>
-    <p className="hint">New services go to the least loaded online server that is not draining and has room, unless you pick one. A service stays on its server; its files, containers, and Nginx vhost live there. Point a service's domains at the server it runs on.</p>
+    <p className="hint">New services stay on this host unless you pick a server or automatic placement (the least loaded online server that is not draining and has room). Drain this host to send new services elsewhere by default. A service stays on its server; its files, containers, and Nginx vhost live there. Point a service's domains at the server it runs on.</p>
     {adding && <AddServer onDone={(enrolled) => {
       setAdding(false); servers.reload();
       if (enrolled?.certificate_pem && enrolled.ca_pem) setBundle({ title: enrolled.server.name, certificate_pem: enrolled.certificate_pem, ca_pem: enrolled.ca_pem });
@@ -166,13 +166,20 @@ function CertificateBundle({ title, certificate_pem, ca_pem, onClose }: { title:
   </div>;
 }
 
-/** Where a new service runs; empty lets the panel place it. */
+/** Request fields for a {@link ServerSelect} value: this host, automatic, or one server. */
+export function placement(value: string): { server_id?: string; auto_place?: boolean } {
+  if (value === 'auto') return { auto_place: true };
+  return value ? { server_id: value } : {};
+}
+
+/** Where a new service runs: `''` this host (or, when it is draining or full, the least loaded server), `'auto'`, or a server id. */
 export function ServerSelect({ value, onChange }: { value: string; onChange: (id: string) => void }) {
   const servers = useApi<Server[]>('/servers');
   if (servers.error || (servers.data && servers.data.length < 2)) return null;
   return <label>Server
     <select value={value} disabled={servers.loading} onChange={(e) => onChange(e.target.value)}>
-      <option value="">automatic (least loaded)</option>
+      <option value="">this host</option>
+      <option value="auto">automatic (least loaded online server)</option>
       {servers.data?.map((s) => <option key={s.id} value={s.id} disabled={s.status !== 'online' || s.draining}>
         {s.name}{s.status !== 'online' ? ` (${s.status})` : s.draining ? ' (draining)' : ''}
       </option>)}

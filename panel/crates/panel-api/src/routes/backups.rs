@@ -364,6 +364,10 @@ struct DatabaseBody {
     /// Restore only: the object to restore.
     #[serde(default)]
     key: Option<String>,
+    /// Server whose agent connects to the database and streams the dump
+    /// (for a database only reachable there); this host when omitted.
+    #[serde(default)]
+    server_id: Option<Uuid>,
 }
 
 impl DatabaseBody {
@@ -463,7 +467,13 @@ async fn backup_database(
         retention_count: dest.retention_count as u32,
     };
     let secrets = vec![body.password.clone()];
-    let agent = state.agent.clone();
+    let agent = state
+        .agents
+        .for_server_id(
+            &state.db,
+            body.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID),
+        )
+        .await?;
     spawn_run(
         &state,
         user.id,
@@ -497,7 +507,13 @@ async fn restore_database(
         key: key.clone(),
         connection,
     };
-    let agent = state.agent.clone();
+    let agent = state
+        .agents
+        .for_server_id(
+            &state.db,
+            body.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID),
+        )
+        .await?;
     spawn_run(
         &state,
         user.id,
@@ -520,7 +536,6 @@ async fn backup_volume(
     Json(body): Json<VolumeBody>,
 ) -> ApiResult<Accepted> {
     body.check()?;
-    ensure_local_service(&state, &body.project_slug).await?;
     let dest = find(&state, id).await?;
     let params = BackupVolumeParams {
         target: target(&state, &dest)?,
@@ -531,7 +546,7 @@ async fn backup_volume(
         stop_service: body.stop_service,
         retention_count: dest.retention_count as u32,
     };
-    let agent = state.agent.clone();
+    let agent = agent_for_service(&state, &body.project_slug).await?;
     spawn_run(
         &state,
         user.id,
@@ -558,7 +573,6 @@ async fn restore_volume(
     Json(body): Json<VolumeBody>,
 ) -> ApiResult<Accepted> {
     body.check()?;
-    ensure_local_service(&state, &body.project_slug).await?;
     let dest = find(&state, id).await?;
     let key = restore_key(&body.key, &dest)?;
     let params = RestoreVolumeParams {
@@ -569,7 +583,7 @@ async fn restore_volume(
         volume: body.volume.clone(),
         stop_service: body.stop_service,
     };
-    let agent = state.agent.clone();
+    let agent = agent_for_service(&state, &body.project_slug).await?;
     spawn_run(
         &state,
         user.id,
@@ -654,20 +668,21 @@ fn not_found() -> ApiError {
     ApiError::NotFound("backup destination not found".into())
 }
 
-/// Volume backups run on the local agent; a service on a remote server is
-/// refused rather than looked for on the wrong host.
-async fn ensure_local_service(state: &AppState, slug: &str) -> ApiResult<()> {
+/// The agent of the server the service named `slug` runs on: its volumes
+/// live there. A slug the panel does not know is looked for on this host.
+async fn agent_for_service(
+    state: &AppState,
+    slug: &str,
+) -> ApiResult<std::sync::Arc<dyn panel_core::adapters::AdapterPort>> {
     let server: Option<Uuid> =
         sqlx::query_scalar("SELECT server_id FROM compose_projects WHERE slug = $1")
             .bind(slug)
             .fetch_optional(&state.db)
             .await?;
-    match server {
-        Some(server) if server != db::servers::LOCAL_SERVER_ID => Err(ApiError::Conflict(
-            "volume backups are not available yet for services on remote servers".into(),
-        )),
-        _ => Ok(()),
-    }
+    state
+        .agents
+        .for_server_id(&state.db, server.unwrap_or(db::servers::LOCAL_SERVER_ID))
+        .await
 }
 
 async fn find(state: &AppState, id: Uuid) -> ApiResult<DestinationRow> {

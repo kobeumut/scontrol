@@ -1,0 +1,42 @@
+# One persistent SSH connection that forwards a remote server's agent
+# socket to /run/scontrol/remote/<instance>.sock on the panel host (the
+# `ssh_socket` server transport). Instance = the server's name in the panel.
+#
+# /etc/scontrol/tunnels/<instance>.env must set:
+#   SCONTROL_TUNNEL_TARGET=root@web-2.example.com
+# and the scontrol user needs a key that the target accepts
+# (/var/lib/scontrol/.ssh/id_ed25519) plus the target's host key in
+# /var/lib/scontrol/.ssh/known_hosts. Host keys are checked strictly.
+[Unit]
+Description=scontrol agent tunnel to %i
+After=network-online.target panel-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scontrol
+Group=scontrol
+EnvironmentFile=/etc/scontrol/tunnels/%i.env
+RuntimeDirectory=scontrol/remote
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/ssh -N -T \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 \
+    -o StreamLocalBindUnlink=yes \
+    -o StreamLocalBindMask=0117 \
+    -L /run/scontrol/remote/%i.sock:/run/scontrol/agent.sock \
+    ${SCONTROL_TUNNEL_TARGET}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/scontrol/remote
+
+[Install]
+WantedBy=multi-user.target

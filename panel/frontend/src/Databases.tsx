@@ -2,6 +2,7 @@ import { FormEvent, useState } from 'react';
 import {
   api, ComposeProject, DATABASE_ENGINE_LABELS, DatabaseEngine, DatabaseSpec, Deployment, formatTime, isActive, useApi,
 } from './api';
+import { placement, ServerSelect } from './Servers';
 
 type EngineInfo = {
   engine: DatabaseEngine; versions: string[]; default_version: string; container_port: number; has_database_and_user: boolean;
@@ -56,6 +57,7 @@ function CreateForm({ engines, onDone }: { engines?: EngineInfo[]; onDone: (id?:
   const [database, setDatabase] = useState('app');
   const [username, setUsername] = useState('app');
   const [memory, setMemory] = useState('');
+  const [serverId, setServerId] = useState('');
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
 
@@ -71,6 +73,7 @@ function CreateForm({ engines, onDone }: { engines?: EngineInfo[]; onDone: (id?:
           database_name: info?.has_database_and_user === false ? undefined : database,
           username: info?.has_database_and_user === false ? undefined : username,
           memory_limit_mb: memory ? Number(memory) : undefined,
+          ...placement(serverId),
         },
       });
       onDone(created.service.project.id);
@@ -93,6 +96,7 @@ function CreateForm({ engines, onDone }: { engines?: EngineInfo[]; onDone: (id?:
       <label>Memory limit (MiB) <span className="muted small">(optional)</span>
         <input type="number" min={64} value={memory} onChange={(e) => setMemory(e.target.value)} />
       </label>
+      <ServerSelect value={serverId} onChange={setServerId} />
       {info?.has_database_and_user !== false && <>
         <label>Database name<input required className="mono" pattern="[A-Za-z][A-Za-z0-9_]{0,62}" value={database} onChange={(e) => setDatabase(e.target.value)} /></label>
         <label>Username<input required className="mono" pattern="[A-Za-z][A-Za-z0-9_]{0,62}" value={username} onChange={(e) => setUsername(e.target.value)} /></label>

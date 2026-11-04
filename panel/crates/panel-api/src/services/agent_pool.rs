@@ -118,7 +118,30 @@ pub struct AgentPool {
     pki: PanelPki,
     /// Adapters registered in place of a server's real transport (tests).
     overrides: Arc<RwLock<HashMap<Uuid, Arc<dyn AdapterPort>>>>,
+    /// One client per server, kept so its open connections are reused;
+    /// replaced when the server's address, pins, or the panel identity
+    /// change.
+    clients: Arc<RwLock<HashMap<Uuid, CachedAgent>>>,
+    /// How long a health check waits for an agent's answer. Deployments
+    /// and log streams are long on purpose and are not bounded by it.
+    health_timeout: std::time::Duration,
 }
+
+/// A cached client and what it was built from.
+type CachedAgent = (ClientKey, Arc<dyn AdapterPort>);
+
+/// What a cached client was built from.
+#[derive(Clone, PartialEq, Eq)]
+struct ClientKey {
+    transport: Transport,
+    address: String,
+    pins: Vec<String>,
+    /// Identity of the panel's TLS configuration (it changes on renewal).
+    config: usize,
+}
+
+/// Default bound on one health check (connect, handshake, and answer).
+pub const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AgentPool {
     pub fn new(local: Arc<dyn AdapterPort>, secrets: SecretBox) -> Self {
@@ -126,6 +149,30 @@ impl AgentPool {
             local,
             pki: PanelPki::new(secrets),
             overrides: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            health_timeout: HEALTH_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_health_timeout(&mut self, timeout: std::time::Duration) {
+        self.health_timeout = timeout;
+    }
+
+    /// `capabilities()` bounded by the health timeout, so an agent that
+    /// accepts a connection but never answers counts as offline.
+    async fn probe(
+        &self,
+        agent: &dyn AdapterPort,
+    ) -> ApiResult<panel_core::adapters::AgentCapabilities> {
+        match tokio::time::timeout(self.health_timeout, agent.capabilities()).await {
+            Ok(result) => result.map_err(ApiError::from),
+            Err(_) => Err(ApiError::Core(panel_core::error::CoreError::External(
+                format!(
+                    "the agent did not answer within {} s",
+                    self.health_timeout.as_secs()
+                ),
+            ))),
         }
     }
 
@@ -158,25 +205,50 @@ impl AgentPool {
         {
             return Ok(adapter.clone());
         }
-        match server.transport {
-            Transport::Local => Ok(self.local.clone()),
-            Transport::SshSocket => Ok(Arc::new(AgentClient::new(&server.address))),
+        let pins = server.accepted_fingerprints(Utc::now());
+        let config = match server.transport {
+            Transport::Local => return Ok(self.local.clone()),
+            Transport::SshSocket => None,
             Transport::Mtls => {
-                let pins = server.accepted_fingerprints(Utc::now());
                 if pins.is_empty() {
                     return Err(ApiError::Conflict(format!(
                         "server {} has no certificate yet",
                         server.name
                     )));
                 }
-                Ok(Arc::new(AgentClient::tls(TlsTarget {
-                    address: server.address.clone(),
-                    server_name: server.host().to_string(),
-                    config: self.pki.client_config(pool).await?,
-                    pinned_fingerprints: pins,
-                })))
+                Some(self.pki.client_config(pool).await?)
+            }
+        };
+        let key = ClientKey {
+            transport: server.transport,
+            address: server.address.clone(),
+            pins: pins.clone(),
+            config: config.as_ref().map_or(0, |c| Arc::as_ptr(c) as usize),
+        };
+        if let Some((cached, client)) = self
+            .clients
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&server.id)
+        {
+            if *cached == key {
+                return Ok(client.clone());
             }
         }
+        let client: Arc<dyn AdapterPort> = match config {
+            None => Arc::new(AgentClient::new(&server.address)),
+            Some(config) => Arc::new(AgentClient::tls(TlsTarget {
+                address: server.address.clone(),
+                server_name: server.host().to_string(),
+                config,
+                pinned_fingerprints: pins,
+            })),
+        };
+        self.clients
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server.id, (key, client.clone()));
+        Ok(client)
     }
 
     pub async fn for_server_id(&self, pool: &PgPool, id: Uuid) -> ApiResult<Arc<dyn AdapterPort>> {
@@ -209,7 +281,7 @@ impl AgentPool {
         server: &Server,
     ) -> ApiResult<panel_core::adapters::AgentCapabilities> {
         let result = match self.for_server(pool, server).await {
-            Ok(agent) => agent.capabilities().await.map_err(ApiError::from),
+            Ok(agent) => self.probe(agent.as_ref()).await,
             Err(error) => Err(error),
         };
         match &result {
@@ -226,7 +298,7 @@ impl AgentPool {
                     let mut current_only = server.clone();
                     current_only.previous_fingerprint = None;
                     if let Ok(agent) = self.for_server(pool, &current_only).await {
-                        if agent.capabilities().await.is_ok() {
+                        if self.probe(agent.as_ref()).await.is_ok() {
                             db::servers::finish_rotation(pool, server.id).await?;
                         }
                     }
@@ -243,26 +315,33 @@ impl AgentPool {
         result
     }
 
+    /// Checks every remote server at once; each check is bounded, so one
+    /// silent server delays neither the others nor the next round.
+    pub async fn check_all(&self, pool: &PgPool) -> sqlx::Result<()> {
+        let servers = db::servers::list(pool).await?;
+        let checks = servers
+            .iter()
+            .filter(|s| s.id != LOCAL_SERVER_ID)
+            .map(|server| async move {
+                if let Err(error) = self.check(pool, server).await {
+                    tracing::debug!(server = %server.name, %error, "server check failed");
+                }
+            });
+        futures::future::join_all(checks).await;
+        Ok(())
+    }
+
     /// Checks every remote server once a minute so placement sees which are
     /// online. The local agent is reported by `/health/agent`.
     pub fn start_health_checks(&self, pool: PgPool) {
-        let pool_agents = self.clone();
+        let agents = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let servers = match db::servers::list(&pool).await {
-                    Ok(servers) => servers,
-                    Err(error) => {
-                        tracing::warn!(%error, "listing servers for health checks");
-                        continue;
-                    }
-                };
-                for server in servers.iter().filter(|s| s.id != LOCAL_SERVER_ID) {
-                    if let Err(error) = pool_agents.check(&pool, server).await {
-                        tracing::debug!(server = %server.name, %error, "server check failed");
-                    }
+                if let Err(error) = agents.check_all(&pool).await {
+                    tracing::warn!(%error, "listing servers for health checks");
                 }
             }
         });
@@ -350,5 +429,75 @@ mod tests {
             .unwrap();
         assert_ne!(client.cert_pem, rotated.cert_pem);
         assert!(rotated.expires_at > Utc::now() + Duration::days(pki::CLIENT_CERT_DAYS - 1));
+    }
+
+    #[tokio::test]
+    async fn a_silent_agent_does_not_hold_up_the_other_checks() {
+        use panel_core::adapters::mock::MockAdapter;
+        let pool = crate::test_support::test_pool().await;
+        let dir = std::env::temp_dir().join(format!("scontrol-silent-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("silent.sock");
+        // Accepts connections and reads, but never answers.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let (silent, healthy) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, name, address) in [
+            (
+                silent,
+                format!("silent-{suffix}"),
+                socket.display().to_string(),
+            ),
+            (
+                healthy,
+                format!("healthy-{suffix}"),
+                "/run/scontrol/remote/x.sock".to_string(),
+            ),
+        ] {
+            db::servers::insert(
+                &pool,
+                db::servers::NewServer {
+                    id,
+                    name: &name,
+                    transport: Transport::SshSocket,
+                    address: &address,
+                    max_services: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut agents =
+            AgentPool::new(Arc::new(MockAdapter::new()), SecretBox::derive(&[42u8; 32]));
+        agents.set_health_timeout(std::time::Duration::from_millis(300));
+        agents.set_override(healthy, Arc::new(MockAdapter::new()));
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(5), agents.check_all(&pool))
+            .await
+            .expect("check_all finishes despite the silent agent")
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let silent_row = db::servers::find(&pool, silent).await.unwrap().unwrap();
+        assert_eq!(silent_row.status, "offline");
+        assert!(silent_row.last_error.unwrap().contains("did not answer"));
+        assert_eq!(
+            db::servers::find(&pool, healthy)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "online"
+        );
+        for id in [silent, healthy] {
+            db::servers::delete(&pool, id).await.unwrap();
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 }

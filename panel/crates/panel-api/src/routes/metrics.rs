@@ -9,7 +9,7 @@
 //! The range picks the stored resolution: up to 24 h reads 30 s buckets,
 //! 7 d reads 5 min averages, 30 d reads 1 h averages.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, AdminUser, ServiceAccess};
 use crate::db;
 use crate::db::metrics::{AlertSettings, AlertStateRow, ContainerPoint, ServerPoint};
 use crate::error::{ApiError, ApiResult};
@@ -67,6 +67,15 @@ impl Range {
 struct RangeQuery {
     #[serde(default)]
     range: Range,
+    /// Server whose host metrics to show; this host when omitted.
+    #[serde(default)]
+    server_id: Option<Uuid>,
+}
+
+#[derive(Deserialize, Default)]
+struct ServerQuery {
+    #[serde(default)]
+    server_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -89,8 +98,10 @@ struct CurrentView {
 async fn current(
     AdminUser(_): AdminUser,
     State(state): State<AppState>,
+    Query(query): Query<ServerQuery>,
 ) -> ApiResult<Json<CurrentView>> {
-    let Some(snapshot) = state.metrics.latest() else {
+    let server = query.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID);
+    let Some(snapshot) = state.metrics.latest_for(server) else {
         return Ok(Json(CurrentView {
             sampled_at: None,
             interval_secs: None,
@@ -99,11 +110,12 @@ async fn current(
             containers: Vec::new(),
         }));
     };
-    let projects: HashMap<String, (Uuid, String)> = db::metrics::project_slugs(&state.db)
-        .await?
-        .into_iter()
-        .map(|(id, slug, name)| (slug, (id, name)))
-        .collect();
+    let projects: HashMap<String, (Uuid, String)> =
+        db::metrics::project_slugs_on(&state.db, server)
+            .await?
+            .into_iter()
+            .map(|(id, slug, name)| (slug, (id, name)))
+            .collect();
     let containers = snapshot
         .containers
         .into_iter()
@@ -138,7 +150,9 @@ async fn server(
     Query(query): Query<RangeQuery>,
 ) -> ApiResult<Json<ServerSeries>> {
     let (window, resolution) = query.range.window();
-    let points = db::metrics::server_series(&state.db, resolution, Utc::now() - window).await?;
+    let server = query.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID);
+    let points =
+        db::metrics::server_series(&state.db, server, resolution, Utc::now() - window).await?;
     Ok(Json(ServerSeries {
         range: query.range,
         resolution_secs: resolution,
@@ -159,18 +173,13 @@ struct ProjectSeries {
     services: Vec<ServiceSeries>,
 }
 
+/// A service's container metrics: readable with `services:read` on it.
 async fn project(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<RangeQuery>,
 ) -> ApiResult<Json<ProjectSeries>> {
-    if db::compose_projects::find_by_id(&state.db, id)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::NotFound("compose project".into()));
-    }
     let (window, resolution) = query.range.window();
     let rows =
         db::metrics::container_series(&state.db, id, resolution, Utc::now() - window).await?;

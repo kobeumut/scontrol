@@ -2,9 +2,11 @@
 //! Desktop, Cursor, OpenCode, Gemini CLI, ...).
 
 use crate::db;
+use crate::mcp::McpIdentity;
 use crate::services::site_service::{self, CreateSiteRequest};
 use crate::state::AppState;
 use panel_core::adapters::{ApplyFirewallRuleParams, CreateDatabaseParams};
+use panel_core::rbac::Permission;
 use panel_core::types::{DatabaseEngine, FirewallProtocol, Runtime};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -154,16 +156,43 @@ struct ComposeDeploymentLogInput {
     offset: Option<u64>,
 }
 
+/// The service `id` if the caller holds `permission` on it (checked
+/// against its environment, like the REST routes).
+async fn authorized_service(
+    state: &AppState,
+    identity: &McpIdentity,
+    id: Uuid,
+    permission: Permission,
+) -> Result<panel_core::types::ComposeProject, String> {
+    let service = crate::auth::find_service_ref(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Compose project not found")?;
+    if !identity.authority.allows(permission, service.target()) {
+        return Err(format!("permission denied: {permission} on this service"));
+    }
+    db::compose_projects::find_by_id(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Compose project not found".to_string())
+}
+
 /// Dispatches a tool call. `actor_user_id` is the panel user the MCP session
 /// is authenticated as (MCP calls go through the same auth/audit path as the
 /// REST API — see `routes::mcp`).
 pub async fn call_tool(
     state: &AppState,
-    actor_user_id: Uuid,
-    is_admin: bool,
+    identity: &McpIdentity,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
+    let (actor_user_id, is_admin) = (identity.user_id, identity.is_admin);
+    // Sites, databases, and the firewall act as the user's own account,
+    // which an API key does not stand for; keys reach the Compose tools,
+    // checked against their grants.
+    if identity.api_key_id.is_some() && !name.contains("compose") && name != "agent_capabilities" {
+        return Err(format!("{name} is not available with an API key"));
+    }
     match name {
         "list_sites" => {
             let sites = if is_admin {
@@ -268,24 +297,31 @@ pub async fn call_tool(
             Ok(serde_json::to_value(rule).unwrap())
         }
         "list_compose_projects" => {
-            if !is_admin {
-                return Err("only admins may inspect Docker projects via MCP".into());
-            }
-            let projects = db::compose_projects::list_all(&state.db)
+            let mut projects = Vec::new();
+            for project in db::compose_projects::list_all(&state.db)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+            {
+                let readable = crate::auth::find_service_ref(&state.db, project.id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|s| {
+                        identity
+                            .authority
+                            .allows(Permission::ServicesRead, s.target())
+                    });
+                if readable {
+                    projects.push(project);
+                }
+            }
             Ok(json!({ "projects": projects }))
         }
         "compose_project_services" => {
-            if !is_admin {
-                return Err("only admins may inspect Docker projects via MCP".into());
-            }
             let input: ComposeProjectIdInput =
                 serde_json::from_value(arguments).map_err(|e| e.to_string())?;
-            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Compose project not found")?;
+            let project =
+                authorized_service(state, identity, input.project_id, Permission::ServicesRead)
+                    .await?;
             let services = state
                 .agents
                 .for_server_id(&state.db, project.server_id)
@@ -299,15 +335,11 @@ pub async fn call_tool(
             Ok(json!({ "services": services }))
         }
         "compose_project_logs" => {
-            if !is_admin {
-                return Err("only admins may inspect Docker project logs via MCP".into());
-            }
             let input: ComposeProjectLogsInput =
                 serde_json::from_value(arguments).map_err(|e| e.to_string())?;
-            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Compose project not found")?;
+            let project =
+                authorized_service(state, identity, input.project_id, Permission::ServicesRead)
+                    .await?;
             let logs = state
                 .agents
                 .for_server_id(&state.db, project.server_id)
@@ -322,15 +354,15 @@ pub async fn call_tool(
             Ok(json!({ "logs": logs }))
         }
         "deploy_compose_project" => {
-            if !is_admin {
-                return Err("only admins may deploy Docker projects via MCP".into());
-            }
             let input: DeployComposeProjectInput =
                 serde_json::from_value(arguments).map_err(|e| e.to_string())?;
-            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Compose project not found")?;
+            let project = authorized_service(
+                state,
+                identity,
+                input.project_id,
+                Permission::ServicesDeploy,
+            )
+            .await?;
             let deployment = state
                 .deploy_queue
                 .enqueue(
@@ -345,7 +377,11 @@ pub async fn call_tool(
             db::audit::record(
                 &state.db,
                 Some(actor_user_id),
-                "mcp",
+                if identity.api_key_id.is_some() {
+                    "mcp_api_key"
+                } else {
+                    "mcp"
+                },
                 "deploy_compose_project",
                 Some(&project.slug),
                 json!({ "project_id": project.id, "deployment_id": deployment.id }),
@@ -355,15 +391,15 @@ pub async fn call_tool(
             Ok(json!({ "deployment": deployment }))
         }
         "rollback_compose_project" => {
-            if !is_admin {
-                return Err("only admins may roll back Docker projects via MCP".into());
-            }
             let input: RollbackComposeProjectInput =
                 serde_json::from_value(arguments).map_err(|e| e.to_string())?;
-            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Compose project not found")?;
+            let project = authorized_service(
+                state,
+                identity,
+                input.project_id,
+                Permission::ServicesDeploy,
+            )
+            .await?;
             let deployment = state
                 .deploy_queue
                 .enqueue_rollback(&state.db, &project, input.deployment_id)
@@ -372,7 +408,11 @@ pub async fn call_tool(
             db::audit::record(
                 &state.db,
                 Some(actor_user_id),
-                "mcp",
+                if identity.api_key_id.is_some() {
+                    "mcp_api_key"
+                } else {
+                    "mcp"
+                },
                 "rollback_compose_project",
                 Some(&project.slug),
                 json!({
@@ -386,15 +426,11 @@ pub async fn call_tool(
             Ok(json!({ "deployment": deployment }))
         }
         "compose_deployment_log" => {
-            if !is_admin {
-                return Err("only admins may inspect Docker deployments via MCP".into());
-            }
             let input: ComposeDeploymentLogInput =
                 serde_json::from_value(arguments).map_err(|e| e.to_string())?;
-            let project = db::compose_projects::find_by_id(&state.db, input.project_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Compose project not found")?;
+            let project =
+                authorized_service(state, identity, input.project_id, Permission::ServicesRead)
+                    .await?;
             let deployment =
                 db::compose_projects::find_deployment(&state.db, project.id, input.deployment_id)
                     .await

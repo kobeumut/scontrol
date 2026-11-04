@@ -141,10 +141,14 @@ struct CreateProjectBody {
     /// default project's `production` environment when omitted.
     #[serde(default)]
     environment_id: Option<Uuid>,
-    /// Server to place the service on; the least loaded eligible server
-    /// when omitted (see `services::placement`).
+    /// Server to place the service on. When omitted: this host, unless it
+    /// is draining or full (see `place`).
     #[serde(default)]
     server_id: Option<Uuid>,
+    /// Without `server_id`, pick the least loaded eligible server instead
+    /// of this host.
+    #[serde(default)]
+    auto_place: bool,
     /// Write-only values of the service layer; stored sealed, never returned.
     #[serde(default)]
     environment: Vec<(String, String)>,
@@ -194,6 +198,14 @@ async fn create(
         None => Target::Global,
     };
     user.require(Permission::ServicesCreate, target)?;
+    // Creating can also write the variable layer and queue the first
+    // deployment; each needs its own permission.
+    if !body.environment.is_empty() {
+        user.require(Permission::VariablesUpdate, target)?;
+    }
+    if body.deploy {
+        user.require(Permission::ServicesDeploy, target)?;
+    }
     validate_project_input(&body.name, &body.slug, &body.environment)?;
     validate_source(&body.source)?;
     let token_host = match &body.git_credentials {
@@ -203,7 +215,7 @@ async fn create(
         }
         None => None,
     };
-    let server_id = place(&state, body.server_id, &body.source).await?;
+    let server_id = place(&state, body.server_id, body.auto_place, &body.source).await?;
     if let Some(registry_id) = body.registry_id {
         if db::registries::find(&state.db, registry_id)
             .await?
@@ -317,32 +329,42 @@ async fn create(
     ))
 }
 
-/// The server a new service goes on: the requested one if it can take it,
-/// otherwise the least loaded eligible server.
-async fn place(
+/// The server a new service goes on: the requested one if it can take it;
+/// with `auto`, the least loaded eligible server; otherwise this host, or
+/// the least loaded eligible server when this host is draining or full.
+/// Never a remote server the request did not ask for while this host can
+/// take the service, so adding a server changes nothing for existing
+/// clients.
+pub(crate) async fn place(
     state: &AppState,
     requested: Option<Uuid>,
+    auto: bool,
     source: &ComposeSource,
 ) -> ApiResult<Uuid> {
+    use crate::services::placement::{choose, ineligible_reason};
     // A static site runs no container, only files and a host Nginx vhost.
     let needs_docker = !matches!(source, ComposeSource::Static(_));
-    match requested {
-        Some(id) => {
-            let server = db::servers::find(&state.db, id)
-                .await?
-                .ok_or_else(|| ApiError::BadRequest("server not found".into()))?;
-            match crate::services::placement::ineligible_reason(&server, needs_docker) {
-                Some(reason) => Err(ApiError::Conflict(reason)),
-                None => Ok(server.id),
-            }
-        }
-        None => {
-            let servers = db::servers::list(&state.db).await?;
-            crate::services::placement::choose(&servers, needs_docker)
-                .map(|server| server.id)
-                .ok_or_else(|| ApiError::Conflict("no server can take this service".into()))
+    if let Some(id) = requested {
+        let server = db::servers::find(&state.db, id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("server not found".into()))?;
+        return match ineligible_reason(&server, needs_docker) {
+            Some(reason) => Err(ApiError::Conflict(reason)),
+            None => Ok(server.id),
+        };
+    }
+    let servers = db::servers::list(&state.db).await?;
+    if !auto {
+        let local = servers
+            .iter()
+            .find(|s| s.id == db::servers::LOCAL_SERVER_ID);
+        if local.is_some_and(|l| ineligible_reason(l, needs_docker).is_none()) {
+            return Ok(db::servers::LOCAL_SERVER_ID);
         }
     }
+    choose(&servers, needs_docker)
+        .map(|server| server.id)
+        .ok_or_else(|| ApiError::Conflict("no server can take this service".into()))
 }
 
 #[derive(Deserialize, Default)]
@@ -356,13 +378,20 @@ struct DeployProjectBody {
 
 async fn deploy(
     ServiceAccess {
-        principal: user, ..
+        principal: user,
+        service,
+        ..
     }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     body: Option<Json<DeployProjectBody>>,
 ) -> ApiResult<(StatusCode, Json<DeploymentInfo>)> {
     let body = body.map(|Json(body)| body).unwrap_or_default();
+    // Replacing the environment writes the variable layer: that is
+    // `variables:update`, checked before anything changes.
+    if body.environment.is_some() {
+        user.require(Permission::VariablesUpdate, service.target())?;
+    }
     let project = find_project(&state, id).await?;
     if let Some(environment) = body.environment {
         env_layers::replace(
@@ -853,12 +882,18 @@ struct DomainChange<T> {
 
 async fn add_domain(
     ServiceAccess {
-        principal: user, ..
+        principal: user,
+        service,
+        ..
     }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<AddDomainBody>,
 ) -> ApiResult<(StatusCode, Json<DomainChange<ComposeDomain>>)> {
+    // Applying the binding right away is a deployment.
+    if body.redeploy {
+        user.require(Permission::ServicesDeploy, service.target())?;
+    }
     let project = find_project(&state, id).await?;
     if matches!(project.source, ComposeSource::Database(_)) {
         return Err(ApiError::BadRequest(
@@ -927,12 +962,18 @@ struct RemoveDomainQuery {
 
 async fn remove_domain(
     ServiceAccess {
-        principal: user, ..
+        principal: user,
+        service,
+        ..
     }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path((id, domain_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<RemoveDomainQuery>,
 ) -> ApiResult<Json<DomainChange<serde_json::Value>>> {
+    let redeploy = query.redeploy.unwrap_or(true);
+    if redeploy {
+        user.require(Permission::ServicesDeploy, service.target())?;
+    }
     let project = find_project(&state, id).await?;
     if !db::compose_projects::delete_domain(&state.db, id, domain_id).await? {
         return Err(ApiError::NotFound("domain binding not found".into()));
@@ -947,7 +988,7 @@ async fn remove_domain(
     )
     .await
     .ok();
-    let deployment = if query.redeploy.unwrap_or(true) {
+    let deployment = if redeploy {
         Some(
             state
                 .deploy_queue
@@ -1056,11 +1097,15 @@ async fn update_webhook(
 /// previous secret stops working immediately.
 async fn rotate_webhook(
     ServiceAccess {
-        principal: user, ..
+        principal: user,
+        service,
+        ..
     }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<WebhookCredentials>> {
+    // The secret lets its holder trigger deployments.
+    user.require(Permission::ServicesDeploy, service.target())?;
     let project = find_project(&state, id).await?;
     if project.source.git_checkout().is_none() {
         return Err(ApiError::BadRequest(

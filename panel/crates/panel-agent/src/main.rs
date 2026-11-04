@@ -163,7 +163,12 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         tokio::spawn(async move {
             let served = remote::serve(remote, move |stream| {
                 let (read_half, write_half) = tokio::io::split(stream);
-                handle_connection(read_half, write_half, remote_adapter.clone())
+                handle_connection(
+                    read_half,
+                    write_half,
+                    remote_adapter.clone(),
+                    Some(remote::IDLE_TIMEOUT),
+                )
             })
             .await;
             if let Err(error) = served {
@@ -177,17 +182,21 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         let adapter = adapter.clone();
         tokio::spawn(async move {
             let (read_half, write_half) = stream.into_split();
-            if let Err(e) = handle_connection(read_half, write_half, adapter).await {
+            if let Err(e) = handle_connection(read_half, write_half, adapter, None).await {
                 tracing::warn!(error = %e, "connection handler error");
             }
         });
     }
 }
 
+/// Serves requests on one connection until the client closes it. With
+/// `idle`, a connection that sends nothing for that long is closed (remote
+/// clients keep connections open for reuse).
 async fn handle_connection<R, W>(
     read_half: R,
     mut write_half: W,
     adapter: Arc<LocalAdapter>,
+    idle: Option<std::time::Duration>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -198,7 +207,13 @@ where
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = match idle {
+            Some(limit) => match tokio::time::timeout(limit, reader.read_line(&mut line)).await {
+                Ok(read) => read?,
+                Err(_) => return Ok(()),
+            },
+            None => reader.read_line(&mut line).await?,
+        };
         if n == 0 {
             return Ok(());
         }

@@ -1,6 +1,7 @@
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools;
 use crate::state::AppState;
+use panel_core::rbac::Authority;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -10,10 +11,27 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 /// from the session cookie (see `routes::mcp`); stdio transport (typically
 /// launched locally, already root-equivalent trust) acts as the configured
 /// service account.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct McpIdentity {
     pub user_id: Uuid,
+    /// Installation admin acting through a session (never true for a key).
     pub is_admin: bool,
+    /// What the caller may do (an API key is narrowed to its grants).
+    pub authority: Authority,
+    /// Set when the request came with an API key.
+    pub api_key_id: Option<Uuid>,
+}
+
+impl McpIdentity {
+    /// The identity of a panel user acting through a session or a key.
+    pub fn from_principal(principal: &crate::auth::Principal) -> Self {
+        Self {
+            user_id: principal.id,
+            is_admin: principal.is_admin && principal.api_key_id.is_none(),
+            authority: principal.authority.clone(),
+            api_key_id: principal.api_key_id,
+        }
+    }
 }
 
 pub async fn handle_request(
@@ -50,9 +68,7 @@ pub async fn handle_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(json!({}));
-            match tools::call_tool(state, identity.user_id, identity.is_admin, name, arguments)
-                .await
-            {
+            match tools::call_tool(state, &identity, name, arguments).await {
                 Ok(result) => JsonRpcResponse::ok(
                     id,
                     json!({ "content": [{ "type": "text", "text": result.to_string() }], "isError": false }),

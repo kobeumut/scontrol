@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { RegistrySelect } from './Registries';
-import { ServerSelect } from './Servers';
+import { placement, ServerSelect } from './Servers';
 import {
   api, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
   DATABASE_ENGINE_LABELS,
@@ -144,7 +144,7 @@ function CreateProjectForm({ projects, buildTools, onCreated }: { projects?: Pro
         body: {
           name: name.trim(), slug: slug.trim(), environment_id: environmentId || undefined, source,
           environment: toPairs(env), git_credentials, github_app, deploy, registry_id: registryId || undefined,
-          server_id: serverId || undefined,
+          ...placement(serverId),
         },
       });
       setToken('');
