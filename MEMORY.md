@@ -51,6 +51,14 @@ Durable project context that is not obvious from the code. Read it together with
   - Jobs run only inside a project's containers. Host jobs as root would be arbitrary root execution from the panel, and the per-site `cron` adapter already covers site users.
   - How to apply: a new scheduled feature (backups, Docker cleanup) adds a helper mode or reuses this one with typed parameters, never a command in a unit file or crontab.
 
+## Request statistics and Docker cleanup (GENE-74)
+
+- Decision: the agent's access-log reader keeps no state; panel-api owns the inode and offset and commits them with the buckets.
+  - Why: the database is the one place that can make "count the requests and move the cursor" atomic, and a stateless agent survives restarts and rotation without a second cursor file.
+  - How to apply: any future incremental reader (metrics, mail logs) passes its cursor in and out the same way.
+- Decision: `$host` is client-controlled, so hosts are normalized and capped per chunk, with the rest counted as `_other`.
+  - Why: a flood of random `Host` headers must not create unbounded rows.
+
 ## Open Items
 
 The full list is in `TASK.md`. The largest open items as of 2026-11-03 (after D0):

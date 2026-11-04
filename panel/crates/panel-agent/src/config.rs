@@ -93,6 +93,11 @@ pub struct AgentConfig {
     #[serde(default = "default_nginx_stream_dir")]
     pub nginx_stream_dir: PathBuf,
 
+    /// The Nginx JSON access log (`scontrol_json` format) that request
+    /// statistics are read from.
+    #[serde(default = "default_nginx_stats_log")]
+    pub nginx_stats_log: PathBuf,
+
     #[serde(default)]
     pub runtime_features: RuntimeFeatures,
 
@@ -185,6 +190,10 @@ fn default_static_sites_root() -> PathBuf {
     PathBuf::from("/srv/scontrol/static")
 }
 
+fn default_nginx_stats_log() -> PathBuf {
+    PathBuf::from("/var/log/nginx/scontrol-access.json.log")
+}
+
 fn default_nginx_stream_dir() -> PathBuf {
     PathBuf::from("/etc/nginx/scontrol-stream")
 }
@@ -216,6 +225,7 @@ impl Default for AgentConfig {
             railpack_frontend: default_railpack_frontend(),
             buildpacks_builder: default_buildpacks_builder(),
             nginx_stream_dir: default_nginx_stream_dir(),
+            nginx_stats_log: default_nginx_stats_log(),
             runtime_features: RuntimeFeatures {
                 docker: true,
                 mail: true,

@@ -336,6 +336,12 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         AgentRequest::ReadScheduledJobRunLog(p) => {
             AgentResponse::from_core_result(adapter.read_scheduled_job_run_log(p).await)
         }
+        AgentRequest::ReadNginxStats(p) => {
+            AgentResponse::from_core_result(adapter.read_nginx_stats(p).await)
+        }
+        AgentRequest::PruneDocker(p) => {
+            AgentResponse::from_core_result(adapter.prune_docker(p).await)
+        }
         AgentRequest::CreateMailbox(p) => {
             AgentResponse::from_core_result(adapter.create_mailbox(p).await)
         }

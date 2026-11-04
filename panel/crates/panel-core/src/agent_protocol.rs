@@ -56,6 +56,8 @@ pub enum AgentRequest {
     RunScheduledJob(ScheduledJobRef),
     ListScheduledJobRuns(ListScheduledJobRunsParams),
     ReadScheduledJobRunLog(ScheduledJobRunLogParams),
+    ReadNginxStats(ReadNginxStatsParams),
+    PruneDocker(PruneDockerParams),
     CreateMailbox(CreateMailboxParams),
     DeleteMailbox(DeleteMailboxParams),
     ScanPath(ScanPathParams),

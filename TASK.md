@@ -159,8 +159,12 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 ### D4: Observability
 
 - [ ] Agent metrics sampler reading `/proc` and cgroup v2 (no `docker stats` spawning), downsampled retention in PostgreSQL, threshold alerts.
-- [ ] Request stats from an Nginx JSON access log, read incrementally.
-- [ ] Scheduled Docker image/builder cleanup.
+- [x] Request stats from an Nginx JSON access log, read incrementally (GENE-74).
+  - `install/nginx-scontrol-log.conf` (`log_format scontrol_json escape=json`, http-level `access_log`, no headers/query string) and logrotate. `panel_core::observability` parses lines and aggregates per host and UTC minute (hosts capped at 200 per chunk, odd `Host` values counted as `_other`). The agent's `read_nginx_stats` is stateless: panel-api stores the inode and byte offset (`nginx_log_cursor`) and updates it in the same transaction as the buckets (`request_stats_minute`, 30 days kept). Partial last lines wait for the next poll; truncation or a new inode restarts at 0.
+  - `GET /api/observability/requests?hours=&host=` (any signed-in user); UI "Observability" tab with a status-class chart and a per-domain table.
+- [x] Scheduled Docker image/builder cleanup (GENE-74).
+  - Agent `prune_docker`: fixed argv `docker image prune -a -f --filter until=<n>h` and `docker builder prune -a -f ...`; only the validated age (1–8760 h) varies. Freed bytes are parsed from Docker's "Total reclaimed space" / "Total:" line. Runs and settings live in `docker_cleanup_runs` / `docker_cleanup_settings` (migration `0014`); one run at a time; the scheduler (every 5 min) honours the interval; admin-only API and UI (one-click run, interval, age).
+  - Verified: core parser/aggregation tests, agent log-reader tests (offsets, partial lines, rotation, giant line), API tests (accumulation, cursor, cleanup validation, overlap, admin-only). Not yet run against a real Nginx and Docker host (part of the pending installer E2E). Notifications for cleanup results are not added.
 
 ### D5 and D6
 

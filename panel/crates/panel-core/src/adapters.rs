@@ -8,11 +8,50 @@
 //! See CLAUDE.md "Shell Command Rule".
 
 use crate::error::CoreResult;
+use crate::observability::RequestBucket;
 use crate::schedule::{JobRunInfo, ScheduledJobSpec};
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Reads the next part of the Nginx JSON access log. The agent keeps no
+/// cursor: panel-api passes the position it stored last time.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReadNginxStatsParams {
+    /// Identity (inode) of the log file the offset belongs to. When the file
+    /// is now a different one (rotation), reading restarts at 0.
+    pub file_id: Option<u64>,
+    pub offset: u64,
+    /// Bounded by the agent to 64 KiB..=8 MiB.
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NginxStatsChunk {
+    pub buckets: Vec<RequestBucket>,
+    pub file_id: Option<u64>,
+    /// Where to continue: just after the last complete line read.
+    pub next_offset: u64,
+    /// Valid entries aggregated.
+    pub lines: u64,
+    /// Lines that were not valid entries.
+    pub skipped: u64,
+    /// False while the log file does not exist (Nginx not yet logging).
+    pub log_present: bool,
+}
+
+/// A Docker cleanup. Only the age is variable; the commands are fixed.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PruneDockerParams {
+    pub older_than_hours: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DockerPruneOutcome {
+    pub images_freed_bytes: u64,
+    pub builder_freed_bytes: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CreateSiteParams {
@@ -606,6 +645,12 @@ pub trait AdapterPort: Send + Sync {
     async fn restore_database(&self, params: RestoreDatabaseParams) -> CoreResult<()>;
     async fn backup_volume(&self, params: BackupVolumeParams) -> CoreResult<BackupOutcome>;
     async fn restore_volume(&self, params: RestoreVolumeParams) -> CoreResult<()>;
+
+    // Observability: request statistics and Docker cleanup.
+    async fn read_nginx_stats(&self, params: ReadNginxStatsParams) -> CoreResult<NginxStatsChunk>;
+    /// `docker image prune -a` and `docker builder prune -a` with an
+    /// `until=` filter; reports the freed space (Docker feature).
+    async fn prune_docker(&self, params: PruneDockerParams) -> CoreResult<DockerPruneOutcome>;
 }
 
 #[cfg(feature = "test-utils")]
@@ -632,6 +677,12 @@ pub mod mock {
         /// Runs `list_scheduled_job_runs` reports (filtered by job and
         /// `since`), so tests can simulate timer runs.
         pub job_runs: Mutex<Vec<JobRunInfo>>,
+        /// Chunks `read_nginx_stats` hands out, front first. Empty yields an
+        /// empty chunk at the requested offset.
+        pub nginx_chunks: Mutex<std::collections::VecDeque<NginxStatsChunk>>,
+        /// What `prune_docker` reports, and every request received.
+        pub prune_outcome: Mutex<Option<DockerPruneOutcome>>,
+        pub prunes: Mutex<Vec<PruneDockerParams>>,
     }
 
     impl MockAdapter {
@@ -993,6 +1044,40 @@ pub mod mock {
 
         async fn restore_volume(&self, _params: RestoreVolumeParams) -> CoreResult<()> {
             self.record("restore_volume")
+        }
+
+        async fn read_nginx_stats(
+            &self,
+            params: ReadNginxStatsParams,
+        ) -> CoreResult<NginxStatsChunk> {
+            self.record("read_nginx_stats")?;
+            Ok(self
+                .nginx_chunks
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(NginxStatsChunk {
+                    buckets: Vec::new(),
+                    file_id: params.file_id,
+                    next_offset: params.offset,
+                    lines: 0,
+                    skipped: 0,
+                    log_present: true,
+                }))
+        }
+
+        async fn prune_docker(&self, params: PruneDockerParams) -> CoreResult<DockerPruneOutcome> {
+            self.record("prune_docker")?;
+            self.prunes.lock().unwrap().push(params);
+            Ok(self
+                .prune_outcome
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(DockerPruneOutcome {
+                    images_freed_bytes: 0,
+                    builder_freed_bytes: 0,
+                }))
         }
     }
 }

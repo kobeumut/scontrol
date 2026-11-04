@@ -4,6 +4,7 @@ pub mod deploy_queue;
 pub mod env_layers;
 pub mod github_app;
 pub mod notifications;
+pub mod observability;
 pub mod registries;
 pub mod scheduled_jobs;
 pub mod secret_box;

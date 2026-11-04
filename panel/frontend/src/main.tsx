@@ -7,6 +7,7 @@ import { GitHubApps } from './GitHubApps';
 import { Notifications } from './Notifications';
 import { Projects } from './Projects';
 import { Backups } from './Backups';
+import { Observability } from './Observability';
 import { Registries } from './Registries';
 import './styles.css';
 
@@ -55,7 +56,7 @@ function Sites() {
 function App() {
   const health = useApi<{ status: string; capabilities?: Capability }>('/health/agent', 30000);
   const me = useApi<User>('/auth/me');
-  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications'>('projects');
+  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications' | 'observability'>('projects');
   const docker = health.data?.capabilities?.docker;
 
   const signOut = async () => {
@@ -87,12 +88,14 @@ function App() {
           <button className={active === 'projects' ? 'selected' : ''} onClick={() => setActive('projects')}>Compose projects</button>
           <button className={active === 'databases' ? 'selected' : ''} onClick={() => setActive('databases')}>Databases</button>
           <button className={active === 'backups' ? 'selected' : ''} onClick={() => setActive('backups')}>Backups</button>
+          <button className={active === 'observability' ? 'selected' : ''} onClick={() => setActive('observability')}>Observability</button>
           <button className={active === 'registries' ? 'selected' : ''} onClick={() => setActive('registries')}>Registries</button>
           <button className={active === 'sites' ? 'selected' : ''} onClick={() => setActive('sites')}>Hosted sites</button>
           <button className={active === 'github' ? 'selected' : ''} onClick={() => setActive('github')}>GitHub Apps</button>
           <button className={active === 'notifications' ? 'selected' : ''} onClick={() => setActive('notifications')}>Notifications</button>
         </nav>
         {active === 'sites' ? <Sites />
+          : active === 'observability' ? <Observability isAdmin={me.data.is_admin} docker={docker !== false} />
           : active === 'notifications' ? <Notifications />
             : active === 'github' ? <GitHubApps />
             : active === 'backups' ? <Backups docker={docker !== false} />
