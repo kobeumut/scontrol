@@ -270,5 +270,23 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
             AgentResponse::from_core_result(adapter.delete_mailbox(p).await)
         }
         AgentRequest::ScanPath(p) => AgentResponse::from_core_result(adapter.scan_path(p).await),
+        AgentRequest::TestS3Target(p) => {
+            AgentResponse::from_core_result(adapter.test_s3_target(p).await)
+        }
+        AgentRequest::ListBackups(p) => {
+            AgentResponse::from_core_result(adapter.list_backups(p).await)
+        }
+        AgentRequest::BackupDatabase(p) => {
+            AgentResponse::from_core_result(adapter.backup_database(p).await)
+        }
+        AgentRequest::RestoreDatabase(p) => {
+            AgentResponse::from_core_result(adapter.restore_database(p).await)
+        }
+        AgentRequest::BackupVolume(p) => {
+            AgentResponse::from_core_result(adapter.backup_volume(p).await)
+        }
+        AgentRequest::RestoreVolume(p) => {
+            AgentResponse::from_core_result(adapter.restore_volume(p).await)
+        }
     }
 }

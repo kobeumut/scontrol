@@ -311,6 +311,149 @@ pub struct ScanPathParams {
     pub path: String,
 }
 
+/// An S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, ...). Requests
+/// use path-style addressing: `<endpoint>/<bucket>/<key>`. The keys exist
+/// only in memory and on the agent socket; `Debug` redacts them.
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct S3Target {
+    /// `https://host[:port]` (plain `http://` is accepted for a local MinIO).
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl std::fmt::Debug for S3Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Target")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"********")
+            .field("secret_key", &"********")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupEngine {
+    Postgres,
+    Mysql,
+    Mongodb,
+}
+
+impl BackupEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackupEngine::Postgres => "postgres",
+            BackupEngine::Mysql => "mysql",
+            BackupEngine::Mongodb => "mongodb",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            BackupEngine::Mongodb => "archive.gz",
+            _ => "sql.gz",
+        }
+    }
+}
+
+/// How to reach a database server. The password goes to the dump tool
+/// through its environment (or a 0600 config file for MongoDB), never argv.
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DatabaseConnection {
+    pub engine: BackupEngine,
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for DatabaseConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConnection")
+            .field("engine", &self.engine)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"********")
+            .finish()
+    }
+}
+
+/// Streams a database dump (gzip) straight into a multipart S3 upload,
+/// then prunes backups of the same database beyond `retention_count`
+/// (0 keeps everything).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BackupDatabaseParams {
+    pub target: S3Target,
+    pub prefix: String,
+    pub connection: DatabaseConnection,
+    pub retention_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RestoreDatabaseParams {
+    pub target: S3Target,
+    pub key: String,
+    pub connection: DatabaseConnection,
+}
+
+/// Streams `tar | gzip` of a Docker named volume into S3. With
+/// `stop_service`, the service is stopped for the copy and started again
+/// afterwards (even when the copy fails).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BackupVolumeParams {
+    pub target: S3Target,
+    pub prefix: String,
+    pub project_slug: String,
+    pub service: Option<String>,
+    pub volume: String,
+    pub stop_service: bool,
+    pub retention_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RestoreVolumeParams {
+    pub target: S3Target,
+    pub key: String,
+    pub project_slug: String,
+    pub service: Option<String>,
+    pub volume: String,
+    pub stop_service: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BackupOutcome {
+    pub key: String,
+    pub size_bytes: u64,
+    /// Older backups deleted by the retention policy.
+    pub pruned: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TestS3Params {
+    pub target: S3Target,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ListBackupsParams {
+    pub target: S3Target,
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct BackupObject {
+    pub key: String,
+    pub size_bytes: u64,
+    pub last_modified: String,
+}
+
 /// Capabilities the running agent supports, derived from the optional
 /// features it was compiled and configured with. `panel-api` queries this at
 /// startup (and caches it) so it can return clear "not installed" errors
@@ -400,6 +543,14 @@ pub trait AdapterPort: Send + Sync {
 
     // Optional: Antivirus
     async fn scan_path(&self, params: ScanPathParams) -> CoreResult<ScanResult>;
+
+    // Data: streaming S3 backups
+    async fn test_s3_target(&self, params: TestS3Params) -> CoreResult<()>;
+    async fn list_backups(&self, params: ListBackupsParams) -> CoreResult<Vec<BackupObject>>;
+    async fn backup_database(&self, params: BackupDatabaseParams) -> CoreResult<BackupOutcome>;
+    async fn restore_database(&self, params: RestoreDatabaseParams) -> CoreResult<()>;
+    async fn backup_volume(&self, params: BackupVolumeParams) -> CoreResult<BackupOutcome>;
+    async fn restore_volume(&self, params: RestoreVolumeParams) -> CoreResult<()>;
 }
 
 #[cfg(feature = "test-utils")]
@@ -701,6 +852,40 @@ pub mod mock {
                 started_at: now,
                 finished_at: now,
             })
+        }
+        async fn test_s3_target(&self, _params: TestS3Params) -> CoreResult<()> {
+            self.record("test_s3_target")
+        }
+
+        async fn list_backups(&self, _params: ListBackupsParams) -> CoreResult<Vec<BackupObject>> {
+            self.record("list_backups")?;
+            Ok(vec![])
+        }
+
+        async fn backup_database(&self, params: BackupDatabaseParams) -> CoreResult<BackupOutcome> {
+            self.record("backup_database")?;
+            Ok(BackupOutcome {
+                key: format!("{}/mock.sql.gz", params.prefix),
+                size_bytes: 0,
+                pruned: 0,
+            })
+        }
+
+        async fn restore_database(&self, _params: RestoreDatabaseParams) -> CoreResult<()> {
+            self.record("restore_database")
+        }
+
+        async fn backup_volume(&self, params: BackupVolumeParams) -> CoreResult<BackupOutcome> {
+            self.record("backup_volume")?;
+            Ok(BackupOutcome {
+                key: format!("{}/mock.tar.gz", params.prefix),
+                size_bytes: 0,
+                pruned: 0,
+            })
+        }
+
+        async fn restore_volume(&self, _params: RestoreVolumeParams) -> CoreResult<()> {
+            self.record("restore_volume")
         }
     }
 }

@@ -221,6 +221,7 @@ mod tests {
     fn config(root: &Path) -> AgentConfig {
         AgentConfig {
             docker_projects_root: root.to_path_buf(),
+            docker_volumes_root: std::path::PathBuf::from("/nonexistent-volumes"),
             ..Default::default()
         }
     }

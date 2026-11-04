@@ -6,6 +6,7 @@ import { Databases } from './Databases';
 import { GitHubApps } from './GitHubApps';
 import { Notifications } from './Notifications';
 import { Projects } from './Projects';
+import { Backups } from './Backups';
 import { Registries } from './Registries';
 import './styles.css';
 
@@ -54,7 +55,7 @@ function Sites() {
 function App() {
   const health = useApi<{ status: string; capabilities?: Capability }>('/health/agent', 30000);
   const me = useApi<User>('/auth/me');
-  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'databases' | 'registries' | 'github' | 'notifications'>('projects');
+  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications'>('projects');
   const docker = health.data?.capabilities?.docker;
 
   const signOut = async () => {
@@ -85,6 +86,7 @@ function App() {
           <button className={active === 'groups' ? 'selected' : ''} onClick={() => setActive('groups')}>Projects &amp; environments</button>
           <button className={active === 'projects' ? 'selected' : ''} onClick={() => setActive('projects')}>Compose projects</button>
           <button className={active === 'databases' ? 'selected' : ''} onClick={() => setActive('databases')}>Databases</button>
+          <button className={active === 'backups' ? 'selected' : ''} onClick={() => setActive('backups')}>Backups</button>
           <button className={active === 'registries' ? 'selected' : ''} onClick={() => setActive('registries')}>Registries</button>
           <button className={active === 'sites' ? 'selected' : ''} onClick={() => setActive('sites')}>Hosted sites</button>
           <button className={active === 'github' ? 'selected' : ''} onClick={() => setActive('github')}>GitHub Apps</button>
@@ -93,6 +95,7 @@ function App() {
         {active === 'sites' ? <Sites />
           : active === 'notifications' ? <Notifications />
             : active === 'github' ? <GitHubApps />
+            : active === 'backups' ? <Backups docker={docker !== false} />
             : active === 'registries' ? (docker === false ? <section className="panel"><p className="state">Docker was not selected at install time.</p></section> : <Registries />)
             : docker === false ? <section className="panel"><p className="state">Docker was not selected at install time. Re-run the installer and opt in to enable projects and Compose services.</p></section>
             : active === 'groups' ? <Projects />

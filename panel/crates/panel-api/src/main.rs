@@ -61,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
     if interrupted > 0 {
         tracing::warn!(interrupted, "marked interrupted deployments as failed");
     }
+    let interrupted = db::backups::fail_interrupted_runs(&state.db).await?;
+    if interrupted > 0 {
+        tracing::warn!(interrupted, "marked interrupted backup runs as failed");
+    }
     state.deploy_queue.start_workers(
         state.db.clone(),
         state.agent.clone(),

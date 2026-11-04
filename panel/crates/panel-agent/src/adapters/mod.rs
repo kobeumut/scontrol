@@ -1,5 +1,6 @@
 #[cfg(feature = "antivirus")]
 pub mod antivirus;
+pub mod backup;
 #[cfg(feature = "builders")]
 pub mod builders;
 #[cfg(feature = "docker")]
@@ -22,6 +23,7 @@ pub mod git_auth;
 pub mod mail;
 pub mod nginx;
 pub mod php_fpm;
+pub mod s3;
 pub mod systemd_app;
 pub mod tls;
 pub mod users;
@@ -573,6 +575,52 @@ impl AdapterPort for LocalAdapter {
         {
             let _ = params;
             Err(Self::feature_disabled("antivirus"))
+        }
+    }
+
+    async fn test_s3_target(&self, params: TestS3Params) -> CoreResult<()> {
+        backup::test_target(params).await
+    }
+
+    async fn list_backups(&self, params: ListBackupsParams) -> CoreResult<Vec<BackupObject>> {
+        backup::list(params).await
+    }
+
+    async fn backup_database(&self, params: BackupDatabaseParams) -> CoreResult<BackupOutcome> {
+        backup::backup_database(params).await
+    }
+
+    async fn restore_database(&self, params: RestoreDatabaseParams) -> CoreResult<()> {
+        backup::restore_database(params).await
+    }
+
+    async fn backup_volume(&self, params: BackupVolumeParams) -> CoreResult<BackupOutcome> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return backup::backup_volume(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn restore_volume(&self, params: RestoreVolumeParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return backup::restore_volume(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
         }
     }
 }

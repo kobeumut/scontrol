@@ -54,6 +54,12 @@ pub enum AgentRequest {
     CreateMailbox(CreateMailboxParams),
     DeleteMailbox(DeleteMailboxParams),
     ScanPath(ScanPathParams),
+    TestS3Target(TestS3Params),
+    ListBackups(ListBackupsParams),
+    BackupDatabase(BackupDatabaseParams),
+    RestoreDatabase(RestoreDatabaseParams),
+    BackupVolume(BackupVolumeParams),
+    RestoreVolume(RestoreVolumeParams),
 }
 
 /// One line of a streamed response (see the module docs).

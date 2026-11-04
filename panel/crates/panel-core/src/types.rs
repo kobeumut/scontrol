@@ -1200,9 +1200,135 @@ pub mod validate {
             && !secret.chars().any(|c| c.is_control() || c.is_whitespace())
     }
 
+    /// `https://host[:port]` (or `http://` for a local MinIO), with no path,
+    /// userinfo, query, or fragment. Returns the normalized endpoint.
+    pub fn normalize_s3_endpoint(endpoint: &str) -> Option<String> {
+        let trimmed = endpoint.trim().trim_end_matches('/');
+        let (scheme, rest) = trimmed
+            .strip_prefix("https://")
+            .map(|rest| ("https", rest))
+            .or_else(|| trimmed.strip_prefix("http://").map(|rest| ("http", rest)))?;
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (rest, None),
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            || !is_valid_git_host(host)
+        {
+            return None;
+        }
+        if let Some(port) = port {
+            if port.parse::<u16>().ok().filter(|p| *p > 0).is_none()
+                || !port.chars().all(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+        }
+        Some(format!("{scheme}://{}", rest.to_ascii_lowercase()))
+    }
+
+    static S3_BUCKET_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$").unwrap());
+    static S3_REGION_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^[a-z0-9][a-z0-9-]{0,30}$").unwrap());
+    static S3_KEY_ID_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^[A-Za-z0-9._-]{1,128}$").unwrap());
+    static BACKUP_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$").unwrap()
+    });
+
+    pub fn is_valid_s3_bucket(bucket: &str) -> bool {
+        S3_BUCKET_RE.is_match(bucket)
+    }
+
+    /// `auto` (Cloudflare R2) and `us-east-1` style names.
+    pub fn is_valid_s3_region(region: &str) -> bool {
+        S3_REGION_RE.is_match(region)
+    }
+
+    pub fn is_valid_s3_access_key(key: &str) -> bool {
+        S3_KEY_ID_RE.is_match(key)
+    }
+
+    /// An S3 secret key: printable, no whitespace.
+    pub fn is_valid_s3_secret_key(secret: &str) -> bool {
+        !secret.is_empty()
+            && secret.len() <= 256
+            && !secret.chars().any(|c| c.is_control() || c.is_whitespace())
+    }
+
+    /// A backup key prefix or object key: `/`-separated segments of
+    /// `[A-Za-z0-9._-]`, none starting with `.` or `-`, so no `..`, no empty
+    /// segments, and no leading slash.
+    pub fn is_valid_backup_path(path: &str) -> bool {
+        path.len() <= 512 && BACKUP_PATH_RE.is_match(path) && !path.contains("..")
+    }
+
+    /// A database server host or IP literal. Never starts with `-`, so it
+    /// cannot be read as an option by a dump tool.
+    pub fn is_valid_db_host(host: &str) -> bool {
+        !host.is_empty()
+            && host.len() <= 253
+            && host
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == ':')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+    }
+
+    /// A database password: printable, no whitespace, at most 256 bytes.
+    pub fn is_valid_db_password(password: &str) -> bool {
+        !password.is_empty()
+            && password.len() <= 256
+            && !password
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn backup_inputs_are_validated() {
+            assert_eq!(
+                normalize_s3_endpoint("https://ACC.r2.cloudflarestorage.com/").as_deref(),
+                Some("https://acc.r2.cloudflarestorage.com")
+            );
+            assert_eq!(
+                normalize_s3_endpoint("http://127.0.0.1:9000").as_deref(),
+                Some("http://127.0.0.1:9000")
+            );
+            for bad in [
+                "",
+                "ftp://x.com",
+                "https://u@x.com",
+                "https://x.com/p",
+                "https://x.com:0",
+                "https://x.com:abc",
+                "x.com",
+            ] {
+                assert_eq!(normalize_s3_endpoint(bad), None, "{bad:?}");
+            }
+            assert!(is_valid_s3_bucket("my-backups.01"));
+            assert!(!is_valid_s3_bucket("Bad_Bucket"));
+            assert!(is_valid_s3_region("auto") && is_valid_s3_region("eu-west-1"));
+            assert!(is_valid_backup_path("scontrol/db-main"));
+            for bad in ["", "/abs", "a//b", "a/../b", "a/.hidden", "-x", "a b", "a/"] {
+                assert!(!is_valid_backup_path(bad), "{bad:?}");
+            }
+            assert!(
+                is_valid_db_host("db.internal")
+                    && is_valid_db_host("::1")
+                    && is_valid_db_host("10.0.0.5")
+            );
+            assert!(!is_valid_db_host("-oProxyCommand") && !is_valid_db_host("a b"));
+        }
 
         #[test]
         fn registry_addresses_normalize_to_docker_auth_keys() {
