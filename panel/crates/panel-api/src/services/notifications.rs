@@ -1,5 +1,5 @@
-//! Deployment notifications: Slack, Discord, Telegram, ntfy, Gotify, a
-//! generic signed webhook, and SMTP.
+//! Deployment and scheduled-job notifications: Slack, Discord, Telegram,
+//! ntfy, Gotify, a generic signed webhook, and SMTP.
 //!
 //! Each channel has non-secret settings (`ChannelConfig`, stored as JSON)
 //! and at most one secret (webhook URL, bot/app token, SMTP password,
@@ -13,6 +13,7 @@ use super::secret_box::SecretBox;
 use crate::db;
 use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
+use panel_core::schedule::{JobRunInfo, ScheduledJob};
 use panel_core::types::{validate, DeploymentStatus};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,12 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Events a channel can subscribe to.
-pub const EVENTS: &[&str] = &["deploy_succeeded", "deploy_failed", "deploy_cancelled"];
+pub const EVENTS: &[&str] = &[
+    "deploy_succeeded",
+    "deploy_failed",
+    "deploy_cancelled",
+    "job_failed",
+];
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_LEN: usize = 300;
@@ -299,6 +305,64 @@ impl Notification {
     }
 }
 
+impl Notification {
+    /// A failed scheduled-job run. Command output is not included: it can
+    /// hold data that should not leave the server, and the log is one click
+    /// away in the panel.
+    fn job_run_failed(
+        project: &panel_core::types::ComposeProject,
+        job: &ScheduledJob,
+        run: &JobRunInfo,
+    ) -> Self {
+        let seconds = run
+            .finished_at
+            .map(|end| (end - run.started_at).num_seconds().max(0));
+        let mut body = format!(
+            "Project: {} ({})\nService: {}\nTrigger: {}",
+            project.name,
+            project.slug,
+            job.service_name,
+            run.trigger.as_str()
+        );
+        if let Some(code) = run.exit_code {
+            body.push_str(&format!("\nExit code: {code}"));
+        }
+        if let Some(seconds) = seconds {
+            body.push_str(&format!("\nDuration: {seconds}s"));
+        }
+        if let Some(error) = &run.error_message {
+            let error: String = error.chars().take(500).collect();
+            body.push_str(&format!("\nError: {error}"));
+        }
+        Self {
+            event: "job_failed",
+            title: format!("Scheduled job failed: {} ({})", job.name, project.name),
+            body,
+            data: json!({
+                "project": { "id": project.id, "name": project.name, "slug": project.slug },
+                "job": {
+                    "id": job.id,
+                    "name": job.name,
+                    "service_name": job.service_name,
+                    "schedule": job.schedule,
+                    "timezone": job.timezone,
+                },
+                "run": {
+                    "id": run.id,
+                    "status": run.status,
+                    "trigger": run.trigger,
+                    "exit_code": run.exit_code,
+                    "error_message": run.error_message,
+                    "started_at": run.started_at,
+                    "finished_at": run.finished_at,
+                    "duration_seconds": seconds,
+                },
+            }),
+            urgent: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Notifier {
     secrets: SecretBox,
@@ -342,6 +406,35 @@ impl Notifier {
                 tracing::warn!(%deployment_id, %error, "deployment notification failed");
             }
         });
+    }
+
+    /// Notifies `job_failed` channels about a failed run, in the background.
+    pub fn job_run_failed(&self, db: PgPool, run: JobRunInfo) {
+        let notifier = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = notifier.notify_job_run(&db, &run).await {
+                tracing::warn!(run_id = %run.id, %error, "job notification failed");
+            }
+        });
+    }
+
+    async fn notify_job_run(&self, db: &PgPool, run: &JobRunInfo) -> anyhow::Result<()> {
+        let Some(job) = db::scheduled_jobs::find_by_id(db, run.job_id).await? else {
+            return Ok(());
+        };
+        let Some(project) = db::compose_projects::find_by_id(db, job.compose_project_id).await?
+        else {
+            return Ok(());
+        };
+        let notification = Notification::job_run_failed(&project, &job, run);
+        let channels = db::notifications::list_for_event(db, notification.event).await?;
+        futures::future::join_all(
+            channels
+                .iter()
+                .map(|channel| self.deliver_and_record(db, channel, &notification)),
+        )
+        .await;
+        Ok(())
     }
 
     async fn notify_deployment(

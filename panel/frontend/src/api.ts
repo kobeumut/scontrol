@@ -137,6 +137,27 @@ export const gitTransport = (url: string): 'ssh' | 'https' | null =>
 
 export type LogChunk = { content: string; next_offset: number; eof: boolean; status: DeploymentStatus };
 
+/** Cron (converted to systemd `OnCalendar=`) or a systemd calendar expression. */
+export type JobSchedule = { kind: 'cron' | 'calendar'; expression: string };
+export type JobRunStatus = 'running' | 'succeeded' | 'failed';
+
+/** A command run by a systemd timer inside a service container; `command` is argv, never a shell string. */
+export type ScheduledJob = {
+  id: string; compose_project_id: string; name: string; service_name: string; command: string[];
+  schedule: JobSchedule; timezone: string; on_calendar: string[]; timeout_secs: number; enabled: boolean;
+  last_run_at: string | null; last_run_status: JobRunStatus | null; created_at: string; updated_at: string;
+};
+
+export type JobInput = Pick<ScheduledJob, 'name' | 'service_name' | 'command' | 'schedule' | 'timezone' | 'timeout_secs' | 'enabled'>;
+
+export type JobRun = {
+  id: string; job_id: string; trigger: 'schedule' | 'manual'; status: JobRunStatus;
+  started_at: string; finished_at: string | null; exit_code: number | null; error_message: string | null;
+  log_bytes: number; log_truncated: boolean;
+};
+
+export type JobLogChunk = { content: string; next_offset: number; eof: boolean; status: JobRunStatus };
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
 }

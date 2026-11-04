@@ -24,6 +24,8 @@
 //! db.env                    database services: 0600 generated credentials
 //! redis.conf                Redis services: 0400 config holding the password
 //! exposure.json             database services: applied outside access
+//! jobs/<id>/                scheduled job definition, run records and logs
+//!                           (see `scheduled_jobs`)
 //! ```
 //!
 //! A database service (`ComposeSource::Database`) is rendered from a vetted
@@ -250,7 +252,7 @@ pub async fn write_project_environment(
 
 /// Every environment value of the project, including overridden inherited
 /// ones, for masking in deployment and container logs.
-async fn environment_secrets(root: &Path) -> CoreResult<Vec<String>> {
+pub(crate) async fn environment_secrets(root: &Path) -> CoreResult<Vec<String>> {
     let mut secrets: Vec<String> = read_environment(&root.join(ENV_FILE))
         .await?
         .into_iter()
@@ -359,6 +361,9 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
             params.project_slug
         )));
     }
+    // Timers of the project's scheduled jobs go first: they would otherwise
+    // keep firing into a project that no longer exists.
+    super::scheduled_jobs::remove_project_jobs(cfg, &params.project_slug).await?;
     let root = project_root(cfg, &params.project_slug);
     // A database service may be reachable from outside through a stream
     // proxy and firewall rule; close that first.
@@ -1273,6 +1278,11 @@ async fn prune_static_releases(releases: &Path, current: &str) {
 }
 
 /// The release a static site serves, if it was deployed.
+/// Whether the project is a static site (no containers).
+pub(crate) fn is_static_project(cfg: &AgentConfig, slug: &str) -> bool {
+    project_root(cfg, slug).join(STATIC_MARKER).exists() || static_site_dir(cfg, slug).exists()
+}
+
 fn static_release(cfg: &AgentConfig, slug: &str) -> Option<String> {
     std::fs::read_to_string(project_root(cfg, slug).join(STATIC_MARKER))
         .ok()
@@ -1787,7 +1797,7 @@ async fn reset_dir(dir: &Path) -> CoreResult<()> {
         .map_err(|e| CoreError::Io(format!("creating source directory: {e}")))
 }
 
-async fn create_private_dir(dir: &Path) -> CoreResult<()> {
+pub(crate) async fn create_private_dir(dir: &Path) -> CoreResult<()> {
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| CoreError::Io(format!("creating project root: {e}")))?;
@@ -1842,7 +1852,7 @@ async fn write_environment(path: &Path, environment: &[(String, String)]) -> Cor
 }
 
 /// Replaces `path` with `body`, readable by root only (0600).
-async fn write_private_file(path: &Path, body: &str) -> CoreResult<()> {
+pub(crate) async fn write_private_file(path: &Path, body: &str) -> CoreResult<()> {
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
@@ -2152,18 +2162,18 @@ fn compose_policy(yaml: &Yaml, agent_files: &[PathBuf]) -> CoreResult<Vec<String
     Ok(host_paths)
 }
 
-struct ProjectPaths {
+pub(crate) struct ProjectPaths {
     code_dir: PathBuf,
     compose: PathBuf,
     env: Option<PathBuf>,
     override_file: Option<PathBuf>,
 }
 
-fn project_root(cfg: &AgentConfig, slug: &str) -> PathBuf {
+pub(crate) fn project_root(cfg: &AgentConfig, slug: &str) -> PathBuf {
     cfg.docker_projects_root.join(slug)
 }
 
-fn existing_project_paths(cfg: &AgentConfig, slug: &str) -> CoreResult<ProjectPaths> {
+pub(crate) fn existing_project_paths(cfg: &AgentConfig, slug: &str) -> CoreResult<ProjectPaths> {
     if !validate::is_valid_project_slug(slug) {
         return Err(CoreError::Validation(format!(
             "invalid project slug: {slug}"
@@ -2265,6 +2275,52 @@ fn compose_up_args(slug: &str, paths: &ProjectPaths, pull_images: bool) -> Vec<S
         args.extend(["--pull".into(), "always".into()]);
     }
     args
+}
+
+/// `docker compose ... exec -T -e <marker>... <service> <argv...>` for a
+/// scheduled job. Compose stops parsing its own options at the service
+/// name, and the command never starts with `-` (see
+/// `validate_job_command`), so every argument reaches the container
+/// process as is, without a shell. `markers` are `NAME=value` variables the
+/// agent uses to find the run's processes again.
+pub(crate) fn compose_exec_args(
+    slug: &str,
+    paths: &ProjectPaths,
+    service: &str,
+    markers: &[String],
+    command: &[String],
+) -> Vec<String> {
+    let mut args = compose_args(slug, paths);
+    args.extend(["exec".into(), "-T".into()]);
+    for marker in markers {
+        args.extend(["-e".into(), marker.clone()]);
+    }
+    args.push(service.into());
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// IDs of the containers of one service (`docker compose ps -q`).
+pub(crate) async fn service_container_ids(
+    slug: &str,
+    paths: &ProjectPaths,
+    service: &str,
+) -> CoreResult<Vec<String>> {
+    let mut args = compose_args(slug, paths);
+    args.extend(["ps".into(), "-q".into(), service.into()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
+    if code != 0 {
+        return Err(CoreError::External(format!(
+            "docker compose ps failed: {stderr}"
+        )));
+    }
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|id| id.len() >= 12 && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .collect())
 }
 
 fn compose_args(slug: &str, paths: &ProjectPaths) -> Vec<String> {

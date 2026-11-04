@@ -11,7 +11,7 @@ mod adapters;
 mod config;
 
 use adapters::LocalAdapter;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use config::AgentConfig;
 use panel_core::adapters::{AdapterPort, LogLines};
 use panel_core::agent_protocol::{AgentRequest, AgentResponse, StreamFrame};
@@ -29,8 +29,21 @@ use tokio::net::{UnixListener, UnixStream};
 )]
 struct Args {
     /// Path to agent.toml
-    #[arg(long, default_value = "/etc/scontrol/agent.toml")]
+    #[arg(long, default_value = config::DEFAULT_CONFIG_PATH, global = true)]
     config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<HelperCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum HelperCommand {
+    /// Runs one scheduled job; started by its generated systemd service.
+    #[command(name = "run-scheduled-job", hide = true)]
+    RunScheduledJob {
+        project_slug: String,
+        job_id: uuid::Uuid,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -41,11 +54,57 @@ fn main() -> anyhow::Result<()> {
     if let Some(result) = adapters::git_auth::run_as_git_helper() {
         return result;
     }
-    serve()
+    let args = Args::parse();
+    match args.command {
+        Some(HelperCommand::RunScheduledJob {
+            ref project_slug,
+            job_id,
+        }) => run_scheduled_job(&args.config, project_slug, job_id),
+        None => serve(args),
+    }
+}
+
+/// Helper mode for a job's systemd service: one run, recorded next to its
+/// log. Exits non-zero when the run failed, so the unit shows as failed.
+fn run_scheduled_job(
+    config_path: &std::path::Path,
+    project_slug: &str,
+    job_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
+        )
+        .init();
+    #[cfg(feature = "docker")]
+    {
+        let config = AgentConfig::load(config_path)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let status = runtime.block_on(adapters::scheduled_jobs::execute(
+            &config,
+            project_slug,
+            job_id,
+        ))?;
+        tracing::info!(%job_id, %status, "scheduled job finished");
+        // An error from `main` is a non-zero exit, so systemd marks the unit
+        // failed; the run record and log carry the details.
+        if status != panel_core::schedule::JobRunStatus::Succeeded {
+            anyhow::bail!("scheduled job {job_id} {status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "docker"))]
+    {
+        let _ = (config_path, project_slug, job_id);
+        anyhow::bail!("scheduled jobs need an agent built with the 'docker' feature")
+    }
 }
 
 #[tokio::main]
-async fn serve() -> anyhow::Result<()> {
+async fn serve(args: Args) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
@@ -53,7 +112,6 @@ async fn serve() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let args = Args::parse();
     let config = AgentConfig::load(&args.config)?;
     tracing::info!(socket = %config.socket_path.display(), "starting panel-agent");
 
@@ -262,6 +320,21 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         }
         AgentRequest::ReadDeploymentLog(p) => {
             AgentResponse::from_core_result(adapter.read_deployment_log(p).await)
+        }
+        AgentRequest::UpsertScheduledJob(p) => {
+            AgentResponse::from_core_result(adapter.upsert_scheduled_job(p).await)
+        }
+        AgentRequest::RemoveScheduledJob(p) => {
+            AgentResponse::from_core_result(adapter.remove_scheduled_job(p).await)
+        }
+        AgentRequest::RunScheduledJob(p) => {
+            AgentResponse::from_core_result(adapter.run_scheduled_job(p).await)
+        }
+        AgentRequest::ListScheduledJobRuns(p) => {
+            AgentResponse::from_core_result(adapter.list_scheduled_job_runs(p).await)
+        }
+        AgentRequest::ReadScheduledJobRunLog(p) => {
+            AgentResponse::from_core_result(adapter.read_scheduled_job_run_log(p).await)
         }
         AgentRequest::CreateMailbox(p) => {
             AgentResponse::from_core_result(adapter.create_mailbox(p).await)

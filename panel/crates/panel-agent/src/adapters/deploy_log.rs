@@ -61,6 +61,16 @@ impl DeployLog {
         })
     }
 
+    /// Bytes written so far, including panel-authored lines.
+    pub fn bytes_written(&self) -> u64 {
+        self.written
+    }
+
+    /// Whether output reached the limit and the rest was dropped.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
     pub fn is_cancelled(&self) -> bool {
         *self.cancel.borrow()
     }

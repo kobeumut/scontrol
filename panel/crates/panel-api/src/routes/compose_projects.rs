@@ -80,6 +80,7 @@ pub fn router() -> Router<AppState> {
                 .put(update_webhook)
                 .delete(disable_webhook),
         )
+        .merge(super::scheduled_jobs::router())
 }
 
 async fn list(

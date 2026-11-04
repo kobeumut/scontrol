@@ -7,5 +7,6 @@ pub mod agent_client;
 pub mod agent_protocol;
 pub mod database_services;
 pub mod error;
+pub mod schedule;
 pub mod security;
 pub mod types;

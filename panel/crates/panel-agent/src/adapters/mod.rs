@@ -24,6 +24,8 @@ pub mod mail;
 pub mod nginx;
 pub mod php_fpm;
 pub mod s3;
+#[cfg(feature = "docker")]
+pub mod scheduled_jobs;
 pub mod systemd_app;
 pub mod tls;
 pub mod users;
@@ -451,6 +453,87 @@ impl AdapterPort for LocalAdapter {
             .get(&params.deployment_id)
             .cloned();
         Ok(sender.is_some_and(|tx| tx.send(true).is_ok()))
+    }
+
+    async fn upsert_scheduled_job(&self, params: UpsertScheduledJobParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return scheduled_jobs::upsert(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn remove_scheduled_job(&self, params: ScheduledJobRef) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return scheduled_jobs::remove(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn run_scheduled_job(&self, params: ScheduledJobRef) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return scheduled_jobs::run_now(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn list_scheduled_job_runs(
+        &self,
+        params: ListScheduledJobRunsParams,
+    ) -> CoreResult<Vec<panel_core::schedule::JobRunInfo>> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return scheduled_jobs::list_runs(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn read_scheduled_job_run_log(
+        &self,
+        params: ScheduledJobRunLogParams,
+    ) -> CoreResult<DeploymentLogChunk> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return scheduled_jobs::read_run_log(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
     }
 
     async fn create_container(&self, params: CreateContainerParams) -> CoreResult<ContainerInfo> {

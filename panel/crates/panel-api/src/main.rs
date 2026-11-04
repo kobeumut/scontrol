@@ -77,6 +77,11 @@ async fn main() -> anyhow::Result<()> {
         workers = config.deploy_workers,
         "deployment workers started"
     );
+    state.job_runs.start(
+        state.db.clone(),
+        state.agent.clone(),
+        state.notifier.clone(),
+    );
 
     let router = routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

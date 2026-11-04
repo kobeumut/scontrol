@@ -246,46 +246,10 @@ mod tests {
     use panel_core::adapters::mock::MockAdapter;
     use serde_json::{json, Value};
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
-    /// A one-route HTTP receiver: answers 200 and hands over each request's
-    /// lower-cased headers and body.
     async fn receiver() -> (String, tokio::sync::mpsc::Receiver<(String, String)>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/hook", listener.local_addr().unwrap());
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 4096];
-                let (head, body) = loop {
-                    let n = socket.read(&mut buf).await.unwrap();
-                    raw.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&raw).to_string();
-                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                        let length = head
-                            .lines()
-                            .find_map(|l| {
-                                l.to_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|v| v.trim().parse::<usize>().unwrap())
-                            })
-                            .unwrap_or(0);
-                        if body.len() >= length {
-                            break (head.to_lowercase(), body.to_string());
-                        }
-                    }
-                };
-                socket
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                    .await
-                    .unwrap();
-                tx.send((head, body)).await.ok();
-            }
-        });
-        (url, rx)
+        test_support::http_receiver().await
     }
 
     async fn call(

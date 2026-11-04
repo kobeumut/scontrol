@@ -51,3 +51,9 @@ fieldset{border:1px solid var(--line);padding:12px 14px;margin:0}legend{font:11p
 table.layers{margin-bottom:12px}table.layers td{padding:8px 10px}
 .badge.layer-project{border-color:#6c7fa8;color:#3d4f78}.badge.layer-environment{border-color:#ac8613;color:#7e620a}.badge.layer-service{border-color:#5e9d68;color:#296438}
 .badge.overridden{color:var(--muted);text-decoration:line-through;margin-right:4px}
+/* Scheduled jobs: table actions, timer preview, run history dialog. */
+.panel-title.subsection{margin:34px 0 0}.panel-title.subsection h3{margin:0}
+td.actions{white-space:nowrap}td.actions .link{margin-left:10px}td.actions .link:first-child{margin-left:0}
+.calendar-line{display:block}
+.modal-backdrop{position:fixed;inset:0;background:rgba(24,32,28,.45);display:flex;align-items:flex-start;justify-content:center;padding:48px 16px;overflow:auto;z-index:10}
+.modal{background:var(--paper);border:1px solid var(--ink);width:min(960px,100%);padding:20px 22px 24px}.modal table{margin-top:6px}

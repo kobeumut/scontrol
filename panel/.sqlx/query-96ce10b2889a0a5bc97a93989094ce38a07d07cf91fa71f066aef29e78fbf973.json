@@ -1,0 +1,115 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE job_schedules\n           SET name = $2, service_name = $3, command = $4, schedule_kind = $5,\n               schedule_expression = $6, timezone = $7, on_calendar = $8,\n               timeout_secs = $9, enabled = $10, updated_at = now()\n           WHERE id = $1\n           RETURNING id, compose_project_id, name, service_name, command, schedule_kind,\n                     schedule_expression, timezone, on_calendar, timeout_secs, enabled,\n                     last_run_at, last_run_status, created_at, updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "compose_project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "service_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "command",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "schedule_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "schedule_expression",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "timezone",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "on_calendar",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 9,
+        "name": "timeout_secs",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_run_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "last_run_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "TextArray",
+        "Int4",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "96ce10b2889a0a5bc97a93989094ce38a07d07cf91fa71f066aef29e78fbf973"
+}
