@@ -71,6 +71,17 @@ Durable project context that is not obvious from the code. Read it together with
   - Why `pull_policy: never` and no `--build`: a rollback must be a container switch, and a same-named image in a registry must never replace the pinned local one.
   - Database services are excluded (an older engine on newer data files can corrupt them); static sites have no images (rolling back their kept release directories is a follow-up).
   - How to apply: a new source kind either produces images that can be pinned per service or is added to `supports_rollback` exclusions; never put an environment value into a snapshot field.
+## Remote agents, RBAC, and API keys (GENE-78)
+
+- **Remote agents use a panel-owned PKI with CSR enrollment and pinned leaves (decided 2026-11-04, D6).** The agent makes its own key (`panel-agent remote-init`), so a private key never crosses the network; the panel signs only the public key and always writes its own SAN, key usage, and validity. Each leaf has exactly one EKU, which webpki enforces: an agent certificate (`serverAuth`) cannot authenticate to another agent as the panel (`clientAuth`), so compromising one remote host does not give root on the others.
+  - Why pinning on top of the CA: there is no CRL/OCSP; pinning the recorded fingerprint makes "rotate" and "remove server" revoke immediately. The previous fingerprint stays accepted for 7 days or until the agent presents the new one, so rotation needs no downtime.
+  - Why one connection per call: it keeps the client stateless and identical to the Unix socket path; a pooled connection is a later optimization.
+  - How to apply: anything new that talks to an agent about a service goes through `state.agents.for_server_id(.., service.server_id)`, never `state.agent`. A feature that is not multi-server aware must refuse services on remote servers (409), not silently use the local agent.
+- **RBAC is checked in typed extractors and fails closed (decided 2026-11-04, D6).** A handler names its permission in its signature (`ServiceAccess<perm::ServicesDeploy>`); the extractor resolves the resource from the path, returns 404 for unknown resources, and 403 when no grant covers it. `users.is_admin` stays the installation superuser for backward compatibility. Global-only permissions granted at a narrower scope grant nothing.
+  - Why no wildcard permission: `admin` lists every permission explicitly, so adding a permission is a visible change to the catalog and the built-in roles, which are re-synced at every start.
+  - Why authors cannot hand out more than they hold: `access:manage` would otherwise be a path to `system:admin`.
+- **API keys are narrowed by their owner at request time (decided 2026-11-04, D6).** A request with a key needs the permission in both the key's grants and the owner's current grants, so removing a user's role disables their keys at once. Keys cannot hold `access:manage` or `system:admin`, and keys, roles, and bindings are managed from a session only, so a leaked key cannot mint more keys. Argon2id verification is cached per key and secret digest for a minute; the key row is read on every request, so revocation and expiry are immediate.
+
 ## Open Items
 
 The full list is in `TASK.md`. The largest open items as of 2026-11-03 (after D0):

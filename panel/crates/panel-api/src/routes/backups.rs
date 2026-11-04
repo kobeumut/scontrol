@@ -520,6 +520,7 @@ async fn backup_volume(
     Json(body): Json<VolumeBody>,
 ) -> ApiResult<Accepted> {
     body.check()?;
+    ensure_local_service(&state, &body.project_slug).await?;
     let dest = find(&state, id).await?;
     let params = BackupVolumeParams {
         target: target(&state, &dest)?,
@@ -557,6 +558,7 @@ async fn restore_volume(
     Json(body): Json<VolumeBody>,
 ) -> ApiResult<Accepted> {
     body.check()?;
+    ensure_local_service(&state, &body.project_slug).await?;
     let dest = find(&state, id).await?;
     let key = restore_key(&body.key, &dest)?;
     let params = RestoreVolumeParams {
@@ -650,6 +652,22 @@ async fn run(
 
 fn not_found() -> ApiError {
     ApiError::NotFound("backup destination not found".into())
+}
+
+/// Volume backups run on the local agent; a service on a remote server is
+/// refused rather than looked for on the wrong host.
+async fn ensure_local_service(state: &AppState, slug: &str) -> ApiResult<()> {
+    let server: Option<Uuid> =
+        sqlx::query_scalar("SELECT server_id FROM compose_projects WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(&state.db)
+            .await?;
+    match server {
+        Some(server) if server != db::servers::LOCAL_SERVER_ID => Err(ApiError::Conflict(
+            "volume backups are not available yet for services on remote servers".into(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 async fn find(state: &AppState, id: Uuid) -> ApiResult<DestinationRow> {

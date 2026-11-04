@@ -378,10 +378,19 @@ async fn preview(
     Ok(Json(serde_json::json!({ "on_calendar": on_calendar })))
 }
 
+/// The service, which must be on the panel's own host: job timers and run
+/// collection talk to the local agent only, so a service on a remote server
+/// is refused rather than scheduled on the wrong host.
 async fn find_project(state: &AppState, id: Uuid) -> ApiResult<ComposeProject> {
-    db::compose_projects::find_by_id(&state.db, id)
+    let project = db::compose_projects::find_by_id(&state.db, id)
         .await?
-        .ok_or_else(|| ApiError::NotFound("Compose project not found".into()))
+        .ok_or_else(|| ApiError::NotFound("Compose project not found".into()))?;
+    if project.server_id != db::servers::LOCAL_SERVER_ID {
+        return Err(ApiError::Conflict(
+            "scheduled jobs are not available yet for services on remote servers".into(),
+        ));
+    }
+    Ok(project)
 }
 
 async fn find_job(state: &AppState, project_id: Uuid, job_id: Uuid) -> ApiResult<ScheduledJob> {

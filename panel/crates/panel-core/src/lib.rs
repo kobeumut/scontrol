@@ -9,6 +9,8 @@ pub mod database_services;
 pub mod error;
 pub mod metrics;
 pub mod observability;
+pub mod pki;
+pub mod rbac;
 pub mod schedule;
 pub mod security;
 pub mod types;

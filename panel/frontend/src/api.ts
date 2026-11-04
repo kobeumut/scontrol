@@ -78,6 +78,8 @@ export type ComposeProject = {
   id: string; name: string; slug: string; status: DeploymentStatus; source: ComposeSource;
   /** Environment (of a project) the service inherits variables from. */
   environment_id: string;
+  /** Server (agent) the service runs on; the nil UUID is this host. */
+  server_id?: string;
   /** False for a service that predates layering: nothing is inherited until its variables are saved. */
   env_layered: boolean;
   created_at: string; updated_at: string;
@@ -168,6 +170,53 @@ export type JobRun = {
 };
 
 export type JobLogChunk = { content: string; next_offset: number; eof: boolean; status: JobRunStatus };
+
+/** The panel's own host; remote agents are added under Servers. */
+export const LOCAL_SERVER_ID = '00000000-0000-0000-0000-000000000000';
+
+export type ServerTransport = 'local' | 'mtls' | 'ssh_socket';
+export type Server = {
+  id: string; name: string; transport: ServerTransport; address: string;
+  cert_fingerprint: string | null; cert_serial: string | null; cert_expires_at: string | null;
+  /** A new certificate was signed; the old one is accepted until the agent presents the new one. */
+  rotation_pending: boolean;
+  draining: boolean; max_services: number | null;
+  status: 'pending' | 'online' | 'offline'; docker: boolean; agent_version: string | null;
+  last_seen_at: string | null; last_error: string | null; service_count: number; created_at: string;
+};
+
+export type Permission =
+  | 'projects:read' | 'projects:create' | 'projects:update' | 'projects:delete'
+  | 'services:read' | 'services:create' | 'services:update' | 'services:delete' | 'services:deploy'
+  | 'variables:read' | 'variables:update' | 'servers:read' | 'servers:manage'
+  | 'access:manage' | 'system:admin';
+
+export type PermissionInfo = { key: Permission; description: string; scopable: boolean; api_keys: boolean };
+
+export type Scope =
+  | { kind: 'global' }
+  | { kind: 'project'; project_id: string }
+  | { kind: 'environment'; project_id: string; environment_id: string };
+
+export type Grant = { permission: Permission; scope: Scope };
+export type Role = { id: string; name: string; description: string; builtin: boolean; permissions: Permission[] };
+export type RoleBinding = {
+  id: string; user_id: string; username: string; role_id: string; role_name: string;
+  project_id: string | null; project_name: string | null;
+  environment_id: string | null; environment_name: string | null; created_at: string;
+};
+/** The caller's grants; the server still checks every request. */
+export type AccessMe = { user_id: string; username: string; superuser: boolean; api_key: boolean; grants: Grant[] };
+
+export type ApiKey = {
+  id: string; user_id: string; username: string; name: string; prefix: string; grants: Grant[];
+  expires_at: string | null; last_used_at: string | null; revoked_at: string | null; created_at: string;
+};
+
+/** Whether `me` holds `permission` globally (UI hint only). */
+export function holdsGlobally(me: AccessMe | undefined, permission: Permission): boolean {
+  return !!me && (me.superuser || me.grants.some((g) => g.permission === permission && g.scope.kind === 'global'));
+}
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); }

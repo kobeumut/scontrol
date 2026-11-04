@@ -287,7 +287,10 @@ pub async fn call_tool(
                 .map_err(|e| e.to_string())?
                 .ok_or("Compose project not found")?;
             let services = state
-                .agent
+                .agents
+                .for_server_id(&state.db, project.server_id)
+                .await
+                .map_err(|e| e.to_string())?
                 .list_compose_project_services(panel_core::adapters::ComposeProjectActionParams {
                     project_slug: project.slug,
                 })
@@ -306,7 +309,10 @@ pub async fn call_tool(
                 .map_err(|e| e.to_string())?
                 .ok_or("Compose project not found")?;
             let logs = state
-                .agent
+                .agents
+                .for_server_id(&state.db, project.server_id)
+                .await
+                .map_err(|e| e.to_string())?
                 .compose_project_logs(panel_core::adapters::ComposeProjectLogsParams {
                     project_slug: project.slug,
                     tail_lines: input.tail_lines.unwrap_or(200),
@@ -395,7 +401,10 @@ pub async fn call_tool(
                     .map_err(|e| e.to_string())?
                     .ok_or("deployment not found")?;
             let chunk = state
-                .agent
+                .agents
+                .for_server_id(&state.db, project.server_id)
+                .await
+                .map_err(|e| e.to_string())?
                 .read_deployment_log(panel_core::adapters::DeploymentLogParams {
                     project_slug: project.slug,
                     deployment_id: deployment.id,

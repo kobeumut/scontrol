@@ -758,6 +758,10 @@ pub struct ComposeProject {
     /// variables the panel never saw: deployments keep its env file as is
     /// (no inheritance) until its environment is saved once.
     pub env_layered: bool,
+    /// The server (agent) the service is placed on; the nil UUID is the
+    /// panel's own host.
+    #[serde(default)]
+    pub server_id: Uuid,
     pub source: ComposeSource,
     pub status: DeploymentStatus,
     pub created_at: DateTime<Utc>,

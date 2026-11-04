@@ -1,7 +1,13 @@
-//! Shared Unix-socket RPC client implementing [`AdapterPort`] by talking to
+//! Shared agent RPC client implementing [`AdapterPort`] by talking to
 //! `panel-agent`. Used by both `panel-api` (per-request, unprivileged) and
 //! `panel-cli` (direct host administration). Never builds or runs shell
 //! commands itself — see `panel-agent` for the privileged side.
+//!
+//! Two transports carry the same line protocol: the local Unix socket (also
+//! used for an SSH-forwarded socket of a remote host) and mutual TLS to a
+//! remote agent (see [`crate::pki`]). Over TLS the agent's certificate must
+//! chain to the panel CA, name the configured host, and match one of the
+//! fingerprints the panel recorded for that server.
 
 use crate::adapters::*;
 use crate::agent_protocol::{AgentRequest, AgentResponse, StreamFrame};
@@ -14,19 +20,74 @@ use crate::types::{
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
+
+type BoxReader = BufReader<Box<dyn AsyncRead + Send + Unpin>>;
+type BoxWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// How long connecting (TCP plus TLS handshake) to a remote agent may take.
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+enum Transport {
+    Unix(PathBuf),
+    Tls(Arc<TlsTarget>),
+}
+
+/// A remote agent reached over mutual TLS.
+pub struct TlsTarget {
+    /// `host:port` to connect to.
+    pub address: String,
+    /// The host the agent certificate must name.
+    pub server_name: String,
+    pub config: Arc<rustls::ClientConfig>,
+    /// SHA-256 fingerprints (hex) the agent's leaf certificate may have:
+    /// the current one and, during a rotation, the previous one.
+    pub pinned_fingerprints: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct AgentClient {
-    socket_path: PathBuf,
+    transport: Transport,
 }
 
 impl AgentClient {
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
         Self {
-            socket_path: socket_path.as_ref().to_path_buf(),
+            transport: Transport::Unix(socket_path.as_ref().to_path_buf()),
+        }
+    }
+
+    pub fn tls(target: TlsTarget) -> Self {
+        Self {
+            transport: Transport::Tls(Arc::new(target)),
+        }
+    }
+
+    async fn connect(&self) -> CoreResult<(BoxReader, BoxWriter)> {
+        match &self.transport {
+            Transport::Unix(path) => {
+                let stream = UnixStream::connect(path).await.map_err(|e| {
+                    CoreError::External(format!("connecting to agent at {}: {e}", path.display()))
+                })?;
+                let (read_half, write_half) = stream.into_split();
+                Ok((BufReader::new(Box::new(read_half)), Box::new(write_half)))
+            }
+            Transport::Tls(target) => {
+                let stream = tokio::time::timeout(REMOTE_CONNECT_TIMEOUT, connect_tls(target))
+                    .await
+                    .map_err(|_| {
+                        CoreError::External(format!(
+                            "connecting to agent at {}: timed out",
+                            target.address
+                        ))
+                    })??;
+                let (read_half, write_half) = tokio::io::split(stream);
+                Ok((BufReader::new(Box::new(read_half)), Box::new(write_half)))
+            }
         }
     }
 
@@ -35,14 +96,8 @@ impl AgentClient {
     async fn send(
         &self,
         request: AgentRequest,
-    ) -> CoreResult<(serde_json::Value, BufReader<OwnedReadHalf>, OwnedWriteHalf)> {
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            CoreError::External(format!(
-                "connecting to agent at {}: {e}",
-                self.socket_path.display()
-            ))
-        })?;
-        let (read_half, mut write_half) = stream.into_split();
+    ) -> CoreResult<(serde_json::Value, BoxReader, BoxWriter)> {
+        let (mut reader, mut write_half) = self.connect().await?;
 
         let mut payload = serde_json::to_string(&request)
             .map_err(|e| CoreError::External(format!("encoding agent request: {e}")))?;
@@ -51,8 +106,11 @@ impl AgentClient {
             .write_all(payload.as_bytes())
             .await
             .map_err(|e| CoreError::External(format!("writing to agent: {e}")))?;
+        write_half
+            .flush()
+            .await
+            .map_err(|e| CoreError::External(format!("writing to agent: {e}")))?;
 
-        let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         reader
             .read_line(&mut line)
@@ -332,5 +390,263 @@ impl AdapterPort for AgentClient {
 
     async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>> {
         self.call(AgentRequest::MetricsSnapshot).await
+    }
+}
+
+async fn connect_tls(target: &TlsTarget) -> CoreResult<tokio_rustls::client::TlsStream<TcpStream>> {
+    let server_name = rustls::ServerName::try_from(target.server_name.as_str()).map_err(|_| {
+        CoreError::Validation(format!("invalid agent host '{}'", target.server_name))
+    })?;
+    let tcp = TcpStream::connect(&target.address).await.map_err(|e| {
+        CoreError::External(format!("connecting to agent at {}: {e}", target.address))
+    })?;
+    tcp.set_nodelay(true).ok();
+    let stream = tokio_rustls::TlsConnector::from(target.config.clone())
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| {
+            CoreError::External(format!(
+                "TLS handshake with agent at {}: {e}",
+                target.address
+            ))
+        })?;
+    let leaf = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .ok_or_else(|| CoreError::External("agent presented no certificate".into()))?;
+    let fingerprint = crate::pki::fingerprint_der(&leaf.0);
+    if !target
+        .pinned_fingerprints
+        .iter()
+        .any(|pin| pin.eq_ignore_ascii_case(&fingerprint))
+    {
+        return Err(CoreError::PermissionDenied(format!(
+            "agent at {} presented a certificate the panel did not issue for this server",
+            target.address
+        )));
+    }
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    //! A mock remote agent: a TLS 1.3 listener built with the same
+    //! `pki::server_config` the real agent uses, answering the line protocol.
+    use super::*;
+    use crate::pki::{self, KeyedCert};
+    use tokio::net::TcpListener;
+
+    struct Pki {
+        ca: KeyedCert,
+        agent: KeyedCert,
+        agent_fingerprint: String,
+        client: KeyedCert,
+    }
+
+    fn pki_for(host: &str) -> Pki {
+        let ca = pki::generate_ca().unwrap();
+        let request = pki::generate_agent_csr(host).unwrap();
+        let (cert_pem, info) =
+            pki::sign_agent_csr(&ca, &request.cert_pem, host, uuid::Uuid::nil(), 1).unwrap();
+        let (client, _) = pki::issue_client_cert(&ca, 1).unwrap();
+        Pki {
+            ca,
+            agent: KeyedCert {
+                cert_pem,
+                key_pem: request.key_pem,
+            },
+            agent_fingerprint: info.fingerprint,
+            client,
+        }
+    }
+
+    /// Serves until dropped; answers `Capabilities` and records whether a
+    /// request ever got through the handshake.
+    async fn mock_agent(
+        ca_pem: &str,
+        identity: &KeyedCert,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let config = pki::server_config(ca_pem, identity).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(config);
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let (read_half, mut write_half) = tokio::io::split(stream);
+                    let mut reader = BufReader::new(read_half);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = match serde_json::from_str::<AgentRequest>(line.trim()) {
+                        Ok(AgentRequest::Capabilities) => AgentResponse::ok(&AgentCapabilities {
+                            docker: true,
+                            mail: false,
+                            antivirus: false,
+                            version: "remote-mock".into(),
+                            build_tools: Vec::new(),
+                        }),
+                        _ => AgentResponse::Err {
+                            kind: "not_found".into(),
+                            message: "unsupported in mock".into(),
+                        },
+                    };
+                    let mut out = serde_json::to_string(&response).unwrap();
+                    out.push('\n');
+                    write_half.write_all(out.as_bytes()).await.unwrap();
+                    write_half.flush().await.unwrap();
+                });
+            }
+        });
+        (address, served)
+    }
+
+    fn client(
+        address: &str,
+        host: &str,
+        ca_pem: &str,
+        identity: &KeyedCert,
+        pins: Vec<String>,
+    ) -> AgentClient {
+        AgentClient::tls(TlsTarget {
+            address: address.to_string(),
+            server_name: host.to_string(),
+            config: pki::client_config(ca_pem, identity).unwrap(),
+            pinned_fingerprints: pins,
+        })
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_round_trip() {
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let agent = client(
+            &address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        let capabilities = agent.capabilities().await.unwrap();
+        assert_eq!(capabilities.version, "remote-mock");
+        // Errors travel back as the matching core error.
+        let error = agent.list_containers().await.unwrap_err();
+        assert!(matches!(error, CoreError::NotFound(_)));
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_agent_certificate_is_refused() {
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        // Valid chain and name, but not the certificate recorded for the server.
+        let agent = client(
+            &address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec!["00".repeat(32)],
+        );
+        let error = agent.capabilities().await.unwrap_err();
+        assert!(matches!(error, CoreError::PermissionDenied(_)), "{error}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_agent_must_name_the_configured_host() {
+        let pki = pki_for("agent-a.example.com");
+        let (address, _) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let agent = client(
+            &address,
+            "agent-b.example.com",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        assert!(agent.capabilities().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_client_from_another_ca_is_rejected_by_the_agent() {
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let other_ca = pki::generate_ca().unwrap();
+        let (foreign_client, _) = pki::issue_client_cert(&other_ca, 1).unwrap();
+        // Trusts the right CA for the server, but presents a foreign identity.
+        let agent = AgentClient::tls(TlsTarget {
+            address: address.clone(),
+            server_name: "127.0.0.1".into(),
+            config: {
+                let mut roots = rustls::RootCertStore::empty();
+                for der in rustls_pemfile::certs(&mut pki.ca.cert_pem.as_bytes()).unwrap() {
+                    roots.add(&rustls::Certificate(der)).unwrap();
+                }
+                let cert = rustls_pemfile::certs(&mut foreign_client.cert_pem.as_bytes()).unwrap();
+                let key =
+                    rustls_pemfile::pkcs8_private_keys(&mut foreign_client.key_pem.as_bytes())
+                        .unwrap();
+                Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_safe_defaults()
+                        .with_root_certificates(roots)
+                        .with_client_auth_cert(
+                            cert.into_iter().map(rustls::Certificate).collect(),
+                            rustls::PrivateKey(key[0].clone()),
+                        )
+                        .unwrap(),
+                )
+            },
+            pinned_fingerprints: vec![pki.agent_fingerprint.clone()],
+        });
+        assert!(agent.capabilities().await.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_agent_certificate_cannot_act_as_the_panel() {
+        // A compromised agent host holds a CA-signed certificate; it carries
+        // only `serverAuth`, so another agent refuses it as a client.
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let agent = client(
+            &address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.agent,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        assert!(agent.capabilities().await.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_agent_fails_cleanly() {
+        let pki = pki_for("127.0.0.1");
+        let agent = client(
+            "127.0.0.1:9",
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint],
+        );
+        assert!(matches!(
+            agent.capabilities().await,
+            Err(CoreError::External(_))
+        ));
     }
 }

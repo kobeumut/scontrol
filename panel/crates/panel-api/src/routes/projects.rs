@@ -5,7 +5,7 @@
 //! entries, and errors carry key names only. Services (Compose projects)
 //! inherit project → environment → service at deploy time.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, Authenticated, Principal, ProjectAccess, Require};
 use crate::db;
 use crate::db::projects::EnvScope;
 use crate::error::{ApiError, ApiResult};
@@ -16,6 +16,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use panel_core::rbac::{Permission, Scope, Target};
 use panel_core::types::{validate, EnvKeyInfo, EnvLayer, EnvLayerKeys, Environment, Project};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -60,11 +61,21 @@ struct LayerVariables {
     variables: Vec<EnvKeyInfo>,
 }
 
-async fn view(state: &AppState, project: Project) -> ApiResult<ProjectView> {
+/// The project with the environments `principal` can see.
+async fn view(state: &AppState, principal: &Principal, project: Project) -> ApiResult<ProjectView> {
     let counts = db::projects::service_counts(&state.db, project.id).await?;
     let environments = db::projects::list_environments(&state.db, project.id)
         .await?
         .into_iter()
+        .filter(|environment| {
+            principal.allows(
+                Permission::ProjectsRead,
+                Target::Environment {
+                    project: project.id,
+                    environment: environment.id,
+                },
+            )
+        })
         .map(|environment| EnvironmentView {
             service_count: counts
                 .iter()
@@ -80,28 +91,37 @@ async fn view(state: &AppState, project: Project) -> ApiResult<ProjectView> {
 }
 
 async fn list(
-    AdminUser(user): AdminUser,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<ProjectView>>> {
-    let projects = if user.is_admin {
-        db::projects::list_all(&state.db).await?
-    } else {
-        db::projects::list_for_owner(&state.db, user.id).await?
-    };
+    // A project shows when the principal can read it or one of its
+    // environments.
+    let projects = db::projects::list_all(&state.db).await?;
     let mut views = Vec::with_capacity(projects.len());
     for project in projects {
-        views.push(view(&state, project).await?);
+        if principal
+            .authority
+            .allows_within(Permission::ProjectsRead, project.id)
+        {
+            views.push(view(&state, &principal, project).await?);
+        }
     }
     Ok(Json(views))
 }
 
 async fn show(
-    AdminUser(_): AdminUser,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<ProjectView>> {
     let project = find_project(&state, id).await?;
-    Ok(Json(view(&state, project).await?))
+    if !principal
+        .authority
+        .allows_within(Permission::ProjectsRead, project.id)
+    {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(view(&state, &principal, project).await?))
 }
 
 #[derive(Deserialize)]
@@ -114,7 +134,9 @@ struct CreateProjectBody {
 }
 
 async fn create(
-    AdminUser(user): AdminUser,
+    Require {
+        principal: user, ..
+    }: Require<perm::ProjectsCreate>,
     State(state): State<AppState>,
     Json(body): Json<CreateProjectBody>,
 ) -> ApiResult<(StatusCode, Json<ProjectView>)> {
@@ -133,15 +155,34 @@ async fn create(
     )
     .await
     .map_err(|e| conflict_on_unique(e, "a project with this slug already exists"))?;
+    // A creator who is not an installation admin manages what they create.
+    if !user.is_admin {
+        if let Some(role) = db::rbac::role_id_by_name(&state.db, "project-admin").await? {
+            db::rbac::create_binding(
+                &state.db,
+                user.id,
+                role,
+                Scope::Project {
+                    project_id: project.id,
+                },
+                Some(user.id),
+            )
+            .await?;
+        }
+    }
+    let user = Authenticated::refresh(&state, user).await?;
     audit(
         &state,
-        user.id,
+        &user,
         "create_project",
         &project.slug,
         serde_json::json!({ "project_id": project.id }),
     )
     .await;
-    Ok((StatusCode::CREATED, Json(view(&state, project).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(view(&state, &user, project).await?),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -150,7 +191,9 @@ struct RenameBody {
 }
 
 async fn rename(
-    AdminUser(user): AdminUser,
+    ProjectAccess {
+        principal: user, ..
+    }: ProjectAccess<perm::ProjectsUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<RenameBody>,
@@ -160,18 +203,20 @@ async fn rename(
     db::projects::rename(&state.db, id, body.name.trim()).await?;
     audit(
         &state,
-        user.id,
+        &user,
         "rename_project",
         &project.slug,
         serde_json::json!({ "project_id": id }),
     )
     .await;
     let project = find_project(&state, id).await?;
-    Ok(Json(view(&state, project).await?))
+    Ok(Json(view(&state, &user, project).await?))
 }
 
 async fn remove(
-    AdminUser(user): AdminUser,
+    ProjectAccess {
+        principal: user, ..
+    }: ProjectAccess<perm::ProjectsDelete>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
@@ -181,7 +226,7 @@ async fn remove(
         .map_err(|e| conflict_on_foreign_key(e, "delete or move this project's services first"))?;
     audit(
         &state,
-        user.id,
+        &user,
         "delete_project",
         &project.slug,
         serde_json::json!({ "project_id": id }),
@@ -199,7 +244,9 @@ struct CreateEnvironmentBody {
 }
 
 async fn create_environment(
-    AdminUser(user): AdminUser,
+    ProjectAccess {
+        principal: user, ..
+    }: ProjectAccess<perm::ProjectsUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<CreateEnvironmentBody>,
@@ -216,7 +263,7 @@ async fn create_environment(
         .map_err(|e| conflict_on_unique(e, "an environment with this slug already exists"))?;
     audit(
         &state,
-        user.id,
+        &user,
         "create_environment",
         &project.slug,
         serde_json::json!({ "project_id": id, "environment_id": environment.id }),
@@ -226,7 +273,9 @@ async fn create_environment(
 }
 
 async fn remove_environment(
-    AdminUser(user): AdminUser,
+    ProjectAccess {
+        principal: user, ..
+    }: ProjectAccess<perm::ProjectsDelete>,
     State(state): State<AppState>,
     Path((id, environment_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
@@ -237,7 +286,7 @@ async fn remove_environment(
         .map_err(|e| conflict_on_foreign_key(e, "delete this environment's services first"))?;
     audit(
         &state,
-        user.id,
+        &user,
         "delete_environment",
         &project.slug,
         serde_json::json!({ "project_id": id, "environment_id": environment_id }),
@@ -247,7 +296,7 @@ async fn remove_environment(
 }
 
 async fn project_variables(
-    AdminUser(_): AdminUser,
+    _: ProjectAccess<perm::VariablesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<LayerVariables>> {
@@ -268,7 +317,9 @@ async fn project_layer(state: &AppState, id: Uuid) -> ApiResult<LayerVariables> 
 /// value; keys left out are removed. Applies on each service's next
 /// deployment.
 async fn update_project_variables(
-    AdminUser(user): AdminUser,
+    ProjectAccess {
+        principal: user, ..
+    }: ProjectAccess<perm::VariablesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<VariablesBody>,
@@ -283,7 +334,7 @@ async fn update_project_variables(
     .await?;
     audit(
         &state,
-        user.id,
+        &user,
         "update_project_variables",
         &project.slug,
         serde_json::json!({ "project_id": id, "keys": keys }),
@@ -293,7 +344,7 @@ async fn update_project_variables(
 }
 
 async fn environment_variables(
-    AdminUser(_): AdminUser,
+    _: ProjectAccess<perm::VariablesRead>,
     State(state): State<AppState>,
     Path((id, environment_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<LayerVariables>> {
@@ -304,7 +355,9 @@ async fn environment_variables(
 }
 
 async fn update_environment_variables(
-    AdminUser(user): AdminUser,
+    ProjectAccess {
+        principal: user, ..
+    }: ProjectAccess<perm::VariablesUpdate>,
     State(state): State<AppState>,
     Path((id, environment_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<VariablesBody>,
@@ -320,7 +373,7 @@ async fn update_environment_variables(
     .await?;
     audit(
         &state,
-        user.id,
+        &user,
         "update_environment_variables",
         &project.slug,
         serde_json::json!({ "project_id": id, "environment_id": environment_id, "keys": keys }),
@@ -346,15 +399,15 @@ async fn find_environment(state: &AppState, project_id: Uuid, id: Uuid) -> ApiRe
 
 async fn audit(
     state: &AppState,
-    user_id: Uuid,
+    principal: &Principal,
     action: &str,
     target: &str,
     metadata: serde_json::Value,
 ) {
     db::audit::record(
         &state.db,
-        Some(user_id),
-        "user",
+        Some(principal.id),
+        principal.actor_kind(),
         action,
         Some(target),
         metadata,
