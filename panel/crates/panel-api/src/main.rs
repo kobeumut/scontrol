@@ -89,6 +89,12 @@ async fn main() -> anyhow::Result<()> {
     }
     services::observability::start(state.db.clone(), state.agent.clone());
 
+    state.metrics.start(
+        state.db.clone(),
+        state.agent.clone(),
+        state.notifier.clone(),
+    );
+
     let router = routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "panel-api listening");

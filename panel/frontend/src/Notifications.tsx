@@ -23,7 +23,7 @@ const KINDS: Record<Kind, { label: string; secret: string; secretRequired: boole
 
 const EVENT_LABELS: Record<string, string> = {
   deploy_succeeded: 'Deploy succeeded', deploy_failed: 'Deploy failed', deploy_cancelled: 'Deploy cancelled',
-  job_failed: 'Scheduled job failed',
+  job_failed: 'Scheduled job failed', metric_alert: 'Resource alert (CPU, memory, disk)', metric_resolved: 'Resource alert resolved',
 };
 
 export function Notifications() {

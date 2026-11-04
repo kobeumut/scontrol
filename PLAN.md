@@ -77,7 +77,7 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Backups to S3 | Spawn the dump tool with argv and credentials in env. Stream through gzip into an in-process S3 multipart upload, or `rclone rcat` with env credentials. Retention by count; restore streams back | D3 | ✅ |
 | Volume backups | Optional stop, then `tar` streamed in-process from the volume mountpoint to S3, then start | D3 | ✅ |
 | Scheduled jobs | Generated systemd timers (`OnCalendar=`, timezone; cron converted, Vixie day-of-month/day-of-week OR kept) running `docker compose exec -T` argv through the agent's helper mode. Runs recorded next to their masked 5 MiB logs and collected into `job_runs`; failures notify `job_failed` | D3 | ✅ (needs live E2E) |
-| Server and container metrics | Agent samples `/proc` and cgroup v2 every 10–30 s, with no process spawn. Kept as a downsampled ring in PostgreSQL. Threshold alerts fire on edge transitions | D4 | ⬜ |
+| Server and container metrics | Agent samples `/proc` and cgroup v2 every 10–30 s, with no process spawn. Kept as a downsampled ring in PostgreSQL. Threshold alerts fire on edge transitions | D4 | ✅ |
 | Request stats | Nginx JSON `log_format`, read incrementally with offset tracking and aggregated into PostgreSQL | D4 | ✅ |
 | Docker cleanup | Scheduled `docker image prune` / `builder prune` argv with an `until=` filter; freed space reported | D4 | ✅ |
 | Rollbacks | Tag each successful build `<slug>/<service>:deploy-<id>` and keep the last N. Rollback = compose up pinned to that tag plus the stored non-secret config snapshot | D5 | ⬜ |
@@ -101,7 +101,7 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 | Time from enqueue to `docker compose up` starting (warm checkout) | < 1 s, plus `git fetch` time |
 | Extra always-on containers | 0. No Traefik, Redis, or monitoring container |
 | Log memory | Constant. Output is streamed line by line to disk and never buffered whole |
-| Metrics sampling | No process spawn per sample. Reads are under 1 ms per container from cgroup files |
+| Metrics sampling | No process spawn per sample. Reads are under 1 ms per container from cgroup files. First measurement: ~0.4 ms per host sample (release build, 8-core Linux host, 2026-11-04) |
 
 ## 5. Phases and acceptance criteria
 
@@ -129,6 +129,7 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 
 **D4: Observability.**
 - `/proc` and cgroup sampler, metrics retention, alerts, request stats, and Docker cleanup.
+- Done: `/proc` and cgroup v2 sampler, downsampled retention (30 s / 5 min / 1 h for 24 h / 7 d / 30 d), edge-triggered threshold alerts with hysteresis, and the Monitoring screen.
 
 **D5: Delivery extras.**
 - Rollbacks, previews, templates, the advanced vhost options, and the web terminal.

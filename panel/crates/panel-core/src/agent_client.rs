@@ -329,4 +329,8 @@ impl AdapterPort for AgentClient {
     async fn restore_volume(&self, params: RestoreVolumeParams) -> CoreResult<()> {
         self.call(AgentRequest::RestoreVolume(params)).await
     }
+
+    async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>> {
+        self.call(AgentRequest::MetricsSnapshot).await
+    }
 }

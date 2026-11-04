@@ -67,6 +67,7 @@ pub enum AgentRequest {
     RestoreDatabase(RestoreDatabaseParams),
     BackupVolume(BackupVolumeParams),
     RestoreVolume(RestoreVolumeParams),
+    MetricsSnapshot,
 }
 
 /// One line of a streamed response (see the module docs).

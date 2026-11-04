@@ -6,6 +6,7 @@ pub mod database_services;
 pub mod databases;
 pub mod firewall;
 pub mod github_apps;
+pub mod metrics;
 pub mod notifications;
 pub mod observability;
 pub mod projects;

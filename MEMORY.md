@@ -59,6 +59,13 @@ Durable project context that is not obvious from the code. Read it together with
 - Decision: `$host` is client-controlled, so hosts are normalized and capped per chunk, with the rest counted as `_other`.
   - Why: a flood of random `Host` headers must not create unbounded rows.
 
+## Server and container metrics (GENE-73)
+
+- **Metrics are sampled in the agent from kernel files and stored by panel-api as a downsampled ring (decided 2026-11-04, D4).** `docker stats` and tools like `top` spawn a process per sample and cost far more than the ≤ 1 ms budget; reading `/proc` and cgroup v2 directly costs ~0.4 ms. The agent keeps only the latest snapshot in memory (it has no database), and panel-api pulls it every 30 s, so a panel-api outage loses samples rather than queueing them on the root side.
+  - Container metrics are stored per Compose service of a panel project (`compose_project_id`, `service`), not per container ID, because IDs change on every redeploy. Containers of other Compose projects on the host are not stored. Container CPU uses the `docker stats` convention (100 % = one core).
+  - Alerts are edge-triggered with a consecutive-sample count and a hysteresis band, and their state lives in `metric_alert_state`, so a restart neither repeats nor drops an alert. A metric that disappears (unmounted disk, removed service) is forgotten without a "resolved" message.
+  - How to apply: a new metric is a parser in `panel_core::metrics` with a synthetic-file test, a field in the snapshot, and (if alertable) a `watched_metrics` entry with a stable key. Never add a process spawn to the sampler.
+
 ## Open Items
 
 The full list is in `TASK.md`. The largest open items as of 2026-11-03 (after D0):

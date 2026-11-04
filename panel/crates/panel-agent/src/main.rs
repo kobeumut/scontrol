@@ -126,6 +126,10 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     tokio::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o660)).await?;
 
     let adapter = Arc::new(LocalAdapter::new(config));
+    adapters::metrics::spawn(
+        adapter.metrics.clone(),
+        adapter.config.metrics_interval_secs,
+    );
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -366,6 +370,9 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         }
         AgentRequest::RestoreVolume(p) => {
             AgentResponse::from_core_result(adapter.restore_volume(p).await)
+        }
+        AgentRequest::MetricsSnapshot => {
+            AgentResponse::from_core_result(adapter.metrics_snapshot().await)
         }
     }
 }

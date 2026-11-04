@@ -651,6 +651,11 @@ pub trait AdapterPort: Send + Sync {
     /// `docker image prune -a` and `docker builder prune -a` with an
     /// `until=` filter; reports the freed space (Docker feature).
     async fn prune_docker(&self, params: PruneDockerParams) -> CoreResult<DockerPruneOutcome>;
+
+    // Observability: the agent samples `/proc` and cgroup v2 in-process.
+    /// The sampler's latest snapshot; `None` until it has two readings to
+    /// compute rates from.
+    async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>>;
 }
 
 #[cfg(feature = "test-utils")]
@@ -683,6 +688,8 @@ pub mod mock {
         /// What `prune_docker` reports, and every request received.
         pub prune_outcome: Mutex<Option<DockerPruneOutcome>>,
         pub prunes: Mutex<Vec<PruneDockerParams>>,
+        /// What `metrics_snapshot` returns, so tests can drive the collector.
+        pub metrics: Mutex<Option<crate::metrics::MetricsSnapshot>>,
     }
 
     impl MockAdapter {
@@ -1078,6 +1085,11 @@ pub mod mock {
                     images_freed_bytes: 0,
                     builder_freed_bytes: 0,
                 }))
+        }
+
+        async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>> {
+            self.record("metrics_snapshot")?;
+            Ok(self.metrics.lock().unwrap().clone())
         }
     }
 }

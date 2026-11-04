@@ -21,6 +21,7 @@ pub mod firewall;
 pub mod git_auth;
 #[cfg(feature = "mail")]
 pub mod mail;
+pub mod metrics;
 pub mod nginx;
 pub mod observability;
 pub mod php_fpm;
@@ -44,11 +45,16 @@ pub struct LocalAdapter {
     /// Cancellation senders of deployments currently running in this agent.
     running_deployments:
         std::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio::sync::watch::Sender<bool>>>,
+    /// In-process `/proc` and cgroup sampler (see `metrics`).
+    pub metrics: std::sync::Arc<metrics::MetricsSampler>,
 }
 
 impl LocalAdapter {
     pub fn new(config: AgentConfig) -> Self {
         Self {
+            metrics: std::sync::Arc::new(metrics::MetricsSampler::new(
+                metrics::SamplerPaths::from_config(&config),
+            )),
             config,
             running_deployments: Default::default(),
         }
@@ -725,5 +731,9 @@ impl AdapterPort for LocalAdapter {
             let _ = params;
             Err(Self::feature_disabled("docker"))
         }
+    }
+
+    async fn metrics_snapshot(&self) -> CoreResult<Option<panel_core::metrics::MetricsSnapshot>> {
+        Ok(self.metrics.latest())
     }
 }
