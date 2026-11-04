@@ -71,8 +71,12 @@ async fn main() -> anyhow::Result<()> {
         state.notifier.clone(),
         state.secret_box.clone(),
         state.github_apps.clone(),
+        state.previews.clone(),
         config.deploy_workers,
     );
+    state
+        .previews
+        .start_sweeper(state.db.clone(), state.agent.clone());
     tracing::info!(
         workers = config.deploy_workers,
         "deployment workers started"

@@ -6,6 +6,7 @@ pub mod github_app;
 pub mod metrics;
 pub mod notifications;
 pub mod observability;
+pub mod previews;
 pub mod registries;
 pub mod scheduled_jobs;
 pub mod secret_box;

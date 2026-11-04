@@ -14,6 +14,9 @@
 //! env                       0600 merged environment file (`--env-file`)
 //! env.masked                0600 overridden inherited values, masked in logs
 //! scontrol.override.yml     generated loopback port publishing for domains
+//!                           and resource limits of ephemeral projects
+//! .scontrol-ephemeral       marker: a pull request preview, whose named
+//!                           volumes are removed with the project
 //! .scontrol-compose-path    Compose file path relative to code/
 //! domains.json              domains whose vhosts this project owns
 //! logs/<deployment>.log     streamed, redacted, bounded deployment logs
@@ -51,6 +54,7 @@ use panel_core::adapters::{
     LOG_LINES_CAPACITY,
 };
 use panel_core::error::{CoreError, CoreResult};
+use panel_core::previews::{ResourceLimits, PREVIEW_PIDS_LIMIT};
 use panel_core::types::{
     validate, ApplicationBuild, ApplicationSpec, ComposeDeployOutcome, ComposeDomainBinding,
     ComposeServiceInfo, ComposeSource, DatabaseDeployment, DatabaseServiceSpec, DeploymentLogChunk,
@@ -84,6 +88,8 @@ const COMPOSE_PATH_MARKER: &str = ".scontrol-compose-path";
 const DOMAINS_FILE: &str = "domains.json";
 /// Present only for static sites; holds the deployment ID being served.
 const STATIC_MARKER: &str = "static-release";
+/// Present in the root of an ephemeral (pull request preview) project.
+const EPHEMERAL_MARKER: &str = ".scontrol-ephemeral";
 /// Static releases kept per site, the served one included.
 const STATIC_RELEASES_RETAINED: usize = 3;
 const MAX_DOMAIN_BINDINGS: usize = 32;
@@ -176,12 +182,28 @@ async fn deploy_steps(
     check_bindings_against_compose(&compose, &params.domains)?;
     persist_compose_path(root, &code_dir, &compose_path).await?;
 
+    mark_ephemeral(root, params.ephemeral).await?;
     let override_path = root.join(OVERRIDE_FILE);
-    let override_body = if params.domains.is_empty() {
+    let service_names: Vec<String> = compose
+        .get("services")
+        .and_then(Yaml::as_mapping)
+        .map(|services| {
+            services
+                .keys()
+                .filter_map(Yaml::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let override_body = if params.domains.is_empty() && params.resource_limits.is_none() {
         let _ = tokio::fs::remove_file(&override_path).await;
         None
     } else {
-        let body = render_override(&params.domains)?;
+        let body = render_override(
+            &params.domains,
+            &service_names,
+            params.resource_limits.as_ref(),
+        )?;
         tokio::fs::write(&override_path, &body)
             .await
             .map_err(|e| CoreError::Io(format!("writing Compose override: {e}")))?;
@@ -192,7 +214,7 @@ async fn deploy_steps(
         code_dir,
         compose: compose_path,
         env: Some(env_path.to_path_buf()),
-        override_file: (!params.domains.is_empty()).then_some(override_path),
+        override_file: override_body.is_some().then_some(override_path),
     };
     // A builder's image exists only locally; there is nothing to pull.
     let builds_locally = matches!(
@@ -510,7 +532,12 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
     let mut args = compose_args(&params.project_slug, &paths);
     // Do not pass `--volumes`: persistent named volumes survive a project
     // removal unless an operator explicitly removes them outside the panel.
+    // A pull request preview is temporary by definition, so its volumes go
+    // with it (only the project's own volumes; external ones are kept).
     args.extend(["down".into(), "--remove-orphans".into()]);
+    if root.join(EPHEMERAL_MARKER).is_file() {
+        args.push("--volumes".into());
+    }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
     write_action_log(&root, &stdout, &stderr).await?;
@@ -832,6 +859,9 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
     if let Some(target) = &params.rollback {
         validate_rollback_target(params, target)?;
     }
+    if let Some(limits) = &params.resource_limits {
+        limits.validate().map_err(CoreError::Validation)?;
+    }
     validate_bindings(&params.domains, params.acme_email.as_deref())
 }
 
@@ -938,6 +968,16 @@ fn validate_bindings(
                 binding.domain
             )));
         }
+        if let Some(certificate) = &binding.certificate {
+            // Names a directory under the certbot live dir: domain syntax
+            // only, so no separator or traversal reaches the path.
+            if !validate::is_valid_domain(certificate) {
+                return Err(CoreError::Validation(format!(
+                    "invalid certificate name for {}",
+                    binding.domain
+                )));
+            }
+        }
         if !domains.insert(binding.domain.as_str()) || !host_ports.insert(binding.host_port) {
             return Err(CoreError::Validation(format!(
                 "duplicate domain or host port: {}",
@@ -945,12 +985,19 @@ fn validate_bindings(
             )));
         }
     }
-    if bindings.iter().any(|b| b.https) && !acme_email.is_some_and(is_plausible_email) {
+    if bindings.iter().any(|b| b.https && b.certificate.is_none())
+        && !acme_email.is_some_and(is_plausible_email)
+    {
         return Err(CoreError::Validation(
             "a valid ACME email is required for HTTPS domains".into(),
         ));
     }
     Ok(())
+}
+
+/// The certbot lineage whose files serve a binding's HTTPS.
+fn certificate_of(binding: &ComposeDomainBinding) -> &str {
+    binding.certificate.as_deref().unwrap_or(&binding.domain)
 }
 
 fn is_plausible_email(email: &str) -> bool {
@@ -981,18 +1028,65 @@ fn check_bindings_against_compose(
     Ok(())
 }
 
+/// Writes or removes the ephemeral marker.
+async fn mark_ephemeral(root: &Path, ephemeral: bool) -> CoreResult<()> {
+    let marker = root.join(EPHEMERAL_MARKER);
+    if ephemeral {
+        tokio::fs::write(&marker, b"pull request preview\n")
+            .await
+            .map_err(|e| CoreError::Io(format!("writing ephemeral marker: {e}")))?;
+    } else {
+        let _ = tokio::fs::remove_file(&marker).await;
+    }
+    Ok(())
+}
+
 /// Generates the override that publishes each bound container port on the
-/// loopback interface only, where the generated Nginx vhost reaches it.
-fn render_override(bindings: &[ComposeDomainBinding]) -> CoreResult<String> {
+/// loopback interface only, where the generated Nginx vhost reaches it, and
+/// (for ephemeral projects) caps every service's memory, CPU and PIDs. The
+/// limits are set both as service keys and as `deploy.resources.limits`, so
+/// a value the Compose file sets in either place is overridden consistently
+/// and Compose never sees two different limits.
+fn render_override(
+    bindings: &[ComposeDomainBinding],
+    service_names: &[String],
+    limits: Option<&ResourceLimits>,
+) -> CoreResult<String> {
     let mut services = serde_yaml::Mapping::new();
+    if let Some(limits) = limits {
+        limits.validate().map_err(CoreError::Validation)?;
+        for name in service_names {
+            if !validate::is_valid_service_name(name) {
+                return Err(CoreError::Validation(format!(
+                    "invalid service name: {name}"
+                )));
+            }
+            let mut service = serde_yaml::Mapping::new();
+            service.insert("mem_limit".into(), Yaml::String(limits.memory()));
+            service.insert("memswap_limit".into(), Yaml::String(limits.memory()));
+            service.insert("cpus".into(), Yaml::String(limits.cpus()));
+            service.insert("pids_limit".into(), Yaml::Number(PREVIEW_PIDS_LIMIT.into()));
+            let mut resource = serde_yaml::Mapping::new();
+            resource.insert("memory".into(), Yaml::String(limits.memory()));
+            resource.insert("cpus".into(), Yaml::String(limits.cpus()));
+            resource.insert("pids".into(), Yaml::Number(PREVIEW_PIDS_LIMIT.into()));
+            let mut resources = serde_yaml::Mapping::new();
+            resources.insert("limits".into(), Yaml::Mapping(resource));
+            let mut deploy = serde_yaml::Mapping::new();
+            deploy.insert("resources".into(), Yaml::Mapping(resources));
+            service.insert("deploy".into(), Yaml::Mapping(deploy));
+            services.insert(Yaml::String(name.clone()), Yaml::Mapping(service));
+        }
+    }
     for binding in bindings {
         let entry = services
             .entry(Yaml::String(binding.service_name.clone()))
-            .or_insert_with(|| {
-                let mut service = serde_yaml::Mapping::new();
+            .or_insert_with(|| Yaml::Mapping(serde_yaml::Mapping::new()));
+        if let Some(service) = entry.as_mapping_mut() {
+            if !service.contains_key("ports") {
                 service.insert("ports".into(), Yaml::Sequence(Vec::new()));
-                Yaml::Mapping(service)
-            });
+            }
+        }
         if let Some(Yaml::Sequence(ports)) = entry.get_mut("ports") {
             ports.push(Yaml::String(format!(
                 "127.0.0.1:{}:{}",
@@ -1038,7 +1132,8 @@ async fn apply_domains(
             binding.domain.clone(),
             nginx::read_compose_vhost(cfg, &binding.domain).await,
         ));
-        let tls = binding.https && nginx::certificate_exists(cfg, &binding.domain);
+        let tls = (binding.https && nginx::certificate_exists(cfg, certificate_of(binding)))
+            .then(|| certificate_of(binding));
         let content =
             nginx::render_compose_vhost(cfg, project_slug, &binding.domain, &target(binding), tls);
         nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
@@ -1066,11 +1161,21 @@ async fn apply_domains(
     write_owned_domains(root, bindings).await?;
 
     let mut warnings = Vec::new();
+    // A named (wildcard) certificate is issued out of band, never by certbot
+    // here: an HTTP-01 challenge cannot issue a wildcard.
+    for binding in bindings.iter().filter(|b| {
+        b.https && b.certificate.is_some() && !nginx::certificate_exists(cfg, certificate_of(b))
+    }) {
+        warnings.push(format!(
+            "certificate {} for {} was not found; serving HTTP only",
+            certificate_of(binding),
+            binding.domain
+        ));
+    }
     let mut reload = false;
-    for binding in bindings
-        .iter()
-        .filter(|b| b.https && !nginx::certificate_exists(cfg, &b.domain))
-    {
+    for binding in bindings.iter().filter(|b| {
+        b.https && b.certificate.is_none() && !nginx::certificate_exists(cfg, &b.domain)
+    }) {
         let Some(email) = acme_email else { continue };
         log.step(&format!("requesting certificate for {}", binding.domain))
             .await?;
@@ -1090,7 +1195,7 @@ async fn apply_domains(
                 project_slug,
                 &binding.domain,
                 &target(binding),
-                true,
+                Some(&binding.domain),
             );
             nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
             reload = true;
@@ -3057,6 +3162,8 @@ mod tests {
             git_credentials: None,
             database,
             rollback: None,
+            resource_limits: None,
+            ephemeral: false,
         };
         let good = DatabaseDeployment {
             loopback_port: 25000,
@@ -3120,6 +3227,8 @@ mod tests {
                 compose_sha256: "a".repeat(64),
                 images,
             }),
+            resource_limits: None,
+            ephemeral: false,
         };
         let own = deployment_image_tag("shop", "web", target).unwrap();
         assert!(validate_project_params(&params(vec![pinned(own)])).is_ok());
@@ -3187,16 +3296,21 @@ mod tests {
             container_port: 3000,
             host_port,
             https,
+            certificate: None,
         }
     }
 
     #[test]
     fn override_publishes_bound_ports_on_loopback_only() {
-        let rendered = render_override(&[
-            binding("a.example.com", "web", 40001, false),
-            binding("b.example.com", "web", 40002, false),
-            binding("api.example.com", "api", 40003, false),
-        ])
+        let rendered = render_override(
+            &[
+                binding("a.example.com", "web", 40001, false),
+                binding("b.example.com", "web", 40002, false),
+                binding("api.example.com", "api", 40003, false),
+            ],
+            &[],
+            None,
+        )
         .unwrap();
         let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
         let web_ports = yaml["services"]["web"]["ports"].as_sequence().unwrap();
@@ -3206,6 +3320,55 @@ mod tests {
             yaml["services"]["api"]["ports"][0].as_str(),
             Some("127.0.0.1:40003:3000")
         );
+    }
+
+    #[test]
+    fn override_caps_every_service_of_an_ephemeral_project() {
+        let limits = ResourceLimits {
+            memory_mb: 256,
+            cpu_millis: 250,
+        };
+        let rendered = render_override(
+            &[binding("pr.example.com", "web", 40010, false)],
+            &["web".into(), "worker".into()],
+            Some(&limits),
+        )
+        .unwrap();
+        let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
+        for service in ["web", "worker"] {
+            let svc = &yaml["services"][service];
+            assert_eq!(svc["mem_limit"].as_str(), Some("256m"));
+            assert_eq!(svc["memswap_limit"].as_str(), Some("256m"));
+            assert_eq!(svc["cpus"].as_str(), Some("0.25"));
+            assert_eq!(svc["pids_limit"].as_u64(), Some(1024));
+            let limits = &svc["deploy"]["resources"]["limits"];
+            assert_eq!(limits["memory"].as_str(), Some("256m"));
+            assert_eq!(limits["cpus"].as_str(), Some("0.25"));
+        }
+        // Port publishing is kept next to the limits.
+        assert_eq!(
+            yaml["services"]["web"]["ports"][0].as_str(),
+            Some("127.0.0.1:40010:3000")
+        );
+        assert!(yaml["services"]["worker"]["ports"].is_null());
+
+        let too_small = ResourceLimits {
+            memory_mb: 1,
+            cpu_millis: 250,
+        };
+        assert!(render_override(&[], &["web".into()], Some(&too_small)).is_err());
+        assert!(render_override(&[], &["bad name".into()], Some(&limits)).is_err());
+    }
+
+    #[test]
+    fn named_certificates_skip_acme_and_are_validated() {
+        let mut wildcard = binding("shop-pr-1.preview.example.com", "web", 40011, true);
+        wildcard.certificate = Some("preview.example.com".into());
+        // No ACME email needed: certbot is never asked for a wildcard.
+        assert!(validate_bindings(std::slice::from_ref(&wildcard), None).is_ok());
+        assert_eq!(certificate_of(&wildcard), "preview.example.com");
+        wildcard.certificate = Some("../../etc".into());
+        assert!(validate_bindings(&[wildcard], None).is_err());
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod github_apps;
 pub mod metrics;
 pub mod notifications;
 pub mod observability;
+pub mod previews;
 pub mod projects;
 pub mod registries;
 pub mod scheduled_jobs;

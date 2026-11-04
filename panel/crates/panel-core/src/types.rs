@@ -972,6 +972,11 @@ pub struct ComposeDomainBinding {
     pub container_port: u16,
     pub host_port: u16,
     pub https: bool,
+    /// Serve HTTPS with this existing certbot lineage (a wildcard
+    /// certificate such as `preview.example.com` issued out of band)
+    /// instead of requesting a certificate for `domain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
 }
 
 /// Persisted form of [`ComposeDomainBinding`].

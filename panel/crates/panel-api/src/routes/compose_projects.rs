@@ -86,6 +86,7 @@ pub fn router() -> Router<AppState> {
                 .delete(disable_webhook),
         )
         .merge(super::scheduled_jobs::router())
+        .merge(super::previews::router())
 }
 
 async fn list(
@@ -475,6 +476,21 @@ async fn remove(
     if project.status == DeploymentStatus::Running {
         return Err(ApiError::Conflict(
             "a deployment is running; wait for it to finish".into(),
+        ));
+    }
+    // Previews are removed with their project; their rows would go with
+    // it, but their containers, volumes and vhosts would not.
+    let pending = crate::services::previews::close_all(
+        &state.db,
+        state.agent.as_ref(),
+        &state.previews,
+        id,
+        "removed",
+    )
+    .await?;
+    if pending > 0 {
+        return Err(ApiError::Conflict(
+            "a preview deployment is still running; retry once it has stopped".into(),
         ));
     }
     match state

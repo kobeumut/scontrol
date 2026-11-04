@@ -31,6 +31,7 @@ use crate::services::database_services;
 use crate::services::env_layers;
 use crate::services::github_app::{self, GitHubApps};
 use crate::services::notifications::Notifier;
+use crate::services::previews::{self, Previews};
 use crate::services::registries;
 use crate::services::secret_box::SecretBox;
 use panel_core::adapters::{
@@ -63,6 +64,7 @@ impl DeployQueue {
 
     /// Spawns `workers` claim loops. Call once, from the process that serves
     /// HTTP (MCP stdio processes enqueue but leave execution to it).
+    #[allow(clippy::too_many_arguments)]
     pub fn start_workers(
         &self,
         db: PgPool,
@@ -70,13 +72,15 @@ impl DeployQueue {
         notifier: Notifier,
         secrets: SecretBox,
         github: GitHubApps,
+        previews: Previews,
         workers: usize,
     ) {
         for worker in 0..workers.max(1) {
             let (db, agent, wake) = (db.clone(), agent.clone(), self.wake.clone());
             let (notifier, secrets, github) = (notifier.clone(), secrets.clone(), github.clone());
+            let previews = previews.clone();
             tokio::spawn(async move {
-                worker_loop(worker, db, agent, notifier, secrets, github, wake).await
+                worker_loop(worker, db, agent, notifier, secrets, github, previews, wake).await
             });
         }
     }
@@ -191,6 +195,7 @@ pub fn default_workers() -> usize {
         .unwrap_or(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     worker: usize,
     db: PgPool,
@@ -198,6 +203,7 @@ async fn worker_loop(
     notifier: Notifier,
     secrets: SecretBox,
     github: GitHubApps,
+    previews: Previews,
     wake: Arc<Notify>,
 ) {
     loop {
@@ -207,6 +213,7 @@ async fn worker_loop(
                 let (project_id, deployment_id) = (job.project_id, job.id);
                 run_job(&db, agent.as_ref(), &secrets, &github, job).await;
                 notifier.deployment_finished(db.clone(), project_id, deployment_id);
+                previews.deployment_finished(db.clone(), project_id, deployment_id);
                 continue;
             }
             Ok(None) => {}
@@ -284,16 +291,23 @@ async fn execute(
         }
         None => None,
     };
+    // A pull request preview: the parent's service variables, resource
+    // limits, an ephemeral project, and possibly a wildcard certificate.
+    let preview = previews::deploy_options(db, project.id)
+        .await
+        .map_err(|e| CoreError::External(format!("loading preview settings: {e}")))?;
     // Values this job sends the agent, masked again in the stored snapshot.
     let mut sent_secrets: Vec<String> = Vec::new();
     // A service that predates layering keeps the env file the agent has;
     // the panel does not know its own variables, so overwriting it would
     // lose them.
     if project.env_layered {
-        let (environment, masked_values) = env_layers::merged_for_service(db, secrets, project.id)
-            .await
-            // Errors name keys at most (decryption failures name none).
-            .map_err(|e| CoreError::External(format!("loading environment variables: {e}")))?;
+        let variables_of = preview.as_ref().map_or(project.id, |p| p.parent_project_id);
+        let (environment, masked_values) =
+            env_layers::merged_for_service(db, secrets, variables_of)
+                .await
+                // Errors name keys at most (decryption failures name none).
+                .map_err(|e| CoreError::External(format!("loading environment variables: {e}")))?;
         sent_secrets.extend(environment.iter().map(|(_, value)| value.clone()));
         sent_secrets.extend(masked_values.iter().cloned());
         agent
@@ -307,6 +321,7 @@ async fn execute(
     let domains = db::compose_projects::list_domains(db, project.id)
         .await
         .map_err(|e| CoreError::External(format!("loading domains: {e}")))?;
+    let certificate = preview.as_ref().and_then(|p| p.certificate.clone());
     let acme_email = if domains.iter().any(|d| d.https) {
         db::users::find_by_id(db, project.owner_user_id)
             .await
@@ -364,6 +379,7 @@ async fn execute(
                     service_name: d.service_name,
                     container_port: d.container_port,
                     host_port: d.host_port,
+                    certificate: certificate.clone().filter(|_| d.https),
                     https: d.https,
                 })
                 .collect(),
@@ -371,6 +387,8 @@ async fn execute(
             git_credentials,
             database,
             rollback,
+            resource_limits: preview.as_ref().map(|p| p.limits),
+            ephemeral: preview.is_some(),
         })
         .await
         .map(|mut outcome| {

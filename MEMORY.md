@@ -71,6 +71,16 @@ Durable project context that is not obvious from the code. Read it together with
   - Why `pull_policy: never` and no `--build`: a rollback must be a container switch, and a same-named image in a registry must never replace the pinned local one.
   - Database services are excluded (an older engine on newer data files can corrupt them); static sites have no images (rolling back their kept release directories is a follow-up).
   - How to apply: a new source kind either produces images that can be pinned per service or is added to `supports_rollback` exclusions; never put an environment value into a snapshot field.
+## Pull request previews (GENE-76)
+
+- **A preview is an ordinary Compose project created from the parent, driven by the parent's webhook (decided 2026-11-04, D5).** Reusing the project, queue, domain, and deployment machinery means previews get logs, cancellation, masking and per-project serialisation for free; the only additions on the agent are resource limits in the generated override, a named-certificate option for vhosts, and volume removal for ephemeral projects.
+  - Why same-repository requests only: a preview runs the request's code with the parent's environment variables. Someone who can push a branch to the repository can already change what production deploys; a fork author cannot, so fork requests are ignored (closing one is still handled).
+  - Why the parent's service layer and not copies: copying sealed values would need re-sealing under new AAD and would go stale; the worker merges the parent's layers at deploy time instead.
+  - Why teardown is asynchronous with a `closing` state: `docker compose down` can outlast a Git host's webhook timeout, and a preview whose deployment is still running must be cancelled before removal. The sweeper retries until the row is gone, so a crash in between leaves nothing behind.
+  - Why comments carry no error text: pull request comments are visible to everyone who can read the request, and deployment errors can name hosts, paths, or registry details.
+  - Limits are set both as service keys (`mem_limit`, `cpus`, `pids_limit`) and as `deploy.resources.limits`: Compose refuses two different values, and an override replaces either form the application set.
+  - How to apply: anything that lets previews deploy from private repositories over deploy keys or HTTPS tokens must copy those credentials agent-side; never send them through panel-api.
+
 ## Open Items
 
 The full list is in `TASK.md`. The largest open items as of 2026-11-03 (after D0):

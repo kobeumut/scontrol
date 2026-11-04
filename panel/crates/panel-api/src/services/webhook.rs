@@ -8,6 +8,7 @@
 
 use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
+use panel_core::previews::{PrAction, PrProvider, PullRequestEvent};
 use sha2::Sha256;
 use uuid::Uuid;
 
@@ -90,6 +91,9 @@ pub enum Delivery {
         commit: String,
         changed_paths: Option<Vec<String>>,
     },
+    /// A pull (merge) request was opened, updated, or closed: drives the
+    /// project's preview deployments. Validated (number, branch, commit).
+    PullRequest(PullRequestEvent),
     /// A delivery that never deploys (tags, deletions, other events).
     Ignored(&'static str),
 }
@@ -109,7 +113,19 @@ pub fn interpret(headers: &HeaderMap, body: &[u8]) -> Result<Delivery, &'static 
     match event.as_str() {
         "ping" => return Ok(Delivery::Ping),
         "push" | "push hook" => {}
-        _ => return Ok(Delivery::Ignored("event is not a push")),
+        "pull_request" => {
+            // Gitea and Forgejo also send `X-GitHub-Event`; their own header
+            // tells them apart (their API differs).
+            let provider =
+                if headers.contains_key("x-gitea-event") || headers.contains_key("x-gogs-event") {
+                    PrProvider::Gitea
+                } else {
+                    PrProvider::Github
+                };
+            return interpret_github_pull_request(provider, body);
+        }
+        "merge request hook" => return interpret_gitlab_merge_request(body),
+        _ => return Ok(Delivery::Ignored("event is not a push or pull request")),
     }
 
     #[derive(serde::Deserialize)]
@@ -165,6 +181,117 @@ pub fn interpret(headers: &HeaderMap, body: &[u8]) -> Result<Delivery, &'static 
         commit: payload.after,
         changed_paths,
     })
+}
+
+/// GitHub and Gitea `pull_request` payloads (same shape).
+fn interpret_github_pull_request(
+    provider: PrProvider,
+    body: &[u8],
+) -> Result<Delivery, &'static str> {
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        action: String,
+        pull_request: PullRequest,
+    }
+    #[derive(serde::Deserialize)]
+    struct PullRequest {
+        number: u64,
+        head: Branch,
+        base: Branch,
+    }
+    #[derive(serde::Deserialize)]
+    struct Branch {
+        #[serde(rename = "ref")]
+        git_ref: String,
+        sha: String,
+        /// `null` when the fork was deleted.
+        repo: Option<Repository>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Repository {
+        id: u64,
+    }
+    let payload: Payload =
+        serde_json::from_slice(body).map_err(|_| "pull request payload is not valid JSON")?;
+    let action = match payload.action.as_str() {
+        "opened" | "reopened" => PrAction::Opened,
+        "synchronize" | "synchronized" => PrAction::Updated,
+        "closed" => PrAction::Closed,
+        _ => {
+            return Ok(Delivery::Ignored(
+                "pull request action does not change previews",
+            ))
+        }
+    };
+    let pr = payload.pull_request;
+    let same_repository = matches!(
+        (&pr.head.repo, &pr.base.repo),
+        (Some(head), Some(base)) if head.id == base.id
+    );
+    pull_request(PullRequestEvent {
+        provider,
+        action,
+        number: pr.number,
+        head_branch: pr.head.git_ref,
+        head_sha: pr.head.sha,
+        same_repository,
+    })
+}
+
+/// GitLab `Merge Request Hook` payloads.
+fn interpret_gitlab_merge_request(body: &[u8]) -> Result<Delivery, &'static str> {
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        object_attributes: Attributes,
+    }
+    #[derive(serde::Deserialize)]
+    struct Attributes {
+        iid: u64,
+        #[serde(default)]
+        action: Option<String>,
+        source_branch: String,
+        source_project_id: u64,
+        target_project_id: u64,
+        last_commit: Commit,
+        /// Present on `update` only when new commits were pushed.
+        #[serde(default)]
+        oldrev: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Commit {
+        id: String,
+    }
+    let payload: Payload =
+        serde_json::from_slice(body).map_err(|_| "merge request payload is not valid JSON")?;
+    let attributes = payload.object_attributes;
+    let action = match attributes.action.as_deref() {
+        Some("open" | "reopen") => PrAction::Opened,
+        Some("update") if attributes.oldrev.is_some() => PrAction::Updated,
+        Some("update") => {
+            return Ok(Delivery::Ignored(
+                "merge request update without new commits",
+            ))
+        }
+        Some("close" | "merge") => PrAction::Closed,
+        _ => {
+            return Ok(Delivery::Ignored(
+                "merge request action does not change previews",
+            ))
+        }
+    };
+    pull_request(PullRequestEvent {
+        provider: PrProvider::Gitlab,
+        action,
+        number: attributes.iid,
+        head_branch: attributes.source_branch,
+        head_sha: attributes.last_commit.id,
+        same_repository: attributes.source_project_id == attributes.target_project_id,
+    })
+}
+
+fn pull_request(event: PullRequestEvent) -> Result<Delivery, &'static str> {
+    event.validate()?;
+    Ok(Delivery::PullRequest(event))
 }
 
 /// Upper bound on watch patterns per project.
@@ -368,6 +495,135 @@ mod tests {
             Delivery::Ignored(_)
         ));
         assert!(interpret(&headers(&[("x-github-event", "push")]), b"not json").is_err());
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn github_pr(action: &str, head_repo: serde_json::Value) -> Vec<u8> {
+        serde_json::json!({
+            "action": action,
+            "number": 12,
+            "pull_request": {
+                "number": 12,
+                "merged": action == "closed",
+                "head": { "ref": "feature/x", "sha": SHA, "repo": head_repo },
+                "base": { "ref": "main", "sha": SHA, "repo": { "id": 1 } },
+            },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn pr_of(delivery: Delivery) -> PullRequestEvent {
+        match delivery {
+            Delivery::PullRequest(event) => event,
+            other => panic!("expected a pull request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interprets_github_and_gitea_pull_requests() {
+        let gh = headers(&[("x-github-event", "pull_request")]);
+        let same = serde_json::json!({ "id": 1 });
+        let opened = pr_of(interpret(&gh, &github_pr("opened", same.clone())).unwrap());
+        assert_eq!(opened.provider, PrProvider::Github);
+        assert_eq!(opened.action, PrAction::Opened);
+        assert_eq!(opened.number, 12);
+        assert_eq!(opened.head_branch, "feature/x");
+        assert!(opened.same_repository);
+        assert_eq!(
+            pr_of(interpret(&gh, &github_pr("reopened", same.clone())).unwrap()).action,
+            PrAction::Opened
+        );
+        assert_eq!(
+            pr_of(interpret(&gh, &github_pr("synchronize", same.clone())).unwrap()).action,
+            PrAction::Updated
+        );
+        assert_eq!(
+            pr_of(interpret(&gh, &github_pr("closed", same.clone())).unwrap()).action,
+            PrAction::Closed
+        );
+        assert!(matches!(
+            interpret(&gh, &github_pr("labeled", same.clone())).unwrap(),
+            Delivery::Ignored(_)
+        ));
+        // Forks, and forks that were deleted, are not the same repository.
+        let fork =
+            pr_of(interpret(&gh, &github_pr("opened", serde_json::json!({ "id": 2 }))).unwrap());
+        assert!(!fork.same_repository);
+        let gone = pr_of(interpret(&gh, &github_pr("opened", serde_json::Value::Null)).unwrap());
+        assert!(!gone.same_repository);
+
+        let gitea = headers(&[
+            ("x-github-event", "pull_request"),
+            ("x-gitea-event", "pull_request"),
+        ]);
+        let synced = pr_of(interpret(&gitea, &github_pr("synchronized", same)).unwrap());
+        assert_eq!(synced.provider, PrProvider::Gitea);
+        assert_eq!(synced.action, PrAction::Updated);
+    }
+
+    #[test]
+    fn pull_request_fields_are_validated_before_use() {
+        let gh = headers(&[("x-github-event", "pull_request")]);
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&github_pr("opened", serde_json::json!({ "id": 1 }))).unwrap();
+        body["pull_request"]["head"]["ref"] = "x; rm -rf /".into();
+        assert!(interpret(&gh, body.to_string().as_bytes()).is_err());
+        body["pull_request"]["head"]["ref"] = "feature/x".into();
+        body["pull_request"]["head"]["sha"] = "$(id)".into();
+        assert!(interpret(&gh, body.to_string().as_bytes()).is_err());
+        body["pull_request"]["head"]["sha"] = SHA.into();
+        body["pull_request"]["number"] = 0.into();
+        assert!(interpret(&gh, body.to_string().as_bytes()).is_err());
+        assert!(interpret(&gh, b"{}").is_err());
+    }
+
+    #[test]
+    fn interprets_gitlab_merge_requests() {
+        let gl = headers(&[("x-gitlab-event", "Merge Request Hook")]);
+        let mr = |action: &str, oldrev: Option<&str>, source: u64| {
+            serde_json::json!({
+                "object_kind": "merge_request",
+                "object_attributes": {
+                    "iid": 7,
+                    "action": action,
+                    "source_branch": "feat",
+                    "source_project_id": source,
+                    "target_project_id": 5,
+                    "last_commit": { "id": SHA },
+                    "oldrev": oldrev,
+                },
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let opened = pr_of(interpret(&gl, &mr("open", None, 5)).unwrap());
+        assert_eq!(opened.provider, PrProvider::Gitlab);
+        assert_eq!(opened.action, PrAction::Opened);
+        assert_eq!(opened.number, 7);
+        assert!(opened.same_repository);
+        assert_eq!(
+            pr_of(interpret(&gl, &mr("update", Some("abcdef1"), 5)).unwrap()).action,
+            PrAction::Updated
+        );
+        assert!(matches!(
+            interpret(&gl, &mr("update", None, 5)).unwrap(),
+            Delivery::Ignored(_)
+        ));
+        assert_eq!(
+            pr_of(interpret(&gl, &mr("merge", None, 5)).unwrap()).action,
+            PrAction::Closed
+        );
+        assert_eq!(
+            pr_of(interpret(&gl, &mr("close", None, 5)).unwrap()).action,
+            PrAction::Closed
+        );
+        assert!(!pr_of(interpret(&gl, &mr("open", None, 9)).unwrap()).same_repository);
+        assert!(matches!(
+            interpret(&gl, &mr("approved", None, 5)).unwrap(),
+            Delivery::Ignored(_)
+        ));
     }
 
     fn changed(body: &[u8]) -> Option<Vec<String>> {

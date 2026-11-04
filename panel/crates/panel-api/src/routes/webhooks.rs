@@ -5,6 +5,7 @@
 
 use crate::db;
 use crate::error::{ApiError, ApiResult};
+use crate::services::previews;
 use crate::services::webhook::{self, Delivery};
 use crate::state::AppState;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -51,6 +52,24 @@ async fn compose_push(
         .map_err(|reason| ApiError::BadRequest(reason.into()))?
     {
         Delivery::Ping => return Ok((StatusCode::OK, Json(json!({ "pong": true })))),
+        Delivery::PullRequest(event) => {
+            let outcome = previews::handle_event(
+                &state.db,
+                state.agent.clone(),
+                &state.deploy_queue,
+                &state.previews,
+                &project,
+                &event,
+            )
+            .await?;
+            let status = if outcome.get("deployment").is_some() || outcome.get("closing").is_some()
+            {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            return Ok((status, Json(outcome)));
+        }
         Delivery::Ignored(reason) => return Ok(ignored(reason)),
         Delivery::Push {
             branch,

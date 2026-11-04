@@ -76,6 +76,24 @@ impl GitHubApps {
         installation_id: i64,
         repository: &str,
     ) -> anyhow::Result<String> {
+        self.installation_token_with(
+            app,
+            installation_id,
+            repository,
+            serde_json::json!({ "contents": "read" }),
+        )
+        .await
+    }
+
+    /// An installation token scoped to `repository` with `permissions`
+    /// (pull request previews ask for `pull_requests: write` to comment).
+    pub async fn installation_token_with(
+        &self,
+        app: &SealedApp,
+        installation_id: i64,
+        repository: &str,
+        permissions: serde_json::Value,
+    ) -> anyhow::Result<String> {
         let pem = self
             .secrets
             .open(&app.private_key_sealed, aad(app.id).as_bytes())?;
@@ -98,7 +116,7 @@ impl GitHubApps {
             .header("X-GitHub-Api-Version", "2022-11-28")
             .json(&serde_json::json!({
                 "repositories": [name],
-                "permissions": { "contents": "read" },
+                "permissions": permissions,
             }))
             .send()
             .await
