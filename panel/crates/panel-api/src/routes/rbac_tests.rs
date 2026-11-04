@@ -1235,9 +1235,21 @@ async fn configuration_access_cannot_deploy_through_side_doors() {
     .await;
     assert!(domains.as_array().unwrap().is_empty());
 
-    // Without the redeploy, configuring is allowed.
-    let (status, added) = call(&w.router, auth(), Method::POST, &format!("{base}/domains"),
-        Some(json!({ "domain": domain("b"), "service_name": "web", "container_port": 80, "redeploy": false }))).await;
+    // Without the redeploy, configuring is allowed. (The loopback port
+    // allocator answers 409 "retry" when another test takes the same port
+    // at the same moment; that is its documented contract.)
+    let mut attempt = 0;
+    let (status, added) = loop {
+        let result = call(&w.router, auth(), Method::POST, &format!("{base}/domains"),
+            Some(json!({ "domain": domain("b"), "service_name": "web", "container_port": 80, "redeploy": false }))).await;
+        attempt += 1;
+        if result.0 != StatusCode::CONFLICT
+            || attempt == 5
+            || !result.1.to_string().contains("retry")
+        {
+            break result;
+        }
+    };
     assert_eq!(status, StatusCode::CREATED, "{added}");
     assert!(added["deployment"].is_null());
     let domain_id = added["id"].as_str().unwrap().to_string();
