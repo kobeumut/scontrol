@@ -31,7 +31,7 @@ use panel_core::adapters::{
 use panel_core::types::validate::GitTransport;
 use panel_core::types::{
     validate, ComposeDomain, ComposeProject, ComposeServiceInfo, ComposeSource, DeploymentInfo,
-    DeploymentLogChunk, DeploymentStatus,
+    DeploymentLogChunk, DeploymentSnapshot, DeploymentStatus,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,6 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list).post(create))
         .route("/:id", get(show).delete(remove))
         .route("/:id/deploy", post(deploy))
+        .route("/:id/rollback/:deployment_id", post(rollback))
         .route("/:id/environment", put(replace_environment))
         .route("/:id/variables", get(variables).put(update_variables))
         .route("/:id/stop", post(stop))
@@ -50,6 +51,10 @@ pub fn router() -> Router<AppState> {
         .route("/:id/deployments", get(deployments))
         .route("/:id/deployments/:deployment_id", get(deployment))
         .route("/:id/deployments/:deployment_id/log", get(deployment_log))
+        .route(
+            "/:id/deployments/:deployment_id/snapshot",
+            get(deployment_snapshot),
+        )
         .route(
             "/:id/deployments/:deployment_id/cancel",
             post(cancel_deployment),
@@ -308,6 +313,50 @@ async fn deploy(
     .await
     .ok();
     Ok((StatusCode::ACCEPTED, Json(deployment)))
+}
+
+/// Queues a rollback to an earlier succeeded deployment: the agent starts
+/// its pinned images again with the current environment and domains, with
+/// no fetch, build, or pull.
+async fn rollback(
+    AdminUser(user): AdminUser,
+    State(state): State<AppState>,
+    Path((id, target)): Path<(Uuid, Uuid)>,
+) -> ApiResult<(StatusCode, Json<DeploymentInfo>)> {
+    let project = find_project(&state, id).await?;
+    let deployment = state
+        .deploy_queue
+        .enqueue_rollback(&state.db, &project, target)
+        .await?;
+    db::audit::record(
+        &state.db,
+        Some(user.id),
+        "user",
+        "rollback_compose_project",
+        Some(&project.slug),
+        serde_json::json!({
+            "project_id": project.id,
+            "deployment_id": deployment.id,
+            "rollback_of": target,
+        }),
+    )
+    .await
+    .ok();
+    Ok((StatusCode::ACCEPTED, Json(deployment)))
+}
+
+/// The non-secret release snapshot a succeeded deployment recorded.
+async fn deployment_snapshot(
+    AdminUser(_): AdminUser,
+    State(state): State<AppState>,
+    Path((id, deployment_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<DeploymentSnapshot>> {
+    db::compose_projects::find_release(&state.db, id, deployment_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("deployment not found".into()))?
+        .snapshot
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("this deployment recorded no release".into()))
 }
 
 #[derive(Deserialize)]
@@ -1529,6 +1578,148 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn rollback_endpoint_queues_retained_releases_and_audits_them() {
+        use crate::db::compose_projects as rows;
+        use panel_core::types::{DeploymentSnapshot, DeploymentStatus, PinnedImage};
+        let pool = test_support::test_pool().await;
+        let adapter = Arc::new(MockAdapter::new());
+        let state = test_support::app_state(pool.clone(), adapter);
+        let admin = test_support::user(&pool, true).await;
+        let cookie = test_support::session_cookie(&state, admin.id).await;
+        let router = crate::routes::build_router(state);
+        let slug = format!("r{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let project = rows::create(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "Rollback",
+            &slug,
+            admin.id,
+            None,
+            &panel_core::types::ComposeSource::Raw {
+                compose_yaml: "services:\n  web:\n    image: nginx".into(),
+            },
+        )
+        .await
+        .unwrap();
+        // A finished deployment with a recorded, retained release, and one
+        // without a release.
+        let finished = |pool: sqlx::PgPool, project_id| async move {
+            let id = uuid::Uuid::new_v4();
+            rows::enqueue_deployment(&pool, id, project_id, "agent://t", false, "manual", None)
+                .await
+                .unwrap();
+            rows::finish_deployment(&pool, id, DeploymentStatus::Succeeded, None, Some("abc123"))
+                .await
+                .unwrap();
+            id
+        };
+        let kept = finished(pool.clone(), project.id).await;
+        let bare = finished(pool.clone(), project.id).await;
+        let snapshot = DeploymentSnapshot {
+            compose_path: "docker-compose.yml".into(),
+            compose_sha256: "d".repeat(64),
+            compose_file: "services:\n  web:\n    image: nginx\n".into(),
+            override_file: None,
+            env_keys: vec!["API_KEY".into()],
+            images: vec![PinnedImage {
+                service: "web".into(),
+                tag: panel_core::types::deployment_image_tag(&slug, "web", kept).unwrap(),
+                image_id: format!("sha256:{}", "e".repeat(64)),
+            }],
+        };
+        rows::record_releases(&pool, project.id, kept, Some(&snapshot), &[kept])
+            .await
+            .unwrap();
+
+        let base = format!("/api/compose-projects/{}", project.id);
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::GET,
+            &format!("{base}/deployments"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list: Value = serde_json::from_str(&body).unwrap();
+        let available = |id: uuid::Uuid| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == id.to_string())
+                .unwrap()["rollback_available"]
+                .clone()
+        };
+        assert_eq!(available(kept), json!(true));
+        assert_eq!(available(bare), json!(false));
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::GET,
+            &format!("{base}/deployments/{kept}/snapshot"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let shown: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(shown["env_keys"], json!(["API_KEY"]));
+        assert_eq!(shown["images"][0]["service"], "web");
+
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            &format!("{base}/rollback/{kept}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let queued: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(queued["status"], "queued");
+        assert_eq!(queued["trigger"], "rollback");
+        assert_eq!(queued["rollback_of"], kept.to_string());
+        let audited: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM audit_log WHERE action = 'rollback_compose_project' AND target = $1",
+        )
+        .bind(&slug)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audited.len(), 1);
+        assert_eq!(audited[0]["rollback_of"], kept.to_string());
+        // Leave nothing queued for the shared-queue tests.
+        let queued_id = uuid::Uuid::parse_str(queued["id"].as_str().unwrap()).unwrap();
+        rows::cancel_queued_deployment(&pool, project.id, queued_id)
+            .await
+            .unwrap();
+
+        for (target, expected) in [
+            (bare, StatusCode::CONFLICT),
+            (uuid::Uuid::new_v4(), StatusCode::NOT_FOUND),
+        ] {
+            let (status, body) = call(
+                &router,
+                &cookie,
+                Method::POST,
+                &format!("{base}/rollback/{target}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, expected, "{body}");
+        }
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::GET,
+            &format!("{base}/deployments/{bare}/snapshot"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

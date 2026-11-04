@@ -67,6 +67,13 @@ pub struct AgentConfig {
     #[serde(default = "default_deployment_logs_retained")]
     pub deployment_logs_retained: usize,
 
+    /// Compose releases kept per project for rollbacks (pinned image tags
+    /// plus the deployed Compose file); older ones are pruned with their
+    /// tags. `0` records no releases. Capped at 20.
+    #[allow(dead_code)]
+    #[serde(default = "default_rollback_releases_retained")]
+    pub rollback_releases_retained: usize,
+
     /// Release directories of static sites, served by Nginx directly
     /// (`<root>/<slug>/releases/<deployment>/`). Every ancestor must be
     /// traversable by the Nginx worker user, so this lives under `/srv`
@@ -207,6 +214,10 @@ fn default_deployment_logs_retained() -> usize {
     20
 }
 
+fn default_rollback_releases_retained() -> usize {
+    5
+}
+
 fn default_static_sites_root() -> PathBuf {
     PathBuf::from("/srv/scontrol/static")
 }
@@ -262,6 +273,7 @@ impl Default for AgentConfig {
             deploy_timeout_secs: default_deploy_timeout_secs(),
             deployment_log_max_bytes: default_deployment_log_max_bytes(),
             deployment_logs_retained: default_deployment_logs_retained(),
+            rollback_releases_retained: default_rollback_releases_retained(),
             static_sites_root: default_static_sites_root(),
             railpack_frontend: default_railpack_frontend(),
             buildpacks_builder: default_buildpacks_builder(),

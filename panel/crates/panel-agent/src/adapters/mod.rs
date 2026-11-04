@@ -25,6 +25,8 @@ pub mod metrics;
 pub mod nginx;
 pub mod observability;
 pub mod php_fpm;
+#[cfg(feature = "docker")]
+pub mod releases;
 pub mod s3;
 #[cfg(feature = "docker")]
 pub mod scheduled_jobs;

@@ -3,7 +3,7 @@ import { RegistrySelect } from './Registries';
 import {
   api, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
   DATABASE_ENGINE_LABELS,
-  Deployment, Domain, duration, formatTime, GitAccess, gitCheckout, GitHubApp, gitTransport, isActive, isGitHubHttps,
+  Deployment, DeploymentSnapshot, Domain, duration, formatTime, GitAccess, gitCheckout, GitHubApp, gitTransport, isActive, isGitHubHttps,
   LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
 } from './api';
 import { ScheduledJobs } from './ScheduledJobs';
@@ -432,18 +432,31 @@ function DeploymentTable({ projectId, deployments, selectedId, onSelect, onChang
     await api(`/compose-projects/${projectId}/deployments/${deployment.id}/cancel`, { method: 'POST' });
     onChanged();
   });
+  const rollback = (deployment: Deployment) => action.run(async () => {
+    const snapshot = await api<DeploymentSnapshot>(`/compose-projects/${projectId}/deployments/${deployment.id}/snapshot`);
+    const images = snapshot.images.map((i) => `  ${i.service} → ${i.tag}`).join('\n') || '  (Compose images as deployed)';
+    const commit = deployment.commit_sha ? ` (commit ${deployment.commit_sha.slice(0, 8)})` : '';
+    if (!window.confirm(`Roll back to deployment ${deployment.id.slice(0, 8)}${commit}?\n\nPinned images:\n${images}\n\n`
+      + 'Nothing is fetched, built, or pulled. The current environment variables and domains are used.')) return;
+    const queued = await api<Deployment>(`/compose-projects/${projectId}/rollback/${deployment.id}`, { method: 'POST' });
+    onSelect(queued.id);
+    onChanged();
+  });
   if (deployments.length === 0) return <p className="state">No deployments yet.</p>;
   return <>
     <ErrorLine error={action.error} />
     <table><thead><tr><th>Queued</th><th>Trigger</th><th>Commit</th><th>Duration</th><th>Status</th><th /></tr></thead><tbody>
       {deployments.slice(0, 10).map((d) => <tr key={d.id} className={d.id === selectedId ? 'selected-row clickable' : 'clickable'} onClick={() => onSelect(d.id)}>
         <td>{formatTime(d.queued_at)}</td>
-        <td>{d.trigger}</td>
+        <td>{d.trigger}{d.rollback_of && <span className="mono muted"> → {d.rollback_of.slice(0, 8)}</span>}</td>
         <td className="mono">{d.commit_sha?.slice(0, 8) ?? '—'}</td>
         <td>{duration(d.started_at, d.finished_at)}</td>
         <td><span className={`badge ${d.status}`}>{d.status}</span></td>
         <td>{isActive(d.status) && <button className="link danger" disabled={action.busy}
-          onClick={(e) => { e.stopPropagation(); cancel(d); }}>cancel</button>}</td>
+          onClick={(e) => { e.stopPropagation(); cancel(d); }}>cancel</button>}
+          {d.rollback_available && <button className="link" disabled={action.busy}
+            title="Start this deployment's pinned images again"
+            onClick={(e) => { e.stopPropagation(); rollback(d); }}>Rollback to this version</button>}</td>
       </tr>)}
     </tbody></table>
   </>;

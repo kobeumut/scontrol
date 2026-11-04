@@ -160,6 +160,12 @@ pub struct DeployComposeProjectParams {
     /// credentials to 0600 files and masks them in logs.
     #[serde(default)]
     pub database: Option<DatabaseDeployment>,
+    /// Start a recorded release again instead of preparing the source: no
+    /// Git fetch, no build, no pull. The agent checks the target against its
+    /// own release record and runs the pinned images with the current
+    /// environment file and domains.
+    #[serde(default)]
+    pub rollback: Option<RollbackTarget>,
 }
 
 /// Opens (`Some`) or closes (`None`) outside access to a database service:
@@ -675,6 +681,11 @@ pub mod mock {
         /// Every deployment request received, for tests that inspect what
         /// panel-api sent the agent.
         pub deploys: Mutex<Vec<DeployComposeProjectParams>>,
+        /// Snapshot the next non-rollback deployment reports instead of the
+        /// default one.
+        pub next_snapshot: Mutex<Option<DeploymentSnapshot>>,
+        /// Releases "kept" so far, newest (or rolled back to) first.
+        pub releases: Mutex<Vec<Uuid>>,
         /// Every `set_database_exposure` request.
         pub exposures: Mutex<Vec<SetDatabaseExposureParams>>,
         /// Every scheduled-job install request received.
@@ -822,9 +833,10 @@ pub mod mock {
         ) -> CoreResult<ComposeDeployOutcome> {
             self.record("deploy_compose_project")?;
             self.deploys.lock().unwrap().push(params.clone());
+            let snapshot = self.next_snapshot.lock().unwrap().take();
             Ok(ComposeDeployOutcome {
                 services: vec![ComposeServiceInfo {
-                    name: params.project_slug,
+                    name: params.project_slug.clone(),
                     container: String::new(),
                     image: "mock-image".into(),
                     state: "running".into(),
@@ -835,6 +847,37 @@ pub mod mock {
                 }],
                 commit_sha: None,
                 warnings: vec![],
+                // Like the agent: rollbacks record no new release.
+                snapshot: params.rollback.is_none().then(|| {
+                    snapshot.unwrap_or(DeploymentSnapshot {
+                        compose_path: "docker-compose.yml".into(),
+                        compose_sha256: format!("{:064x}", params.deployment_id.as_u128()),
+                        compose_file: "services:\n  web:\n    image: nginx\n".into(),
+                        override_file: None,
+                        env_keys: vec![],
+                        images: vec![PinnedImage {
+                            service: "web".into(),
+                            tag: deployment_image_tag(
+                                &params.project_slug,
+                                "web",
+                                params.deployment_id,
+                            )
+                            .unwrap_or_default(),
+                            image_id: format!("sha256:{:064x}", params.deployment_id.as_u128()),
+                        }],
+                    })
+                }),
+                retained_releases: {
+                    // Newest first, like the agent; nothing is pruned.
+                    let mut releases = self.releases.lock().unwrap();
+                    let current = params
+                        .rollback
+                        .as_ref()
+                        .map_or(params.deployment_id, |t| t.deployment_id);
+                    releases.retain(|id| *id != current);
+                    releases.insert(0, current);
+                    releases.clone()
+                },
             })
         }
 

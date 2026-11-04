@@ -174,7 +174,13 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 
 ### D5 and D6
 
-- [ ] Rollbacks (keep the last N deploy image tags plus a credential-free config snapshot).
+- [x] Rollbacks: pinned `<slug>/<service>:deploy-<id>` image tags plus a credential-free release snapshot (migration `0016_deployment_rollbacks.sql`). Done 2026-11-04.
+  - Agent (`adapters/releases.rs`): after a successful Compose deployment it tags the image of every running service by image ID, keeps a 0600 copy of the deployed Compose file and a `release.json` (SHA-256, pinned images) under `releases/<deployment>/`, and prunes all but `rollback_releases_retained` (default 5, max 20) releases with their tags. A built service without a running container, or a service name that is not a lowercase image path component, leaves the deployment without a release (warning) instead of a partial pin. Project removal drops every tag.
+  - Snapshot (`DeploymentSnapshot`, `compose_deployments.snapshot`): Compose file with environment/build-arg values, inline secret/config content, `x-` fields, and comments removed, every known secret masked (again by the worker with every value it sent), the override, environment key names, and the pinned images. Never a value.
+  - Rollback: `POST /api/compose-projects/:id/rollback/:deployment_id` (and MCP `rollback_compose_project`) queues a `rollback` deployment with `rollback_of`. The worker writes the current merged environment, skips registry login, GitHub App token, Git, build, and pull, and sends a `RollbackTarget`; the agent checks it against its own record (hash, images, tags of that deployment, unchanged copy, tag still at the recorded image ID), renders `code/.scontrol-rollback.yml` (image → tag, `build` removed, `pull_policy: never`), and runs `up -d --remove-orphans` with current domains. Static sites and database services are refused. `GET …/deployments/:id/snapshot` shows the record; audit `rollback_compose_project`; notifications say "Rollback succeeded/failed".
+  - UI: "Rollback to this version" on retained deployments in the history (confirmation lists the pinned images), rollback rows show their target.
+  - Verified: agent unit tests (sanitizing, rendering, retention, release/target matching, argv), API tests against PostgreSQL (snapshot storage and scrubbing, rollback request shape, no registry/Git calls, conflict/not-found/bad-request cases, route, audit), and a local Docker check that tagging by image ID plus `pull_policy: never` without `--build` brings the older build back. Not yet run end to end through the agent on Ubuntu (part of the pending E2E).
+  - Follow-ups: static-site rollback by re-pointing the vhost at a kept release; a configurable keep count per project.
 - [ ] Preview deployments for pull requests.
 - [ ] Vetted template catalogue.
 - [ ] Redirects, basic auth, path prefix, and custom certificates.

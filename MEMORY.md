@@ -66,6 +66,11 @@ Durable project context that is not obvious from the code. Read it together with
   - Alerts are edge-triggered with a consecutive-sample count and a hysteresis band, and their state lives in `metric_alert_state`, so a restart neither repeats nor drops an alert. A metric that disappears (unmounted disk, removed service) is forgotten without a "resolved" message.
   - How to apply: a new metric is a parser in `panel_core::metrics` with a synthetic-file test, a field in the snapshot, and (if alertable) a `watched_metrics` entry with a stable key. Never add a process spawn to the sampler.
 
+- **Rollbacks start pinned images from an agent-held release, checked against a credential-free snapshot (decided 2026-11-04, D5).** Tags like `scontrol-app/<slug>:latest` or a Compose `image:` move with every deployment, so each successful deployment tags the image ID each running service uses as `<slug>/<service>:deploy-<id>`. The agent keeps the deployed Compose file (0600) because it may contain literal secrets; PostgreSQL gets only a sanitized `DeploymentSnapshot` plus the file's SHA-256, and a rollback must match both the hash and the image list of the agent's record, so a tampered database row cannot point the agent at another image.
+  - Why the current environment: values are write-only and must never be snapshotted, so a rollback reverts code and images, not configuration. Files the Compose file reads from the checkout (bind mounts, `env_file`) also come from the current checkout; domains are the current ones.
+  - Why `pull_policy: never` and no `--build`: a rollback must be a container switch, and a same-named image in a registry must never replace the pinned local one.
+  - Database services are excluded (an older engine on newer data files can corrupt them); static sites have no images (rolling back their kept release directories is a follow-up).
+  - How to apply: a new source kind either produces images that can be pinned per service or is added to `supports_rollback` exclusions; never put an environment value into a snapshot field.
 ## Open Items
 
 The full list is in `TASK.md`. The largest open items as of 2026-11-03 (after D0):

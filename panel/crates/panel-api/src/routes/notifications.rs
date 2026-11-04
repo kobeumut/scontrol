@@ -378,6 +378,7 @@ mod tests {
             "agent://test",
             false,
             "manual",
+            None,
         )
         .await
         .unwrap();

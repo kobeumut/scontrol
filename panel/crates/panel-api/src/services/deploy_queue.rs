@@ -15,10 +15,18 @@
 //! to the agent with `write_compose_environment`. A GitHub App installation token is
 //! minted when the job starts and sent to the agent with that deployment
 //! only, so it never reaches the queue either.
+//!
+//! A rollback is a queued deployment with `rollback_of` set. Its worker
+//! skips everything that prepares a source (registry login, GitHub App
+//! token, Git, build, pull), still writes the current merged environment,
+//! and asks the agent to start the target's pinned release again. A
+//! successful deployment stores the agent's sanitized release snapshot;
+//! before it is stored, every environment value the worker sent is masked
+//! in it once more.
 
 use crate::db;
 use crate::db::compose_projects::ClaimedDeployment;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::services::database_services;
 use crate::services::env_layers;
 use crate::services::github_app::{self, GitHubApps};
@@ -31,7 +39,8 @@ use panel_core::adapters::{
 };
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
-    ComposeDeployOutcome, ComposeDomainBinding, ComposeSource, DeploymentInfo, DeploymentStatus,
+    ComposeDeployOutcome, ComposeDomainBinding, ComposeProject, ComposeSource, DeploymentInfo,
+    DeploymentSnapshot, DeploymentStatus, RollbackTarget,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -80,6 +89,49 @@ impl DeployQueue {
         pull_images: bool,
         trigger: &str,
     ) -> ApiResult<DeploymentInfo> {
+        self.enqueue_job(db, project_id, project_slug, pull_images, trigger, None)
+            .await
+    }
+
+    /// Queues a rollback to `target`, a succeeded deployment of `project`
+    /// whose release the agent still keeps. Errors name the reason: unknown
+    /// target (`NotFound`), a source kind that has no releases
+    /// (`BadRequest`), or a target without a retained release (`Conflict`).
+    pub async fn enqueue_rollback(
+        &self,
+        db: &PgPool,
+        project: &ComposeProject,
+        target: Uuid,
+    ) -> ApiResult<DeploymentInfo> {
+        if !supports_rollback(&project.source) {
+            return Err(ApiError::BadRequest(
+                "static sites and database services cannot be rolled back".into(),
+            ));
+        }
+        let release = db::compose_projects::find_release(db, project.id, target)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("deployment not found".into()))?;
+        rollback_target(&release, target).map_err(ApiError::Conflict)?;
+        self.enqueue_job(
+            db,
+            project.id,
+            &project.slug,
+            false,
+            "rollback",
+            Some(target),
+        )
+        .await
+    }
+
+    async fn enqueue_job(
+        &self,
+        db: &PgPool,
+        project_id: Uuid,
+        project_slug: &str,
+        pull_images: bool,
+        trigger: &str,
+        rollback_of: Option<Uuid>,
+    ) -> ApiResult<DeploymentInfo> {
         let id = Uuid::new_v4();
         let log_path = format!("agent://compose/{project_slug}/logs/{id}.log");
         let deployment = db::compose_projects::enqueue_deployment(
@@ -89,6 +141,7 @@ impl DeployQueue {
             &log_path,
             pull_images,
             trigger,
+            rollback_of,
         )
         .await?;
         // Wake idle workers now; the stored permit covers a worker that is
@@ -97,6 +150,37 @@ impl DeployQueue {
         self.wake.notify_one();
         Ok(deployment)
     }
+}
+
+/// Static sites run no containers and database services must not start an
+/// older engine on newer data, so neither records releases.
+pub fn supports_rollback(source: &ComposeSource) -> bool {
+    !matches!(
+        source,
+        ComposeSource::Static(_) | ComposeSource::Database(_)
+    )
+}
+
+/// The agent request for rolling back to `release`, or why it cannot be.
+fn rollback_target(
+    release: &db::compose_projects::ReleaseRecord,
+    deployment_id: Uuid,
+) -> Result<RollbackTarget, String> {
+    if release.status != DeploymentStatus::Succeeded {
+        return Err("only a succeeded deployment can be rolled back to".into());
+    }
+    let snapshot = release
+        .snapshot
+        .as_ref()
+        .ok_or("this deployment recorded no release to roll back to")?;
+    if !release.retained {
+        return Err("the release of this deployment is no longer kept on the server".into());
+    }
+    Ok(RollbackTarget {
+        deployment_id,
+        compose_sha256: snapshot.compose_sha256.clone(),
+        images: snapshot.images.clone(),
+    })
 }
 
 /// Default worker count: half the CPUs, between 1 and 4. Builds are CPU and
@@ -143,6 +227,19 @@ pub(crate) async fn run_job(
     job: ClaimedDeployment,
 ) {
     let result = execute(db, agent, secrets, github, &job).await;
+    if let Ok(outcome) = &result {
+        if let Err(error) = db::compose_projects::record_releases(
+            db,
+            job.project_id,
+            job.id,
+            outcome.snapshot.as_ref(),
+            &outcome.retained_releases,
+        )
+        .await
+        {
+            tracing::error!(deployment_id = %job.id, %error, "recording the release failed");
+        }
+    }
     let message = result.as_ref().err().map(ToString::to_string);
     let (status, commit) = match &result {
         Ok(outcome) => (DeploymentStatus::Succeeded, outcome.commit_sha.as_deref()),
@@ -169,6 +266,26 @@ async fn execute(
         .await
         .map_err(|e| CoreError::External(format!("loading project: {e}")))?
         .ok_or_else(|| CoreError::NotFound("project no longer exists".into()))?;
+    let rollback = match job.rollback_of {
+        Some(target) => {
+            if !supports_rollback(&project.source) {
+                return Err(CoreError::Validation(
+                    "static sites and database services cannot be rolled back".into(),
+                ));
+            }
+            let release = db::compose_projects::find_release(db, project.id, target)
+                .await
+                .map_err(|e| CoreError::External(format!("loading the rollback target: {e}")))?
+                .ok_or_else(|| {
+                    CoreError::NotFound("the rollback target no longer exists".into())
+                })?;
+            let request = rollback_target(&release, target).map_err(CoreError::Validation)?;
+            Some((request, release.commit_sha))
+        }
+        None => None,
+    };
+    // Values this job sends the agent, masked again in the stored snapshot.
+    let mut sent_secrets: Vec<String> = Vec::new();
     // A service that predates layering keeps the env file the agent has;
     // the panel does not know its own variables, so overwriting it would
     // lose them.
@@ -177,6 +294,8 @@ async fn execute(
             .await
             // Errors name keys at most (decryption failures name none).
             .map_err(|e| CoreError::External(format!("loading environment variables: {e}")))?;
+        sent_secrets.extend(environment.iter().map(|(_, value)| value.clone()));
+        sent_secrets.extend(masked_values.iter().cloned());
         agent
             .write_compose_environment(WriteComposeEnvironmentParams {
                 project_slug: project.slug.clone(),
@@ -197,9 +316,15 @@ async fn execute(
         None
     };
     let slug = project.slug.clone();
-    let registry = registry_login(db, secrets, project.id).await?;
+    // A rollback starts pinned local images: nothing to pull or fetch, so
+    // no registry login and no GitHub App token are created for it.
+    let registry = match rollback {
+        Some(_) => None,
+        None => registry_login(db, secrets, project.id).await?,
+    };
     let has_registry = registry.is_some();
     if let Some(auth) = registry {
+        sent_secrets.push(auth.password.clone());
         // Registry credentials reach the agent right before the pull and are
         // removed right after, win or lose; the job row never carries them.
         agent
@@ -209,7 +334,11 @@ async fn execute(
             })
             .await?;
     }
-    let git_credentials = github_app_credentials(db, github, &project).await?;
+    let git_credentials = match rollback {
+        Some(_) => None,
+        None => github_app_credentials(db, github, &project).await?,
+    };
+    sent_secrets.extend(git_credentials.iter().map(|c| c.token.clone()));
     // Database credentials are unsealed for this request only.
     let database = if matches!(project.source, ComposeSource::Database(_)) {
         Some(
@@ -220,13 +349,14 @@ async fn execute(
     } else {
         None
     };
+    let (rollback, rollback_commit) = rollback.unzip();
     let result = agent
         .deploy_compose_project(DeployComposeProjectParams {
             project_id: project.id,
             deployment_id: job.id,
             project_slug: project.slug,
             source: project.source,
-            pull_images: job.pull_images,
+            pull_images: job.pull_images && rollback.is_none(),
             domains: domains
                 .into_iter()
                 .map(|d| ComposeDomainBinding {
@@ -240,8 +370,19 @@ async fn execute(
             acme_email,
             git_credentials,
             database,
+            rollback,
         })
-        .await;
+        .await
+        .map(|mut outcome| {
+            if let Some(snapshot) = &mut outcome.snapshot {
+                scrub_snapshot(snapshot, &sent_secrets);
+            }
+            // A rollback runs the target's code again.
+            if let Some(commit) = rollback_commit.flatten() {
+                outcome.commit_sha = Some(commit);
+            }
+            outcome
+        });
     if has_registry {
         if let Err(error) = agent
             .write_docker_config(WriteDockerConfigParams {
@@ -315,6 +456,30 @@ async fn github_app_credentials(
         username: github_app::TOKEN_USERNAME.into(),
         token,
     }))
+}
+
+/// Masks every value this job sent the agent in the snapshot's text
+/// fields. The agent already sanitized it; this keeps the guarantee even
+/// if an older or faulty agent did not.
+fn scrub_snapshot(snapshot: &mut DeploymentSnapshot, values: &[String]) {
+    const MASK: &str = "********";
+    let mut values: Vec<&str> = values
+        .iter()
+        .map(String::as_str)
+        .filter(|v| v.len() >= 4)
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    let scrub = |text: &mut String| {
+        for value in &values {
+            if text.contains(value) {
+                *text = text.replace(value, MASK);
+            }
+        }
+    };
+    scrub(&mut snapshot.compose_file);
+    if let Some(body) = &mut snapshot.override_file {
+        scrub(body);
+    }
 }
 
 /// Truncates on a character boundary (slicing bytes could panic).
@@ -807,6 +972,175 @@ mod tests {
             adapter.calls.lock().unwrap().clone(),
             vec!["deploy_compose_project"]
         );
+    }
+
+    /// Deploys once through the worker and returns the finished record.
+    async fn deploy_once(
+        pool: &PgPool,
+        adapter: &MockAdapter,
+        secrets: &SecretBox,
+        project: &panel_core::types::ComposeProject,
+    ) -> DeploymentInfo {
+        let queued = DeployQueue::new()
+            .enqueue(pool, project.id, &project.slug, true, "manual")
+            .await
+            .unwrap();
+        let job = claim_for(pool, project.id).await.unwrap();
+        run_job(pool, adapter, secrets, &test_support::github_apps(), job).await;
+        compose_projects::find_deployment(pool, project.id, queued.id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rollbacks_restart_a_pinned_release_without_fetching_or_storing_secrets() {
+        use crate::db::projects::EnvScope;
+        let _serial = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let secrets = test_secrets();
+        let project = project(&pool).await;
+        env_layers::replace(
+            &pool,
+            &secrets,
+            EnvScope::Service(project.id),
+            &[("DB_PASSWORD".into(), "rollback-secret-xx".into())],
+        )
+        .await
+        .unwrap();
+        let registry_id = Uuid::new_v4();
+        db::registries::create(
+            &pool,
+            registry_id,
+            &format!("reg-{registry_id}"),
+            "ghcr.io",
+            "octocat",
+            &registries::seal(&secrets, registry_id, "registry-pass-xx"),
+        )
+        .await
+        .unwrap();
+        db::registries::set_project_registry(&pool, project.id, Some(registry_id))
+            .await
+            .unwrap();
+
+        let adapter = MockAdapter::new();
+        // An agent that failed to sanitize: the worker masks what it sent.
+        *adapter.next_snapshot.lock().unwrap() = Some(DeploymentSnapshot {
+            compose_path: "docker-compose.yml".into(),
+            compose_sha256: "c".repeat(64),
+            compose_file: "services:\n  web:\n    environment:\n      DB_PASSWORD: rollback-secret-xx\n      REG: registry-pass-xx\n".into(),
+            override_file: Some("# rollback-secret-xx\n".into()),
+            env_keys: vec!["DB_PASSWORD".into()],
+            images: vec![],
+        });
+        let first = deploy_once(&pool, &adapter, &secrets, &project).await;
+        assert_eq!(first.status, DeploymentStatus::Succeeded);
+        assert!(first.rollback_available);
+        let stored = compose_projects::find_release(&pool, project.id, first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert_eq!(stored.env_keys, ["DB_PASSWORD"]);
+        assert!(stored.compose_file.contains("DB_PASSWORD: ********"));
+        let second = deploy_once(&pool, &adapter, &secrets, &project).await;
+        assert!(second.rollback_available);
+        for table in ["compose_deployments", "audit_log"] {
+            let rows: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT row_to_json(t)::text FROM {table} t"))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                rows.iter()
+                    .all(|r| !r.contains("rollback-secret-xx") && !r.contains("registry-pass-xx")),
+                "{table}"
+            );
+        }
+
+        let queue = DeployQueue::new();
+        let queued = queue
+            .enqueue_rollback(&pool, &project, first.id)
+            .await
+            .unwrap();
+        assert_eq!(queued.rollback_of, Some(first.id));
+        assert_eq!(queued.trigger, "rollback");
+        let job = claim_for(&pool, project.id).await.unwrap();
+        assert_eq!(job.rollback_of, Some(first.id));
+        adapter.calls.lock().unwrap().clear();
+        run_job(&pool, &adapter, &secrets, &test_support::github_apps(), job).await;
+        // The current environment is written; no registry login is made.
+        assert_eq!(
+            *adapter.calls.lock().unwrap(),
+            ["write_compose_environment", "deploy_compose_project"]
+        );
+        let sent = adapter.deploys.lock().unwrap().pop().unwrap();
+        let target = sent.rollback.expect("rollback target sent");
+        assert_eq!(target.deployment_id, first.id);
+        assert_eq!(target.compose_sha256, "c".repeat(64));
+        assert!(!sent.pull_images && sent.git_credentials.is_none());
+        let done = compose_projects::find_deployment(&pool, project.id, queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, DeploymentStatus::Succeeded);
+        // A rollback records no release of its own; both targets stay.
+        assert!(!done.rollback_available);
+        for id in [first.id, second.id] {
+            let info = compose_projects::find_deployment(&pool, project.id, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(info.rollback_available);
+        }
+
+        // Targets without a kept release, failed ones, and foreign ones.
+        compose_projects::record_releases(&pool, project.id, done.id, None, &[first.id])
+            .await
+            .unwrap();
+        assert!(matches!(
+            queue.enqueue_rollback(&pool, &project, second.id).await,
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            queue.enqueue_rollback(&pool, &project, done.id).await,
+            Err(ApiError::Conflict(_))
+        ));
+        adapter.fail_next_call("deploy_compose_project");
+        let failed = deploy_once(&pool, &adapter, &secrets, &project).await;
+        assert_eq!(failed.status, DeploymentStatus::Failed);
+        assert!(matches!(
+            queue.enqueue_rollback(&pool, &project, failed.id).await,
+            Err(ApiError::Conflict(_))
+        ));
+        let other = super::tests::project(&pool).await;
+        assert!(matches!(
+            queue.enqueue_rollback(&pool, &other, first.id).await,
+            Err(ApiError::NotFound(_))
+        ));
+        db::registries::set_project_registry(&pool, project.id, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollbacks_refuse_sources_without_releases() {
+        let pool = test_pool().await;
+        let mut project = project(&pool).await;
+        project.source = ComposeSource::Static(Box::new(panel_core::types::StaticSiteSpec {
+            repository_url: "https://github.com/acme/site.git".into(),
+            branch: "main".into(),
+            publish_path: "dist".into(),
+            build: None,
+            spa: false,
+        }));
+        assert!(matches!(
+            DeployQueue::new()
+                .enqueue_rollback(&pool, &project, Uuid::new_v4())
+                .await,
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[tokio::test]
