@@ -180,8 +180,8 @@ pub fn validate_basic_auth_users(users: &[BasicAuthUser]) -> Result<(), String> 
     Ok(())
 }
 
-/// Structural PEM checks only; the agent finishes the job with `nginx -t`,
-/// which verifies the key belongs to the certificate.
+/// Structural PEM checks only; the agent parses the pair with `openssl`,
+/// checks expiry and that the key matches before replacing anything.
 pub fn validate_certificate(cert: &CustomCertificate) -> Result<(), String> {
     let limit = 64 * 1024;
     if cert.certificate_pem.len() > limit || cert.private_key_pem.len() > limit {

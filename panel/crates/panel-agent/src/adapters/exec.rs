@@ -27,6 +27,7 @@ const ALLOWED_PROGRAMS: &[&str] = &[
     "mysqldump",
     "nginx",
     "nixpacks",
+    "openssl",
     "pack",
     "pg_dump",
     "postmap",

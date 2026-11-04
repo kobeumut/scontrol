@@ -1053,7 +1053,7 @@ async fn apply_domains(
             binding.domain.clone(),
             nginx::read_compose_vhost(cfg, &binding.domain).await,
         ));
-        let dir = vhost_secrets::secrets_dir(root, &binding.domain);
+        let dir = vhost_secrets::secrets_dir(cfg, &binding.domain);
         let tls = binding.https
             && nginx::certificate_available(cfg, &binding.domain, &binding.options, &dir);
         let content = nginx::render_compose_vhost(
@@ -1095,7 +1095,7 @@ async fn apply_domains(
     }
     write_owned_domains(root, bindings).await?;
     for domain in &dropped {
-        vhost_secrets::remove_domain_secrets(root, domain).await;
+        vhost_secrets::remove_domain_secrets(cfg, domain).await;
     }
 
     let mut warnings = Vec::new();
@@ -1110,7 +1110,7 @@ async fn apply_domains(
                 cfg,
                 &binding.domain,
                 &binding.options,
-                &vhost_secrets::secrets_dir(root, &binding.domain),
+                &vhost_secrets::secrets_dir(cfg, &binding.domain),
             ) {
                 warnings.push(format!(
                     "no custom certificate uploaded for {}; serving HTTP only",
@@ -1140,7 +1140,7 @@ async fn apply_domains(
                 &target(binding),
                 true,
                 &binding.options,
-                &vhost_secrets::secrets_dir(root, &binding.domain),
+                &vhost_secrets::secrets_dir(cfg, &binding.domain),
             );
             nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
             reload = true;
