@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+pub use crate::database_services::{
+    DatabaseCredentials, DatabaseDeployment, DatabaseExposure, DatabaseServiceSpec,
+    ManagedDatabaseEngine, DATABASE_SERVICE_NAME,
+};
+
 /// A supported application runtime for a hosted site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -237,6 +242,11 @@ pub enum ComposeSource {
     /// container), copied into a release directory and served by the host
     /// Nginx. No container runs once the deployment finishes.
     Static(Box<StaticSiteSpec>),
+    /// A managed database (PostgreSQL, MySQL, MariaDB, MongoDB, Redis)
+    /// rendered by the agent from a vetted template: loopback-only port,
+    /// named volume, generated credentials. Created through the database
+    /// services API, which also allocates its port and credentials.
+    Database(Box<DatabaseServiceSpec>),
 }
 
 impl ComposeSource {
@@ -262,7 +272,7 @@ impl ComposeSource {
                 ApplicationBuild::Image { .. } => None,
             },
             ComposeSource::Static(spec) => Some((&spec.repository_url, &spec.branch)),
-            ComposeSource::Raw { .. } => None,
+            ComposeSource::Raw { .. } | ComposeSource::Database(_) => None,
         }
     }
 
@@ -277,6 +287,7 @@ impl ComposeSource {
                 ApplicationBuild::Builder { builder, .. } => builder.as_str(),
             },
             ComposeSource::Static(_) => "static",
+            ComposeSource::Database(spec) => spec.engine.as_str(),
         }
     }
 }

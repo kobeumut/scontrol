@@ -38,7 +38,23 @@ export type ComposeSource =
   | { kind: 'git'; repository_url: string; branch: string; compose_path: string }
   | { kind: 'raw'; compose_yaml: string }
   | ({ kind: 'application' } & ApplicationSpec)
-  | ({ kind: 'static' } & StaticSiteSpec);
+  | ({ kind: 'static' } & StaticSiteSpec)
+  | ({ kind: 'database' } & DatabaseSpec);
+
+export type DatabaseEngine = 'postgres' | 'mysql' | 'mariadb' | 'mongo' | 'redis';
+
+export const DATABASE_ENGINE_LABELS: Record<DatabaseEngine, string> = {
+  postgres: 'PostgreSQL', mysql: 'MySQL', mariadb: 'MariaDB', mongo: 'MongoDB', redis: 'Redis',
+};
+
+export type DatabaseSpec = {
+  engine: DatabaseEngine;
+  version: string;
+  database_name: string;
+  username: string;
+  memory_limit_mb?: number | null;
+  cpu_limit_millis?: number | null;
+};
 
 /** Repository and branch for sources that deploy from Git. */
 export function gitCheckout(source: ComposeSource): { repository_url: string; branch: string } | null {
@@ -51,6 +67,7 @@ export function sourceLabel(source: ComposeSource): string {
   if (source.kind === 'git') return `git · ${source.branch}`;
   if (source.kind === 'raw') return 'raw';
   if (source.kind === 'static') return `static · ${source.branch}`;
+  if (source.kind === 'database') return `database · ${DATABASE_ENGINE_LABELS[source.engine]} ${source.version}`;
   if (source.build.type === 'builder') return `app · ${BUILD_TOOL_LABELS[source.build.builder]} · ${source.build.branch}`;
   return source.build.type === 'image' ? 'app · image' : `app · Dockerfile · ${source.build.branch}`;
 }

@@ -21,12 +21,21 @@
 //! git-credentials
 //! build/                    builder output that is not an image (Railpack plan)
 //! static-release            static sites only: the release being served
+//! db.env                    database services: 0600 generated credentials
+//! redis.conf                Redis services: 0400 config holding the password
+//! exposure.json             database services: applied outside access
 //! ```
+//!
+//! A database service (`ComposeSource::Database`) is rendered from a vetted
+//! template: the port is published on `127.0.0.1` only, data lives in a
+//! named volume, and credentials come from `db.env` (see
+//! `panel_core::database_services`).
 //!
 //! A static site (`ComposeSource::Static`) runs no container: its files are
 //! copied into `<static_sites_root>/<slug>/releases/<deployment>/`, which the
 //! generated Nginx vhost serves directly.
 
+use super::db_exposure;
 use super::deploy_log::{self, maskable_secrets, redact, DeployLog};
 use super::docker_config;
 use super::exec::{follow_lines, run, run_allow_nonzero, run_streamed};
@@ -41,7 +50,8 @@ use panel_core::adapters::{
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
     validate, ApplicationBuild, ApplicationSpec, ComposeDeployOutcome, ComposeDomainBinding,
-    ComposeServiceInfo, ComposeSource, DeploymentLogChunk, StaticSiteSpec, MAX_MERGED_ENV_VARS,
+    ComposeServiceInfo, ComposeSource, DatabaseDeployment, DatabaseServiceSpec, DeploymentLogChunk,
+    StaticSiteSpec, DATABASE_SERVICE_NAME, MAX_MERGED_ENV_VARS,
 };
 use serde_yaml::Value as Yaml;
 use std::collections::HashSet;
@@ -58,6 +68,15 @@ const ENV_FILE: &str = "env";
 /// Overridden inherited values (0600), read only to mask them in logs.
 const MASKED_VALUES_FILE: &str = "env.masked";
 const OVERRIDE_FILE: &str = "scontrol.override.yml";
+/// Generated credentials of a database service (0600), the last `env_file`.
+const DATABASE_ENV_FILE: &str = "db.env";
+/// Redis configuration holding the password, mounted as a Compose secret.
+const REDIS_CONFIG_FILE: &str = "redis.conf";
+/// Where the Redis secret appears inside the container.
+const REDIS_SECRET_NAME: &str = "redis_conf";
+/// UID and GID of the `redis` user in the official images; the server reads
+/// its config after dropping root, so the 0400 file must belong to it.
+const REDIS_CONTAINER_UID: u32 = 999;
 const COMPOSE_PATH_MARKER: &str = ".scontrol-compose-path";
 const DOMAINS_FILE: &str = "domains.json";
 /// Present only for static sites; holds the deployment ID being served.
@@ -83,6 +102,9 @@ pub async fn deploy(
     secrets.extend(git_auth::stored_secrets(&root).await);
     secrets.extend(docker_config::stored_secrets(&root).await);
     secrets.extend(params.git_credentials.iter().map(|c| c.token.clone()));
+    if let Some(database) = &params.database {
+        secrets.extend(database.credentials.secrets());
+    }
     let mut log = DeployLog::create(
         &root.join("logs"),
         params.deployment_id,
@@ -132,7 +154,12 @@ async fn deploy_steps(
     log.step("preparing source").await?;
     let (compose_path, commit_sha) = materialize_source(cfg, params, root, &code_dir, log).await?;
     ensure_inside(&code_dir, &compose_path).await?;
-    let compose = validate_compose_file(&compose_path, &code_dir, env_path).await?;
+    let agent_files = [
+        env_path.to_path_buf(),
+        root.join(DATABASE_ENV_FILE),
+        root.join(REDIS_CONFIG_FILE),
+    ];
+    let compose = validate_compose_file(&compose_path, &code_dir, &agent_files).await?;
     check_bindings_against_compose(&compose, &params.domains)?;
     persist_compose_path(root, &code_dir, &compose_path).await?;
 
@@ -229,6 +256,14 @@ async fn environment_secrets(root: &Path) -> CoreResult<Vec<String>> {
         .into_iter()
         .map(|(_, value)| value)
         .collect();
+    if root.join(DATABASE_ENV_FILE).is_file() {
+        secrets.extend(
+            read_environment(&root.join(DATABASE_ENV_FILE))
+                .await?
+                .into_iter()
+                .map(|(_, value)| value),
+        );
+    }
     match tokio::fs::read_to_string(root.join(MASKED_VALUES_FILE)).await {
         Ok(body) => secrets.extend(body.lines().map(str::to_string)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -270,6 +305,29 @@ pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Core
     Ok(())
 }
 
+/// `docker compose restart` of the last deployed project model.
+pub async fn restart(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
+    if validate::is_valid_project_slug(&params.project_slug)
+        && static_release(cfg, &params.project_slug).is_some()
+    {
+        return Err(CoreError::Validation(
+            "a static site runs no containers to restart".into(),
+        ));
+    }
+    let paths = existing_project_paths(cfg, &params.project_slug)?;
+    let mut args = compose_args(&params.project_slug, &paths);
+    args.extend(["restart".into()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
+    write_action_log(&project_root(cfg, &params.project_slug), &stdout, &stderr).await?;
+    if code != 0 {
+        return Err(CoreError::External(format!(
+            "docker compose restart failed (exit code {code})"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
     if !validate::is_valid_project_slug(&params.project_slug) {
         return Err(CoreError::Validation(format!(
@@ -278,6 +336,9 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
         )));
     }
     let root = project_root(cfg, &params.project_slug);
+    // A database service may be reachable from outside through a stream
+    // proxy and firewall rule; close that first.
+    db_exposure::clear(cfg, &root, &params.project_slug).await?;
     let static_dir = static_site_dir(cfg, &params.project_slug);
     if root.join(STATIC_MARKER).exists() || static_dir.exists() {
         // A static site: no containers, only vhosts and release files.
@@ -469,7 +530,14 @@ pub async fn logs(cfg: &AgentConfig, params: ComposeProjectLogsParams) -> CoreRe
             "docker compose logs failed: {stderr}"
         )));
     }
-    Ok(stdout)
+    let secrets = environment_secrets(&project_root(cfg, &params.project_slug))
+        .await
+        .map(maskable_secrets)
+        .unwrap_or_default();
+    Ok(stdout
+        .lines()
+        .map(|line| redact(line, &secrets) + "\n")
+        .collect())
 }
 
 /// Concurrent live log followers across all projects. Each holds a
@@ -606,8 +674,40 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
         ComposeSource::Static(spec) => {
             spec.validate().map_err(CoreError::Validation)?;
         }
+        ComposeSource::Database(spec) => {
+            spec.validate().map_err(CoreError::Validation)?;
+            let database = params.database.as_ref().ok_or_else(|| {
+                CoreError::Validation("a database service needs its port and credentials".into())
+            })?;
+            validate_database_deployment(spec, database)?;
+            if !params.domains.is_empty() {
+                return Err(CoreError::Validation(
+                    "database services cannot have domains".into(),
+                ));
+            }
+        }
+    }
+    if params.database.is_some() && !matches!(params.source, ComposeSource::Database(_)) {
+        return Err(CoreError::Validation(
+            "database credentials sent for a service that is not a database".into(),
+        ));
     }
     validate_bindings(&params.domains, params.acme_email.as_deref())
+}
+
+fn validate_database_deployment(
+    spec: &DatabaseServiceSpec,
+    database: &DatabaseDeployment,
+) -> CoreResult<()> {
+    if !panel_core::database_services::DATABASE_LOOPBACK_PORTS.contains(&database.loopback_port) {
+        return Err(CoreError::Validation(
+            "invalid database loopback port".into(),
+        ));
+    }
+    database
+        .credentials
+        .validate(spec.engine)
+        .map_err(CoreError::Validation)
 }
 
 fn validate_environment(environment: &[(String, String)]) -> CoreResult<()> {
@@ -1268,6 +1368,17 @@ async fn materialize_source(
         ComposeSource::Static(_) => Err(CoreError::Validation(
             "static sites are not deployed through Compose".into(),
         )),
+        ComposeSource::Database(spec) => {
+            let database = params.database.as_ref().ok_or_else(|| {
+                CoreError::Validation("a database service needs its port and credentials".into())
+            })?;
+            write_database_files(spec, database, root).await?;
+            reset_dir(code_dir).await?;
+            let path = code_dir.join(DEFAULT_COMPOSE_FILE);
+            let body = render_database(spec, database.loopback_port, root)?;
+            write_generated_file(&path, &body).await?;
+            Ok((path, None))
+        }
     }
 }
 
@@ -1490,6 +1601,135 @@ fn render_application(spec: &ApplicationSpec, root: &Path, slug: &str) -> CoreRe
     ))
 }
 
+/// Writes the generated credentials: `db.env` (0600) for every engine and,
+/// for Redis, the 0400 config the server reads after dropping to its user.
+async fn write_database_files(
+    spec: &DatabaseServiceSpec,
+    database: &DatabaseDeployment,
+    root: &Path,
+) -> CoreResult<()> {
+    write_environment(
+        &root.join(DATABASE_ENV_FILE),
+        &spec.container_environment(&database.credentials),
+    )
+    .await?;
+    let redis_config = root.join(REDIS_CONFIG_FILE);
+    if spec.engine == panel_core::types::ManagedDatabaseEngine::Redis {
+        // Recreate rather than rewrite: the file belongs to the container
+        // user and is read-only.
+        tokio::fs::remove_file(&redis_config).await.ok();
+        write_private_file(
+            &redis_config,
+            &DatabaseServiceSpec::redis_config(&database.credentials),
+        )
+        .await?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::chown(
+                &redis_config,
+                Some(REDIS_CONTAINER_UID),
+                Some(REDIS_CONTAINER_UID),
+            )
+            .map_err(|e| CoreError::Io(format!("handing the Redis config to its user: {e}")))?;
+            tokio::fs::set_permissions(
+                &redis_config,
+                std::os::unix::fs::PermissionsExt::from_mode(0o400),
+            )
+            .await
+            .map_err(|e| CoreError::Io(format!("protecting the Redis config: {e}")))?;
+        }
+    } else {
+        tokio::fs::remove_file(&redis_config).await.ok();
+    }
+    Ok(())
+}
+
+/// Renders a database service from its engine template through
+/// `serde_yaml` values. The port is published on loopback only, data is a
+/// named volume, credentials come from the agent's own env files, and the
+/// health check is exec form without a password.
+fn render_database(
+    spec: &DatabaseServiceSpec,
+    loopback_port: u16,
+    root: &Path,
+) -> CoreResult<String> {
+    use serde_yaml::{Mapping, Value};
+    fn key(k: &str) -> Value {
+        Value::String(k.into())
+    }
+    fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> Value {
+        Value::Sequence(items.into_iter().map(|s| Value::String(s.into())).collect())
+    }
+    let engine = spec.engine;
+    let mut service = Mapping::new();
+    service.insert(key("image"), Value::String(engine.image(&spec.version)));
+    service.insert(key("restart"), key("unless-stopped"));
+    let env = root.join(ENV_FILE).to_string_lossy().into_owned();
+    let db_env = root.join(DATABASE_ENV_FILE).to_string_lossy().into_owned();
+    // Later files win, so user variables cannot replace the credentials.
+    service.insert(key("env_file"), strings([env.as_str(), db_env.as_str()]));
+    service.insert(
+        key("ports"),
+        strings([format!("127.0.0.1:{loopback_port}:{}", engine.container_port()).as_str()]),
+    );
+    let mut mount = Mapping::new();
+    mount.insert(key("type"), key("volume"));
+    mount.insert(
+        key("source"),
+        key(panel_core::database_services::DATABASE_VOLUME_NAME),
+    );
+    mount.insert(key("target"), key(engine.data_path(&spec.version)));
+    service.insert(key("volumes"), Value::Sequence(vec![Value::Mapping(mount)]));
+    service.insert(key("security_opt"), strings(["no-new-privileges:true"]));
+    if let Some(mb) = spec.memory_limit_mb {
+        service.insert(key("mem_limit"), Value::String(format!("{mb}m")));
+    }
+    if let Some(millis) = spec.cpu_limit_millis {
+        service.insert(
+            key("cpus"),
+            Value::String(format!("{}.{:03}", millis / 1000, millis % 1000)),
+        );
+    }
+    let mut test = vec![key("CMD")];
+    test.extend(spec.health_check().into_iter().map(Value::String));
+    let mut health = Mapping::new();
+    health.insert(key("test"), Value::Sequence(test));
+    health.insert(key("interval"), key("10s"));
+    health.insert(key("timeout"), key("5s"));
+    health.insert(key("retries"), Value::Number(10.into()));
+    health.insert(key("start_period"), key("30s"));
+    service.insert(key("healthcheck"), Value::Mapping(health));
+
+    let mut doc = Mapping::new();
+    if engine == panel_core::types::ManagedDatabaseEngine::Redis {
+        let target = format!("/run/secrets/{REDIS_SECRET_NAME}");
+        service.insert(key("command"), strings(["redis-server", target.as_str()]));
+        service.insert(key("secrets"), strings([REDIS_SECRET_NAME]));
+        let mut secret = Mapping::new();
+        secret.insert(
+            key("file"),
+            Value::String(root.join(REDIS_CONFIG_FILE).to_string_lossy().into_owned()),
+        );
+        let mut secrets = Mapping::new();
+        secrets.insert(key(REDIS_SECRET_NAME), Value::Mapping(secret));
+        doc.insert(key("secrets"), Value::Mapping(secrets));
+    }
+    let mut services = Mapping::new();
+    services.insert(key(DATABASE_SERVICE_NAME), Value::Mapping(service));
+    doc.insert(key("services"), Value::Mapping(services));
+    let mut volumes = Mapping::new();
+    volumes.insert(
+        key(panel_core::database_services::DATABASE_VOLUME_NAME),
+        Value::Mapping(Mapping::new()),
+    );
+    doc.insert(key("volumes"), Value::Mapping(volumes));
+    let body = serde_yaml::to_string(&Value::Mapping(doc))
+        .map_err(|e| CoreError::External(format!("rendering database Compose: {e}")))?;
+    Ok(format!(
+        "# Generated by scontrol from the database settings; do not edit.\n{body}"
+    ))
+}
+
 /// Shallow-fetches `branch` into an existing checkout and resets to it.
 /// Returns `false` (caller re-clones) when the fetch fails.
 async fn update_checkout(
@@ -1623,7 +1863,7 @@ async fn read_environment(path: &Path) -> CoreResult<Vec<(String, String)>> {
 async fn validate_compose_file(
     path: &Path,
     code_dir: &Path,
-    allowed_env_file: &Path,
+    agent_files: &[PathBuf],
 ) -> CoreResult<Yaml> {
     let body = tokio::fs::read_to_string(path)
         .await
@@ -1639,7 +1879,7 @@ async fn validate_compose_file(
             "Compose must define 1..=64 services".into(),
         ));
     }
-    let host_paths = compose_policy(&yaml, Some(allowed_env_file))?;
+    let host_paths = compose_policy(&yaml, agent_files)?;
     for relative in host_paths {
         ensure_resolves_inside(code_dir, &relative).await?;
     }
@@ -1673,7 +1913,7 @@ async fn ensure_resolves_inside(code_dir: &Path, relative: &str) -> CoreResult<(
 
 #[cfg(test)]
 fn reject_unsafe_compose_features(yaml: &Yaml) -> CoreResult<()> {
-    compose_policy(yaml, None).map(|_| ())
+    compose_policy(yaml, &[]).map(|_| ())
 }
 
 /// Capabilities that let a container escape or read the host.
@@ -1706,7 +1946,11 @@ fn safe_relative_host_path(path: &str) -> Option<String> {
 
 /// Static Compose policy. Returns the relative host paths the file names so
 /// the caller can check they resolve inside the source tree.
-fn compose_policy(yaml: &Yaml, allowed_env_file: Option<&Path>) -> CoreResult<Vec<String>> {
+/// `agent_files` are the agent's own files outside the source tree (the
+/// environment file, database credentials) that generated Compose files
+/// reference by absolute path; nothing else may be named that way.
+fn compose_policy(yaml: &Yaml, agent_files: &[PathBuf]) -> CoreResult<Vec<String>> {
+    let is_agent_file = |path: &str| agent_files.iter().any(|f| Path::new(path) == f);
     let mut host_paths = Vec::new();
     let Some(root) = yaml.as_mapping() else {
         return Err(CoreError::Validation(
@@ -1722,6 +1966,9 @@ fn compose_policy(yaml: &Yaml, allowed_env_file: Option<&Path>) -> CoreResult<Ve
         if let Some(entries) = yaml.get(section).and_then(Yaml::as_mapping) {
             for (name, entry) in entries {
                 if let Some(file) = entry.get("file") {
+                    if file.as_str().is_some_and(is_agent_file) {
+                        continue;
+                    }
                     let path =
                         file.as_str()
                             .and_then(safe_relative_host_path)
@@ -1837,7 +2084,7 @@ fn compose_policy(yaml: &Yaml, allowed_env_file: Option<&Path>) -> CoreResult<Ve
                     .as_str()
                     .or_else(|| entry.get("path").and_then(Yaml::as_str))
                     .unwrap_or_default();
-                if allowed_env_file.is_some_and(|allowed| Path::new(path) == allowed) {
+                if is_agent_file(path) {
                     continue;
                 }
                 match safe_relative_host_path(path) {
@@ -2063,7 +2310,7 @@ mod tests {
     }
 
     fn policy(yaml: &str) -> CoreResult<Vec<String>> {
-        compose_policy(&serde_yaml::from_str(yaml).unwrap(), None)
+        compose_policy(&serde_yaml::from_str(yaml).unwrap(), &[])
     }
 
     #[test]
@@ -2176,9 +2423,11 @@ mod tests {
         let body = render_application(&spec, root, "shop").unwrap();
         let yaml: Yaml = serde_yaml::from_str(&body).unwrap();
         let env_file = root.join(ENV_FILE);
-        assert!(compose_policy(&yaml, Some(&env_file)).unwrap().is_empty());
+        assert!(compose_policy(&yaml, std::slice::from_ref(&env_file))
+            .unwrap()
+            .is_empty());
         // Without the project env file allowed, the absolute path is refused.
-        assert!(compose_policy(&yaml, None).is_err());
+        assert!(compose_policy(&yaml, &[]).is_err());
         let web = &yaml["services"]["web"];
         assert_eq!(web["image"].as_str(), Some("ghcr.io/acme/shop:1.2"));
         assert_eq!(web["restart"].as_str(), Some("always"));
@@ -2215,7 +2464,7 @@ mod tests {
         assert_eq!(build["context"].as_str(), Some("./services/web"));
         assert_eq!(build["dockerfile"].as_str(), Some("Dockerfile.prod"));
         assert_eq!(build["target"].as_str(), Some("runtime"));
-        let paths = compose_policy(&yaml, Some(&env_file)).unwrap();
+        let paths = compose_policy(&yaml, std::slice::from_ref(&env_file)).unwrap();
         assert!(paths.contains(&"./services/web/Dockerfile.prod".to_string()));
     }
 
@@ -2287,7 +2536,7 @@ mod tests {
         assert_eq!(web["image"].as_str(), Some("scontrol-app/shop:latest"));
         assert_eq!(web["pull_policy"].as_str(), Some("never"));
         assert!(web.get("build").is_none());
-        assert!(compose_policy(&yaml, Some(&root.join(ENV_FILE)))
+        assert!(compose_policy(&yaml, &[root.join(ENV_FILE)])
             .unwrap()
             .is_empty());
     }
@@ -2462,6 +2711,173 @@ mod tests {
         for forbidden in ["--privileged", "sh", "-c", "--network=host", "-v"] {
             assert!(!args.iter().any(|a| a == forbidden), "{forbidden}");
         }
+    }
+
+    fn database_spec(engine: panel_core::types::ManagedDatabaseEngine) -> DatabaseServiceSpec {
+        DatabaseServiceSpec {
+            engine,
+            version: engine.default_version().into(),
+            database_name: "shop".into(),
+            username: "shop_user".into(),
+            memory_limit_mb: Some(512),
+            cpu_limit_millis: Some(1500),
+        }
+    }
+
+    fn database_credentials(
+        engine: panel_core::types::ManagedDatabaseEngine,
+    ) -> panel_core::types::DatabaseCredentials {
+        panel_core::types::DatabaseCredentials {
+            password: "SecretPw0123456789abcdefXYZ".into(),
+            root_password: engine
+                .has_root_password()
+                .then(|| "RootPw0123456789abcdefXYZ".into()),
+        }
+    }
+
+    #[test]
+    fn database_templates_publish_on_loopback_only_with_named_volumes() {
+        use panel_core::types::ManagedDatabaseEngine;
+        let root = Path::new("/var/lib/scontrol/docker/shop-db");
+        let agent_files = [
+            root.join(ENV_FILE),
+            root.join(DATABASE_ENV_FILE),
+            root.join(REDIS_CONFIG_FILE),
+        ];
+        for engine in ManagedDatabaseEngine::ALL {
+            let spec = database_spec(engine);
+            let body = render_database(&spec, 25003, root).unwrap();
+            let creds = database_credentials(engine);
+            for secret in creds.secrets() {
+                assert!(!body.contains(&secret), "{engine} leaks a password");
+            }
+            let yaml: Yaml = serde_yaml::from_str(&body).unwrap();
+            // The shared policy accepts it; without the agent files it cannot
+            // name the absolute credential paths.
+            assert!(
+                compose_policy(&yaml, &agent_files).unwrap().is_empty(),
+                "{engine}"
+            );
+            assert!(compose_policy(&yaml, &[]).is_err(), "{engine}");
+            let db = &yaml["services"][DATABASE_SERVICE_NAME];
+            assert_eq!(
+                db["image"].as_str(),
+                Some(engine.image(&spec.version).as_str())
+            );
+            let ports = db["ports"].as_sequence().unwrap();
+            assert_eq!(ports.len(), 1);
+            assert_eq!(
+                ports[0].as_str().unwrap(),
+                format!("127.0.0.1:25003:{}", engine.container_port())
+            );
+            let volume = &db["volumes"][0];
+            assert_eq!(volume["type"].as_str(), Some("volume"));
+            assert_eq!(volume["source"].as_str(), Some("data"));
+            assert_eq!(
+                volume["target"].as_str(),
+                Some(engine.data_path(&spec.version))
+            );
+            assert!(yaml["volumes"]["data"].is_mapping());
+            let env_files: Vec<&str> = db["env_file"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(Yaml::as_str)
+                .collect();
+            assert_eq!(
+                env_files.last().copied(),
+                Some(root.join(DATABASE_ENV_FILE).to_str().unwrap()),
+                "credentials must be the last env_file so they win"
+            );
+            assert_eq!(db["healthcheck"]["test"][0].as_str(), Some("CMD"));
+            assert_eq!(db["mem_limit"].as_str(), Some("512m"));
+            assert_eq!(db["cpus"].as_str(), Some("1.500"));
+            assert!(db.get("privileged").is_none());
+            assert!(db.get("network_mode").is_none());
+            if engine == ManagedDatabaseEngine::Redis {
+                assert_eq!(db["command"][1].as_str(), Some("/run/secrets/redis_conf"));
+                assert_eq!(
+                    yaml["secrets"]["redis_conf"]["file"].as_str(),
+                    Some(root.join(REDIS_CONFIG_FILE).to_str().unwrap())
+                );
+            } else {
+                assert!(db.get("command").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn database_deployments_need_matching_credentials_and_no_domains() {
+        use panel_core::types::{DatabaseDeployment, ManagedDatabaseEngine};
+        let engine = ManagedDatabaseEngine::Postgres;
+        let params = |database: Option<DatabaseDeployment>, domains| DeployComposeProjectParams {
+            project_id: uuid::Uuid::new_v4(),
+            deployment_id: uuid::Uuid::new_v4(),
+            project_slug: "shop-db".into(),
+            source: ComposeSource::Database(Box::new(database_spec(engine))),
+            pull_images: false,
+            domains,
+            acme_email: None,
+            git_credentials: None,
+            database,
+        };
+        let good = DatabaseDeployment {
+            loopback_port: 25000,
+            credentials: database_credentials(engine),
+        };
+        assert!(validate_project_params(&params(Some(good.clone()), vec![])).is_ok());
+        assert!(validate_project_params(&params(None, vec![])).is_err());
+        let public_port = DatabaseDeployment {
+            loopback_port: 5432,
+            ..good.clone()
+        };
+        assert!(validate_project_params(&params(Some(public_port), vec![])).is_err());
+        let mysql_creds = DatabaseDeployment {
+            credentials: database_credentials(ManagedDatabaseEngine::Mysql),
+            ..good.clone()
+        };
+        assert!(validate_project_params(&params(Some(mysql_creds), vec![])).is_err());
+        let domain = vec![binding("db.example.com", "db", 40000, false)];
+        assert!(validate_project_params(&params(Some(good.clone()), domain)).is_err());
+
+        let mut raw = params(Some(good), vec![]);
+        raw.source = ComposeSource::Raw {
+            compose_yaml: "services: {}".into(),
+        };
+        assert!(validate_project_params(&raw).is_err());
+    }
+
+    #[tokio::test]
+    async fn database_credentials_are_private_and_masked() {
+        use panel_core::types::ManagedDatabaseEngine;
+        let root = temp_dir("scontrol-db-files");
+        let engine = ManagedDatabaseEngine::Mysql;
+        let database = panel_core::types::DatabaseDeployment {
+            loopback_port: 25000,
+            credentials: database_credentials(engine),
+        };
+        write_database_files(&database_spec(engine), &database, &root)
+            .await
+            .unwrap();
+        let path = root.join(DATABASE_ENV_FILE);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(!root.join(REDIS_CONFIG_FILE).exists());
+        let secrets = maskable_secrets(environment_secrets(&root).await.unwrap());
+        let line = format!(
+            "mysql -p{} root={}",
+            database.credentials.password,
+            database.credentials.root_password.clone().unwrap()
+        );
+        let masked = redact(&line, &secrets);
+        for secret in database.credentials.secrets() {
+            assert!(!masked.contains(&secret));
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn binding(domain: &str, service: &str, host_port: u16, https: bool) -> ComposeDomainBinding {

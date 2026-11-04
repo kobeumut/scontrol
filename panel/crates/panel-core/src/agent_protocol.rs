@@ -43,6 +43,8 @@ pub enum AgentRequest {
     WriteDockerConfig(WriteDockerConfigParams),
     TestDockerRegistry(TestDockerRegistryParams),
     StopComposeProject(ComposeProjectActionParams),
+    RestartComposeProject(ComposeProjectActionParams),
+    SetDatabaseExposure(SetDatabaseExposureParams),
     RemoveComposeProject(ComposeProjectActionParams),
     ListComposeProjectServices(ComposeProjectActionParams),
     ComposeProjectLogs(ComposeProjectLogsParams),
