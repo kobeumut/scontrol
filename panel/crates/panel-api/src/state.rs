@@ -6,6 +6,7 @@ use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
 use crate::services::metrics::MetricsCollector;
 use crate::services::notifications::Notifier;
+use crate::services::previews::Previews;
 use crate::services::scheduled_jobs::JobRunCollector;
 use crate::services::secret_box::SecretBox;
 use crate::services::webhook::WebhookKey;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub job_runs: JobRunCollector,
     /// Stores agent metrics and evaluates alerts (see `services::metrics`).
     pub metrics: MetricsCollector,
+    /// Pull request previews: Git host comments and the TTL sweeper.
+    pub previews: Previews,
 }
 
 impl AppState {
@@ -55,6 +58,10 @@ impl AppState {
             github_apps: GitHubApps::new(SecretBox::derive(&config.secret_key)),
             job_runs: JobRunCollector::new(),
             metrics: MetricsCollector::new(),
+            previews: Previews::new(
+                SecretBox::derive(&config.secret_key),
+                GitHubApps::new(SecretBox::derive(&config.secret_key)),
+            ),
         }
     }
 }

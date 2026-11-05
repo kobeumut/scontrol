@@ -10,6 +10,7 @@ pub mod error;
 pub mod metrics;
 pub mod observability;
 pub mod pki;
+pub mod previews;
 pub mod rbac;
 pub mod schedule;
 pub mod security;

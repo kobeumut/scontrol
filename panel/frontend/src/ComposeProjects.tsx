@@ -8,6 +8,7 @@ import {
   LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
 } from './api';
 import { ScheduledJobs } from './ScheduledJobs';
+import { Previews } from './Previews';
 import { ErrorLine, StateView, useAction } from './ui';
 import { LayeredVariables } from './Variables';
 
@@ -423,6 +424,7 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <RegistryPanel projectId={id} />
       {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
       {gitCheckout(project.data.source) && <Webhook projectId={id} />}
+      {gitCheckout(project.data.source) && <Previews projectId={id} />}
     </>}
   </section>;
 }

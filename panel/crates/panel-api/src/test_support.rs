@@ -7,6 +7,7 @@ use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
 use crate::services::metrics::MetricsCollector;
 use crate::services::notifications::Notifier;
+use crate::services::previews::Previews;
 use crate::services::scheduled_jobs::JobRunCollector;
 use crate::services::secret_box::SecretBox;
 use crate::services::webhook::WebhookKey;
@@ -65,6 +66,11 @@ pub fn app_state(pool: PgPool, adapter: Arc<MockAdapter>) -> AppState {
         github_apps: github_apps(),
         job_runs: JobRunCollector::new(),
         metrics: MetricsCollector::new(),
+        previews: Previews::with_api_base(
+            SecretBox::derive(&key),
+            github_apps(),
+            "http://127.0.0.1:9",
+        ),
     }
 }
 

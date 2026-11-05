@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod notifications;
 pub mod observability;
 pub mod placement;
+pub mod previews;
 pub mod registries;
 pub mod scheduled_jobs;
 pub mod secret_box;

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE compose_deployments\n           SET status = 'running', started_at = now()\n           WHERE id = (\n               SELECT d.id FROM compose_deployments d\n               WHERE d.status = 'queued'\n                 AND ($1::uuid IS NULL OR d.project_id = $1)\n                 AND NOT EXISTS (\n                     SELECT 1 FROM compose_deployments r\n                     WHERE r.project_id = d.project_id AND r.status = 'running'\n                 )\n                 AND NOT EXISTS (\n                     SELECT 1 FROM preview_deployments p\n                     WHERE p.preview_project_id = d.project_id AND p.status = 'closing'\n                 )\n               ORDER BY d.queued_at\n               LIMIT 1\n               FOR UPDATE SKIP LOCKED\n           )\n           RETURNING id, project_id, pull_images, rollback_of",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "pull_images",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "rollback_of",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "d869298c1534e0e5c57fc449a2ecbb66a06e87eacf0295887f496a7fb92b49bb"
+}

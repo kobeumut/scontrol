@@ -205,18 +205,19 @@ fn render_static_location(root: &std::path::Path, spa: bool) -> String {
 }
 
 /// Renders the vhost for one project domain binding. Port 80 always serves
-/// the ACME HTTP-01 webroot; with `tls` it redirects everything else to a
-/// 443 server using the certbot-managed certificate.
+/// the ACME HTTP-01 webroot; with `tls` (the certbot lineage to use: the
+/// domain itself, or a wildcard certificate covering it) it redirects
+/// everything else to a 443 server using that certificate.
 #[cfg(feature = "docker")]
 pub fn render_compose_vhost(
     cfg: &AgentConfig,
     project_slug: &str,
     domain: &str,
     target: &VhostTarget<'_>,
-    tls: bool,
+    tls: Option<&str>,
 ) -> String {
     let acme_root = cfg.acme_webroot.to_string_lossy();
-    let http_body = if tls {
+    let http_body = if tls.is_some() {
         "    location / {\n        return 301 https://$host$request_uri;\n    }\n".to_string()
     } else {
         target.render()
@@ -235,8 +236,8 @@ server {{\n\
 \n\
 {http_body}}}\n"
     );
-    if tls {
-        let live = cfg.letsencrypt_live_dir.join(domain);
+    if let Some(certificate) = tls {
+        let live = cfg.letsencrypt_live_dir.join(certificate);
         let body = target.render();
         out.push_str(&format!(
             "\nserver {{\n\
@@ -348,13 +349,19 @@ mod tests {
     fn compose_vhost_proxies_to_loopback_and_serves_acme() {
         let cfg = AgentConfig::default();
         let target = VhostTarget::Proxy(40001);
-        let plain = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, false);
+        let plain = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, None);
         assert!(plain.contains("server_name shop.example.com;"));
         assert!(plain.contains("proxy_pass http://127.0.0.1:40001;"));
         assert!(plain.contains("location ^~ /.well-known/acme-challenge/"));
         assert!(!plain.contains("listen 443"));
 
-        let tls = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, true);
+        let tls = render_compose_vhost(
+            &cfg,
+            "shop",
+            "shop.example.com",
+            &target,
+            Some("shop.example.com"),
+        );
         assert!(tls.contains("return 301 https://$host$request_uri;"));
         assert!(tls.contains("/etc/letsencrypt/live/shop.example.com/fullchain.pem"));
         assert_eq!(tls.matches("proxy_pass").count(), 1);
@@ -366,7 +373,7 @@ mod tests {
         let cfg = AgentConfig::default();
         let root = std::path::Path::new("/var/lib/scontrol/static/site/releases/abc");
         let spa = VhostTarget::Static { root, spa: true };
-        let plain = render_compose_vhost(&cfg, "site", "site.example.com", &spa, false);
+        let plain = render_compose_vhost(&cfg, "site", "site.example.com", &spa, None);
         assert!(plain.contains("root /var/lib/scontrol/static/site/releases/abc;"));
         assert!(plain.contains("disable_symlinks on;"));
         assert!(plain.contains("location ~ /\\. {"));
@@ -374,7 +381,13 @@ mod tests {
         assert!(plain.contains("location ^~ /.well-known/acme-challenge/"));
         assert!(!plain.contains("proxy_pass"));
         let files = VhostTarget::Static { root, spa: false };
-        let tls = render_compose_vhost(&cfg, "site", "site.example.com", &files, true);
+        let tls = render_compose_vhost(
+            &cfg,
+            "site",
+            "site.example.com",
+            &files,
+            Some("site.example.com"),
+        );
         assert!(tls.contains("try_files $uri $uri/ =404;"));
         assert_eq!(tls.matches("root /var/lib/scontrol/static").count(), 1);
         assert!(tls.contains("listen 443 ssl http2;"));

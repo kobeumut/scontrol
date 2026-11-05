@@ -4,6 +4,12 @@ Durum işaretleri: `[x]` tamamlandı, `[-]` devam ediyor, `[ ]` planlandı.
 
 The Dokploy parity roadmap, research basis, and performance budgets are in `PLAN.md`. Phase labels (D0–D6) below refer to it.
 
+## Stage 4 integration handoff (2026-11-05)
+
+- [x] Merge GENE-78 / PR #13 as the remote-agent/RBAC foundation.
+- [-] Integrate PR #12, then PR #11, preserving both features when resolving conflicts.
+- [ ] GENE-82: fix cross-feature remote routing/RBAC, unprivileged chown, macOS terminal compilation, YAML merge-key isolation, and full TLS-file rollback; validate combined migrations and Ubuntu/remote-host flows. Stage 4 merge acceptance is not production-readiness approval.
+
 ## Foundation
 
 - [x] Rust workspace: `panel-core`, `panel-agent`, `panel-api`, `panel-cli`.
@@ -181,7 +187,16 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
   - UI: "Rollback to this version" on retained deployments in the history (confirmation lists the pinned images), rollback rows show their target.
   - Verified: agent unit tests (sanitizing, rendering, retention, release/target matching, argv), API tests against PostgreSQL (snapshot storage and scrubbing, rollback request shape, no registry/Git calls, conflict/not-found/bad-request cases, route, audit), and a local Docker check that tagging by image ID plus `pull_policy: never` without `--build` brings the older build back. Not yet run end to end through the agent on Ubuntu (part of the pending E2E).
   - Follow-ups: static-site rollback by re-pointing the vhost at a kept release; a configurable keep count per project.
-- [ ] Preview deployments for pull requests.
+- [x] Preview deployments for pull requests (migration `0019_preview_deployments.sql`). Done 2026-11-04.
+  - Lifecycle (`services/previews.rs`, pure rules in `panel_core::previews`): the push webhook also accepts GitHub/Gitea `pull_request` and GitLab `Merge Request Hook` events (same HMAC/token authentication). Opened/reopened and new commits create `<slug>-pr-<n>` (a Compose project on the PR head branch inheriting the parent's owner, environment, GitHub App link and registry) with the domain `<slug>-pr-<n>.<base domain>` and queue a `preview` deployment, or record the new head and redeploy (coalescing with a queued job); closed/merged marks the preview `closing` and tears it down in the background. Transitions run under a per-project advisory lock. Requests from forks are never previewed. Number, head branch and SHA are allow-list validated before they name anything.
+  - Limits: at most `max_active` (default 5, 1..=50) active previews per project; above it the request gets a comment instead of a preview. Every container gets `mem_limit`/`memswap_limit`, `cpus`, `pids_limit: 1024` and the same `deploy.resources.limits` through the generated override (default 512 MiB / 0.5 CPU). Previews are ephemeral: the agent removes their named volumes with them (`.scontrol-ephemeral` marker).
+  - TTL: the sweeper (every 5 min) marks previews idle for longer than `ttl_hours` (default 48) closing and retries every unfinished teardown (a running deployment is cancelled first). Disabling previews or deleting the parent removes all of them.
+  - Isolation (PR #12 review): a preview's Compose file may not name volumes or networks explicitly, use `external` ones, `volumes_from`, `external_links`, or `container:` namespaces; every service's `ports` is replaced (`!override` / `!reset`) in the override, and the effective `docker compose config` must publish only the managed loopback ports. Teardown never uses `down --volumes`; it removes only volumes labelled with the preview's Compose project and named `<slug>_…`. Queueing happens in the transition's transaction under the parent lock, teardown cancels/inspects jobs under the claim lock, and the claim skips closing previews (regression test `closing_previews_never_start_a_deployment`).
+  - TLS: per-host certbot certificates, or an existing wildcard certificate lineage (`ComposeDomainBinding::certificate`, certbot skipped).
+  - PR comments: after each preview deployment the link (or "failed"/"cancelled", never an error message) is posted and then edited in place; a "removed" note follows teardown. GitHub projects with a GitHub App mint a `pull_requests: write` token; otherwise a write-only sealed API token per project (GitHub/Gitea/GitLab APIs).
+  - API: `GET/PUT /api/compose-projects/:id/previews`, `PUT/DELETE …/previews/comment-token`, `DELETE …/previews/:number`. UI: "Pull request previews" on Git-sourced projects.
+  - Verified: core unit tests (state machine, TTL, limits, slugs, validation), agent tests (limit override, named certificates), API tests against PostgreSQL (open → deploy with parent variables, limits and ephemeral flag → synchronize/coalesce → fork refusal → limit → close/teardown → slot reuse; TTL sweep; settings validation and write-only token; comment request shape). Not yet run against real GitHub/GitLab webhooks or a wildcard certificate on Ubuntu (part of the pending E2E).
+  - Follow-ups: private repositories over deploy keys or stored HTTPS tokens (those live in the parent's agent directory; previews currently get Git access only through a GitHub App or a public remote); a per-preview environment override layer.
 - [ ] Vetted template catalogue.
 - [ ] Redirects, basic auth, path prefix, and custom certificates.
 - [ ] Web terminal (`docker exec` PTY only, admin + audit).
