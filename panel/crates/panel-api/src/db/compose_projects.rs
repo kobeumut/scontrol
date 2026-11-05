@@ -97,6 +97,7 @@ impl DomainRecord {
             container_port: u16::try_from(self.container_port)?,
             host_port: u16::try_from(self.host_port)?,
             https: self.https,
+            options: Default::default(),
             created_at: self.created_at,
         })
     }
@@ -530,7 +531,54 @@ pub async fn list_domains(pool: &PgPool, project_id: Uuid) -> anyhow::Result<Vec
     )
     .fetch_all(pool)
     .await?;
-    records.into_iter().map(DomainRecord::into_domain).collect()
+    let mut domains: Vec<ComposeDomain> = records
+        .into_iter()
+        .map(DomainRecord::into_domain)
+        .collect::<anyhow::Result<_>>()?;
+    let options = domain_options_of_project(pool, project_id).await?;
+    for domain in &mut domains {
+        if let Some(found) = options.get(&domain.id) {
+            domain.options = found.clone();
+        }
+    }
+    Ok(domains)
+}
+
+/// Vhost options of every domain of a project, by domain id.
+pub async fn domain_options_of_project(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> anyhow::Result<std::collections::HashMap<Uuid, panel_core::vhost::VhostOptions>> {
+    let rows: Vec<(Uuid, sqlx::types::Json<panel_core::vhost::VhostOptions>)> = sqlx::query_as(
+        "SELECT o.domain_id, o.options
+         FROM compose_domain_options o
+         JOIN compose_project_domains d ON d.id = o.domain_id
+         WHERE d.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id, o)| (id, o.0)).collect())
+}
+
+/// Stores the options of a domain of `project_id`; false if there is none.
+pub async fn set_domain_options(
+    pool: &PgPool,
+    project_id: Uuid,
+    domain_id: Uuid,
+    options: &panel_core::vhost::VhostOptions,
+) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO compose_domain_options (domain_id, options)
+         SELECT id, $3 FROM compose_project_domains WHERE id = $1 AND project_id = $2
+         ON CONFLICT (domain_id) DO UPDATE SET options = EXCLUDED.options",
+    )
+    .bind(domain_id)
+    .bind(project_id)
+    .bind(sqlx::types::Json(options))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// True if a site or any Compose project already serves `domain`.

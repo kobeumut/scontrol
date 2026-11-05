@@ -27,6 +27,7 @@ const ALLOWED_PROGRAMS: &[&str] = &[
     "mysqldump",
     "nginx",
     "nixpacks",
+    "openssl",
     "pack",
     "pg_dump",
     "postmap",
@@ -214,6 +215,35 @@ pub async fn run_allow_nonzero(program: &str, args: &[&str]) -> CoreResult<(i32,
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     ))
+}
+
+/// Starts `program` with its standard streams on the given terminal slave
+/// (the web terminal's `docker exec -it`). The child gets its own process
+/// group, and dropping the handle kills it.
+#[cfg(feature = "docker")]
+pub fn spawn_on_tty(
+    program: &str,
+    args: &[&str],
+    slave: &std::fs::File,
+) -> CoreResult<tokio::process::Child> {
+    use std::process::Stdio;
+    check_program(program)?;
+    tracing::debug!(program, ?args, "exec (tty)");
+    let dup = |what: &str| {
+        slave
+            .try_clone()
+            .map(Stdio::from)
+            .map_err(|e| CoreError::Io(format!("duplicating terminal {what}: {e}")))
+    };
+    Command::new(program)
+        .args(args)
+        .stdin(dup("stdin")?)
+        .stdout(dup("stdout")?)
+        .stderr(dup("stderr")?)
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))
 }
 
 /// Runs `program` and streams stdout/stderr line by line into a deployment

@@ -411,6 +411,7 @@ async fn execute(
                     host_port: d.host_port,
                     certificate: certificate.clone().filter(|_| d.https),
                     https: d.https,
+                    options: d.options,
                 })
                 .collect(),
             acme_email,

@@ -8,6 +8,8 @@ import {
   LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
 } from './api';
 import { ScheduledJobs } from './ScheduledJobs';
+import { DomainOptions } from './DomainOptions';
+import { Terminal } from './Terminal';
 import { Previews } from './Previews';
 import { ErrorLine, StateView, useAction } from './ui';
 import { LayeredVariables } from './Variables';
@@ -419,6 +421,7 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       {!isStatic && <ContainerLogs projectId={id} />}
       <Domains projectId={id} isStatic={isStatic} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
       {!isStatic && <ScheduledJobs projectId={id} />}
+      {!isStatic && <ProjectTerminal projectId={id} />}
       <LayeredVariables path={`/compose-projects/${id}/variables`} layer="service" title="Variables"
         hint="Write-only. Merged at each deployment: project → environment → this service, the most specific value wins. Stored values are never shown again." />
       <RegistryPanel projectId={id} />
@@ -604,6 +607,7 @@ function Domains({ projectId, isStatic, onDeploy }: {
   const [service, setService] = useState('');
   const [port, setPort] = useState('80');
   const [https, setHttps] = useState(true);
+  const [editing, setEditing] = useState<string>();
   const action = useAction();
 
   const add = (event: FormEvent) => {
@@ -639,9 +643,13 @@ function Domains({ projectId, isStatic, onDeploy }: {
         <td className="mono">{isStatic ? 'static files' : `${d.service_name}:${d.container_port}`}</td>
         <td className="mono">{isStatic ? '—' : `127.0.0.1:${d.host_port}`}</td>
         <td>{d.https ? 'yes' : '—'}</td>
-        <td><button className="link danger" disabled={action.busy} onClick={() => remove(d)}>remove</button></td>
+        <td>
+          <button className="link" onClick={() => setEditing(editing === d.id ? undefined : d.id)}>options{d.options && (d.options.redirect || d.options.path_prefix || d.options.basic_auth || d.options.custom_cert) ? ' •' : ''}</button>{' '}
+          <button className="link danger" disabled={action.busy} onClick={() => remove(d)}>remove</button></td>
       </tr>)}
     </tbody></table>}
+    {domains.data?.filter((d) => d.id === editing).map((d) => <DomainOptions key={d.id} projectId={projectId} domain={d}
+      onSaved={(deployment) => { setEditing(undefined); domains.reload(); if (deployment) onDeploy(deployment); }} />)}
     <form className="inline-form" onSubmit={add}>
       <input required aria-label="Domain" placeholder="app.example.com" value={domain} onChange={(e) => setDomain(e.target.value)} />
       {!isStatic && <input required aria-label="Service" placeholder="service" className="mono" value={service} onChange={(e) => setService(e.target.value)} />}
@@ -799,4 +807,11 @@ function Webhook({ projectId }: { projectId: string }) {
     </div>}
     <ErrorLine error={action.error} />
   </>;
+}
+
+/** Terminal for the project's services (admin-only endpoint). */
+function ProjectTerminal({ projectId }: { projectId: string }) {
+  const services = useApi<ServiceInfo[]>(`/compose-projects/${projectId}/services`);
+  const names = Array.from(new Set((services.data ?? []).map((s) => s.name)));
+  return names.length === 0 ? null : <Terminal projectId={projectId} services={names} />;
 }

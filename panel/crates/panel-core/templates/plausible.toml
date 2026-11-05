@@ -1,0 +1,30 @@
+id = "plausible"
+name = "Plausible Analytics"
+description = "Privacy-friendly web analytics (Community Edition) with PostgreSQL and ClickHouse."
+category = "analytics"
+compose = "plausible.yml"
+suggested_domain = { service = "plausible", port = 8000 }
+
+[[variables]]
+name = "BASE_URL"
+label = "Public URL"
+generator = "input"
+default = "http://localhost:8000"
+
+[[variables]]
+name = "SECRET_KEY_BASE"
+label = "Secret key base"
+generator = "base64"
+length = 48
+
+[[variables]]
+name = "TOTP_VAULT_KEY"
+label = "TOTP vault key"
+generator = "base64"
+length = 32
+
+[[variables]]
+name = "DB_PASSWORD"
+label = "PostgreSQL password"
+generator = "password"
+length = 32

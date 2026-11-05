@@ -127,8 +127,23 @@ export type ServiceInfo = {
   health: string; exit_code: number; ports: string[];
 };
 
+export type VhostRedirect = { status: 301 | 302; target: string; preserve_path: boolean };
+/** Non-secret vhost options; passwords and keys are write-only and never returned. */
+export type VhostOptions = {
+  redirect: VhostRedirect | null; path_prefix: string | null; basic_auth: boolean; custom_cert: boolean;
+};
+export type SecretChange<T> = { action: 'keep' } | { action: 'remove' } | { action: 'set'; value: T };
+
 export type Domain = {
   id: string; domain: string; service_name: string; container_port: number; host_port: number; https: boolean;
+  options?: VhostOptions;
+};
+
+export type TemplateInput = { name: string; label: string; default: string | null };
+export type TemplateInfo = {
+  id: string; name: string; description: string; category: string;
+  suggested_domain: { service: string; port: number } | null;
+  inputs: TemplateInput[]; generated: string[];
 };
 
 /** Non-secret Git access state; tokens are write-only and never returned. */

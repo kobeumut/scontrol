@@ -442,5 +442,23 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         AgentRequest::MetricsSnapshot => {
             AgentResponse::from_core_result(adapter.metrics_snapshot().await)
         }
+        AgentRequest::WriteVhostSecrets(p) => {
+            AgentResponse::from_core_result(adapter.write_vhost_secrets(p).await)
+        }
+        AgentRequest::OpenTerminal(p) => {
+            AgentResponse::from_core_result(adapter.open_terminal(p).await)
+        }
+        AgentRequest::ReadTerminal(p) => {
+            AgentResponse::from_core_result(adapter.read_terminal(p).await)
+        }
+        AgentRequest::WriteTerminal(p) => {
+            AgentResponse::from_core_result(adapter.write_terminal(p).await)
+        }
+        AgentRequest::ResizeTerminal(p) => {
+            AgentResponse::from_core_result(adapter.resize_terminal(p).await)
+        }
+        AgentRequest::CloseTerminal(p) => {
+            AgentResponse::from_core_result(adapter.close_terminal(p).await)
+        }
     }
 }

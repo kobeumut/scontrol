@@ -976,6 +976,9 @@ pub struct ComposeDomainBinding {
     pub container_port: u16,
     pub host_port: u16,
     pub https: bool,
+    /// Redirect, basic auth, path prefix, and custom certificate options.
+    #[serde(default)]
+    pub options: crate::vhost::VhostOptions,
     /// Serve HTTPS with this existing certbot lineage (a wildcard
     /// certificate such as `preview.example.com` issued out of band)
     /// instead of requesting a certificate for `domain`.
@@ -993,6 +996,8 @@ pub struct ComposeDomain {
     pub container_port: u16,
     pub host_port: u16,
     pub https: bool,
+    #[serde(default)]
+    pub options: crate::vhost::VhostOptions,
     pub created_at: DateTime<Utc>,
 }
 

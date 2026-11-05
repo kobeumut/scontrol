@@ -67,3 +67,7 @@ td.actions{white-space:nowrap}td.actions .link{margin-left:10px}td.actions .link
 .chart-tip{position:absolute;top:30px;transform:translateX(-50%);background:var(--ink);color:var(--paper);font:11px/1.5 'DM Mono',monospace;padding:6px 8px;pointer-events:none;white-space:nowrap;z-index:2}.chart-tip .muted{color:#b9c0b4}.chart-tip i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
 table.compact td{padding:9px 10px}.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}label.inline{flex-direction:row;align-items:center;gap:8px}label.inline select{width:auto}
 @media(max-width:680px){.stat-row,.chart-grid,.grid4{grid-template-columns:1fr 1fr}.stat{border-bottom:1px solid var(--line)}}
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin: 12px 0; }
+.cards .card.selected { outline: 2px solid currentColor; }
+.terminal { height: 360px; margin-top: 8px; padding: 6px; background: #000; }

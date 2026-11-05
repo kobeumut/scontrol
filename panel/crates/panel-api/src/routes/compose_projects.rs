@@ -87,6 +87,8 @@ pub fn router() -> Router<AppState> {
                 .delete(disable_webhook),
         )
         .merge(super::scheduled_jobs::router())
+        .merge(super::domain_options::router())
+        .merge(super::terminal::router())
         .merge(super::previews::router())
 }
 

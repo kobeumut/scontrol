@@ -31,8 +31,12 @@ pub mod s3;
 #[cfg(feature = "docker")]
 pub mod scheduled_jobs;
 pub mod systemd_app;
+#[cfg(feature = "docker")]
+pub mod terminal;
 pub mod tls;
 pub mod users;
+#[cfg(feature = "docker")]
+pub mod vhost_secrets;
 
 use crate::config::AgentConfig;
 use async_trait::async_trait;
@@ -49,6 +53,9 @@ pub struct LocalAdapter {
         std::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio::sync::watch::Sender<bool>>>,
     /// In-process `/proc` and cgroup sampler (see `metrics`).
     pub metrics: std::sync::Arc<metrics::MetricsSampler>,
+    /// Open web terminal sessions.
+    #[cfg(feature = "docker")]
+    terminals: std::sync::Arc<terminal::Terminals>,
 }
 
 impl LocalAdapter {
@@ -57,6 +64,8 @@ impl LocalAdapter {
             metrics: std::sync::Arc::new(metrics::MetricsSampler::new(
                 metrics::SamplerPaths::from_config(&config),
             )),
+            #[cfg(feature = "docker")]
+            terminals: terminal::Terminals::new(),
             config,
             running_deployments: Default::default(),
         }
@@ -737,5 +746,95 @@ impl AdapterPort for LocalAdapter {
 
     async fn metrics_snapshot(&self) -> CoreResult<Option<panel_core::metrics::MetricsSnapshot>> {
         Ok(self.metrics.latest())
+    }
+
+    async fn write_vhost_secrets(&self, params: WriteVhostSecretsParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return vhost_secrets::write_vhost_secrets(&self.config, params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn open_terminal(&self, params: OpenTerminalParams) -> CoreResult<TerminalSessionInfo> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return self.terminals.open(params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn read_terminal(&self, params: TerminalReadParams) -> CoreResult<TerminalOutput> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return self.terminals.read(params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn write_terminal(&self, params: TerminalWriteParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return self.terminals.write(params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn resize_terminal(&self, params: TerminalResizeParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return self.terminals.resize(params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
+    }
+
+    async fn close_terminal(&self, params: TerminalCloseParams) -> CoreResult<()> {
+        #[cfg(feature = "docker")]
+        {
+            if !self.config.docker_enabled() {
+                return Err(Self::feature_disabled("docker"));
+            }
+            return self.terminals.close(params).await;
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = params;
+            Err(Self::feature_disabled("docker"))
+        }
     }
 }

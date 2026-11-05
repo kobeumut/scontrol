@@ -1,0 +1,41 @@
+id = "directus"
+name = "Directus"
+description = "Directus headless CMS with PostgreSQL."
+category = "backend"
+compose = "directus.yml"
+suggested_domain = { service = "directus", port = 8055 }
+
+[[variables]]
+name = "PUBLIC_URL"
+label = "Public URL"
+generator = "input"
+default = "http://localhost:8055"
+
+[[variables]]
+name = "ADMIN_EMAIL"
+label = "Admin email"
+generator = "input"
+default = "admin@example.com"
+
+[[variables]]
+name = "ADMIN_PASSWORD"
+label = "Admin password"
+generator = "password"
+length = 24
+
+[[variables]]
+name = "DIRECTUS_KEY"
+label = "Instance key"
+generator = "uuid"
+
+[[variables]]
+name = "DIRECTUS_SECRET"
+label = "Token secret"
+generator = "hex"
+length = 32
+
+[[variables]]
+name = "DB_PASSWORD"
+label = "Database password"
+generator = "password"
+length = 32

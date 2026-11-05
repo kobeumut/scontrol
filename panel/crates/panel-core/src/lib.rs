@@ -14,4 +14,6 @@ pub mod previews;
 pub mod rbac;
 pub mod schedule;
 pub mod security;
+pub mod templates;
 pub mod types;
+pub mod vhost;

@@ -382,6 +382,90 @@ pub struct CreateContainerParams {
     pub env: Vec<(String, String)>,
 }
 
+/// Secrets of one project domain's vhost options. They are written to 0600
+/// files under the project's directory and never read back.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WriteVhostSecretsParams {
+    pub project_slug: String,
+    pub domain: String,
+    #[serde(default)]
+    pub basic_auth: crate::vhost::SecretChange<Vec<crate::vhost::BasicAuthUser>>,
+    #[serde(default)]
+    pub certificate: crate::vhost::SecretChange<crate::vhost::CustomCertificate>,
+}
+
+/// The only shells a web terminal may start inside a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalShell {
+    Sh,
+    Bash,
+    Ash,
+}
+
+impl TerminalShell {
+    pub fn program(self) -> &'static str {
+        match self {
+            TerminalShell::Sh => "sh",
+            TerminalShell::Bash => "bash",
+            TerminalShell::Ash => "ash",
+        }
+    }
+}
+
+/// Opens an interactive terminal in a service container of a Compose project
+/// (`docker exec -it`). There is no way to name a host shell or a container
+/// outside a project.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OpenTerminalParams {
+    pub project_slug: String,
+    pub service_name: String,
+    pub shell: TerminalShell,
+    pub cols: u16,
+    pub rows: u16,
+    /// Who opened it, for the agent's own log line.
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalSessionInfo {
+    pub session_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalReadParams {
+    pub session_id: uuid::Uuid,
+    /// Wait up to this long for output when none is buffered.
+    pub wait_ms: u64,
+}
+
+/// Output since the previous read. `data` is base64.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalOutput {
+    pub data: String,
+    /// Set once the process exited and everything was read.
+    pub exited: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalWriteParams {
+    pub session_id: uuid::Uuid,
+    /// Base64 keystrokes.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalResizeParams {
+    pub session_id: uuid::Uuid,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalCloseParams {
+    pub session_id: uuid::Uuid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContainerActionParams {
     pub name: String,
@@ -670,6 +754,14 @@ pub trait AdapterPort: Send + Sync {
     /// The sampler's latest snapshot; `None` until it has two readings to
     /// compute rates from.
     async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>>;
+
+    // Delivery extras: vhost option secrets and the web terminal.
+    async fn write_vhost_secrets(&self, params: WriteVhostSecretsParams) -> CoreResult<()>;
+    async fn open_terminal(&self, params: OpenTerminalParams) -> CoreResult<TerminalSessionInfo>;
+    async fn read_terminal(&self, params: TerminalReadParams) -> CoreResult<TerminalOutput>;
+    async fn write_terminal(&self, params: TerminalWriteParams) -> CoreResult<()>;
+    async fn resize_terminal(&self, params: TerminalResizeParams) -> CoreResult<()>;
+    async fn close_terminal(&self, params: TerminalCloseParams) -> CoreResult<()>;
 }
 
 #[cfg(feature = "test-utils")]
@@ -705,6 +797,9 @@ pub mod mock {
         /// empty chunk at the requested offset.
         pub nginx_chunks: Mutex<std::collections::VecDeque<NginxStatsChunk>>,
         /// What `prune_docker` reports, and every request received.
+        /// Every `write_vhost_secrets` request and `open_terminal` request.
+        pub vhost_secret_writes: Mutex<Vec<WriteVhostSecretsParams>>,
+        pub terminals: Mutex<Vec<OpenTerminalParams>>,
         pub prune_outcome: Mutex<Option<DockerPruneOutcome>>,
         pub prunes: Mutex<Vec<PruneDockerParams>>,
         /// What `metrics_snapshot` returns, so tests can drive the collector.
@@ -1141,6 +1236,40 @@ pub mod mock {
         async fn metrics_snapshot(&self) -> CoreResult<Option<crate::metrics::MetricsSnapshot>> {
             self.record("metrics_snapshot")?;
             Ok(self.metrics.lock().unwrap().clone())
+        }
+
+        async fn write_vhost_secrets(&self, params: WriteVhostSecretsParams) -> CoreResult<()> {
+            self.record("write_vhost_secrets")?;
+            self.vhost_secret_writes.lock().unwrap().push(params);
+            Ok(())
+        }
+
+        async fn open_terminal(
+            &self,
+            params: OpenTerminalParams,
+        ) -> CoreResult<TerminalSessionInfo> {
+            self.record("open_terminal")?;
+            self.terminals.lock().unwrap().push(params);
+            Ok(TerminalSessionInfo {
+                session_id: Uuid::new_v4(),
+            })
+        }
+
+        async fn read_terminal(&self, _params: TerminalReadParams) -> CoreResult<TerminalOutput> {
+            self.record("read_terminal")?;
+            Ok(TerminalOutput::default())
+        }
+
+        async fn write_terminal(&self, _params: TerminalWriteParams) -> CoreResult<()> {
+            self.record("write_terminal")
+        }
+
+        async fn resize_terminal(&self, _params: TerminalResizeParams) -> CoreResult<()> {
+            self.record("resize_terminal")
+        }
+
+        async fn close_terminal(&self, _params: TerminalCloseParams) -> CoreResult<()> {
+            self.record("close_terminal")
         }
     }
 }

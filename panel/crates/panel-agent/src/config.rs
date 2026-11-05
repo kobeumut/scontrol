@@ -100,6 +100,22 @@ pub struct AgentConfig {
     #[serde(default = "default_nginx_stream_dir")]
     pub nginx_stream_dir: PathBuf,
 
+    /// Per-domain Basic Auth hashes and uploaded certificates. Outside the
+    /// root-only data directory so the Nginx worker can reach its htpasswd.
+    #[allow(dead_code)]
+    #[serde(default = "default_nginx_vhost_secrets_dir")]
+    pub nginx_vhost_secrets_dir: PathBuf,
+    /// Main Nginx config, read for the worker `user` directive.
+    #[allow(dead_code)]
+    #[serde(default = "default_nginx_main_conf")]
+    pub nginx_main_conf: PathBuf,
+    #[allow(dead_code)]
+    #[serde(default = "default_passwd_file")]
+    pub passwd_file: PathBuf,
+    #[allow(dead_code)]
+    #[serde(default = "default_group_file")]
+    pub group_file: PathBuf,
+
     /// The Nginx JSON access log (`scontrol_json` format) that request
     /// statistics are read from.
     #[serde(default = "default_nginx_stats_log")]
@@ -223,6 +239,22 @@ fn default_systemd_dir() -> PathBuf {
     PathBuf::from("/etc/systemd/system")
 }
 
+fn default_nginx_vhost_secrets_dir() -> PathBuf {
+    PathBuf::from("/etc/nginx/scontrol-vhost")
+}
+
+fn default_nginx_main_conf() -> PathBuf {
+    PathBuf::from("/etc/nginx/nginx.conf")
+}
+
+fn default_passwd_file() -> PathBuf {
+    PathBuf::from("/etc/passwd")
+}
+
+fn default_group_file() -> PathBuf {
+    PathBuf::from("/etc/group")
+}
+
 fn default_docker_projects_root() -> PathBuf {
     PathBuf::from("/var/lib/scontrol/docker")
 }
@@ -303,6 +335,10 @@ impl Default for AgentConfig {
             nginx_sites_available: default_nginx_available(),
             nginx_sites_enabled: default_nginx_enabled(),
             systemd_unit_dir: default_systemd_dir(),
+            nginx_vhost_secrets_dir: default_nginx_vhost_secrets_dir(),
+            nginx_main_conf: default_nginx_main_conf(),
+            passwd_file: default_passwd_file(),
+            group_file: default_group_file(),
             docker_projects_root: default_docker_projects_root(),
             docker_volumes_root: default_docker_volumes_root(),
             acme_webroot: default_acme_webroot(),

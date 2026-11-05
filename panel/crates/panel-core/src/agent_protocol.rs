@@ -68,6 +68,12 @@ pub enum AgentRequest {
     BackupVolume(BackupVolumeParams),
     RestoreVolume(RestoreVolumeParams),
     MetricsSnapshot,
+    WriteVhostSecrets(WriteVhostSecretsParams),
+    OpenTerminal(OpenTerminalParams),
+    ReadTerminal(TerminalReadParams),
+    WriteTerminal(TerminalWriteParams),
+    ResizeTerminal(TerminalResizeParams),
+    CloseTerminal(TerminalCloseParams),
 }
 
 /// One line of a streamed response (see the module docs).
