@@ -219,7 +219,7 @@ function BackupForms({ destination, docker, onStarted }: { destination: Destinat
       <button type="button" className={mode === 'volume' ? 'selected' : ''} onClick={() => setMode('volume')} disabled={!docker}>Volume</button>
     </div>
     {mode === 'database'
-      ? <DatabaseFields busy={busy} label="Back up now" onSubmit={(body) => (e) => submit(e, 'database/backup', body)} />
+      ? <DatabaseFields busy={busy} label="Back up now" withService onSubmit={(body) => (e) => submit(e, 'database/backup', body)} />
       : <VolumeFields busy={busy} label="Back up now" onSubmit={(body) => (e) => submit(e, 'volume/backup', body)} />}
     {message && <p className="state" role="status">{message}</p>}
     {error && <p className="state error" role="alert">{error}</p>}
@@ -251,15 +251,16 @@ function RestoreForm({ destination, object, docker, onDone }: { destination: Des
   </div>;
 }
 
-function DatabaseFields({ busy, label, onSubmit }: { busy: boolean; label: string; onSubmit: (body: Record<string, unknown>) => (e: FormEvent) => void }) {
+function DatabaseFields({ busy, label, withService, onSubmit }: { busy: boolean; label: string; withService?: boolean; onSubmit: (body: Record<string, unknown>) => (e: FormEvent) => void }) {
   const [engine, setEngine] = useState<Engine>('postgres');
   const [host, setHost] = useState('127.0.0.1');
   const [port, setPort] = useState('5432');
   const [database, setDatabase] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [service, setService] = useState('');
   const pick = (value: Engine) => { setEngine(value); setPort({ postgres: '5432', mysql: '3306', mongodb: '27017' }[value]); };
-  return <form onSubmit={onSubmit({ engine, host: host.trim(), port: Number(port), database: database.trim(), username: username.trim(), password })}>
+  return <form onSubmit={onSubmit({ engine, host: host.trim(), port: Number(port), database: database.trim(), username: username.trim(), password, service: (withService && service.trim()) || undefined })}>
     <div className="grid2">
       <label>Engine<select value={engine} onChange={(e) => pick(e.target.value as Engine)}>
         <option value="postgres">PostgreSQL</option><option value="mysql">MySQL / MariaDB</option><option value="mongodb">MongoDB</option>
@@ -269,8 +270,10 @@ function DatabaseFields({ busy, label, onSubmit }: { busy: boolean; label: strin
       <label>Database<input required className="mono" value={database} onChange={(e) => setDatabase(e.target.value)} /></label>
       <label>Username<input required className="mono" autoComplete="off" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
       <label>Password<input required type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+      {withService && <label>Service slug (optional)<input className="mono" value={service} onChange={(e) => setService(e.target.value)} /></label>}
     </div>
     <p className="hint">The password is used for this run only and is never stored.</p>
+    {withService && <p className="hint">Backups are kept per service: a managed database service is recognised by its port, otherwise name the service or the host and port are used, so retention never removes another service's backups.</p>}
     <div className="toolbar"><button className="action" disabled={busy}>{label}</button></div>
   </form>;
 }

@@ -368,9 +368,45 @@ struct DatabaseBody {
     /// (for a database only reachable there); this host when omitted.
     #[serde(default)]
     server_id: Option<Uuid>,
+    /// Backup only: slug of the Compose service the database belongs to.
+    /// Names the backup series, so retention stays within this service.
+    #[serde(default)]
+    service: Option<String>,
 }
 
 impl DatabaseBody {
+    fn server_id(&self) -> Uuid {
+        self.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID)
+    }
+
+    /// The backup series namespace: the named service, else the managed
+    /// database service on that loopback port, else the server and address.
+    /// Two services with a database of the same name never share a series.
+    async fn backup_namespace(&self, state: &AppState) -> ApiResult<String> {
+        let server_id = self.server_id();
+        if let Some(slug) = &self.service {
+            if !validate::is_valid_project_slug(slug) {
+                return Err(ApiError::BadRequest("invalid service slug".into()));
+            }
+            return match db::backups::service_server(&state.db, slug).await? {
+                Some(server) if server == server_id => Ok(service_backup_namespace(slug)),
+                _ => Err(ApiError::BadRequest(
+                    "no such service on that server".into(),
+                )),
+            };
+        }
+        if matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+            if let Some(slug) =
+                db::backups::database_service_on_port(&state.db, server_id, self.port.into())
+                    .await?
+            {
+                return Ok(service_backup_namespace(&slug));
+            }
+        }
+        let server = (server_id != db::servers::LOCAL_SERVER_ID).then_some(server_id);
+        Ok(host_backup_namespace(server, &self.host, self.port))
+    }
+
     fn connection(&self) -> ApiResult<DatabaseConnection> {
         if !validate::is_valid_db_host(&self.host) {
             return Err(ApiError::BadRequest("invalid database host".into()));
@@ -460,19 +496,18 @@ async fn backup_database(
 ) -> ApiResult<Accepted> {
     let connection = body.connection()?;
     let dest = find(&state, id).await?;
+    let namespace = body.backup_namespace(&state).await?;
     let params = BackupDatabaseParams {
         target: target(&state, &dest)?,
         prefix: dest.prefix.clone(),
         connection,
         retention_count: dest.retention_count as u32,
+        namespace: Some(namespace),
     };
     let secrets = vec![body.password.clone()];
     let agent = state
         .agents
-        .for_server_id(
-            &state.db,
-            body.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID),
-        )
+        .for_server_id(&state.db, body.server_id())
         .await?;
     spawn_run(
         &state,
@@ -509,10 +544,7 @@ async fn restore_database(
     };
     let agent = state
         .agents
-        .for_server_id(
-            &state.db,
-            body.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID),
-        )
+        .for_server_id(&state.db, body.server_id())
         .await?;
     spawn_run(
         &state,
@@ -890,7 +922,11 @@ mod tests {
         let run = wait_for_run(&router, &cookie, &run_id).await;
         assert_eq!(run["status"], "succeeded", "{run}");
         assert_eq!(run["kind"], "database_backup");
-        assert_eq!(run["object_key"], "scontrol/s1/mock.sql.gz");
+        // Not a known service: the series is named by the address.
+        assert_eq!(
+            run["object_key"],
+            "scontrol/s1/postgres-host-127.0.0.1-5432-app-mock.sql.gz"
+        );
 
         // A failing agent step is recorded with a redacted error.
         adapter.fail_next_call_with(
@@ -970,6 +1006,121 @@ mod tests {
         .await
         .unwrap();
         assert!(audit.is_empty());
+
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::DELETE,
+            &format!("/api/backups/destinations/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// Two services with a database of the same name back up into two
+    /// series, so neither's retention can delete the other's backups.
+    #[tokio::test]
+    async fn database_backups_are_namespaced_per_service() {
+        let _serial = test_support::QUEUE_TESTS.lock().await;
+        let pool = test_support::test_pool().await;
+        let adapter = Arc::new(MockAdapter::new());
+        let state = test_support::app_state(pool.clone(), adapter.clone());
+        let admin = test_support::user(&pool, true).await;
+        let cookie = test_support::session_cookie(&state, admin.id).await;
+        let router = crate::routes::build_router(state);
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/backups/destinations",
+            Some(json!({
+                "name": format!("ns-{}", uuid::Uuid::new_v4()), "endpoint": "https://s3.example.com",
+                "region": "auto", "bucket": "my-backups", "prefix": "ns", "retention_count": 1,
+                "access_key": "AKIAEXAMPLE", "secret_key": "secret",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let backup = |extra: Value| {
+            let router = router.clone();
+            let cookie = cookie.clone();
+            let id = id.clone();
+            async move {
+                let mut body = json!({ "engine": "postgres", "host": "127.0.0.1", "port": 5432,
+                    "database": "app", "username": "appuser", "password": "pw" });
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let (status, text) = call(
+                    &router,
+                    &cookie,
+                    Method::POST,
+                    &format!("/api/backups/destinations/{id}/database/backup"),
+                    Some(body),
+                )
+                .await;
+                if status == StatusCode::ACCEPTED {
+                    let run = serde_json::from_str::<Value>(&text).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let run = wait_for_run(&router, &cookie, &run).await;
+                    assert_eq!(run["status"], "succeeded", "{run}");
+                }
+                (status, text)
+            }
+        };
+        let last_namespace = || {
+            adapter
+                .database_backups
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .namespace
+                .clone()
+                .unwrap()
+        };
+
+        let (_, shop) = test_support::compose_project(&pool).await;
+        let (_, blog) = test_support::compose_project(&pool).await;
+        let (status, text) = backup(json!({ "service": shop })).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+        let shop_ns = last_namespace();
+        assert_eq!(shop_ns, format!("svc-{shop}"));
+        let (status, _) = backup(json!({ "service": blog })).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(last_namespace(), format!("svc-{blog}"));
+
+        // Unknown or malformed services are refused before anything runs.
+        let runs = adapter.database_backups.lock().unwrap().len();
+        for bad in ["no-such-service", "../x"] {
+            let (status, _) = backup(json!({ "service": bad })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert_eq!(adapter.database_backups.lock().unwrap().len(), runs);
+
+        // A managed database service is recognised by its loopback port.
+        let (managed_id, managed) = test_support::compose_project(&pool).await;
+        let row = crate::db::database_services::create(&pool, managed_id, b"sealed")
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, _) = backup(json!({ "port": row.loopback_port })).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(last_namespace(), format!("svc-{managed}"));
+        // The same port on another host is not that service.
+        let (status, _) = backup(json!({ "host": "db.internal", "port": row.loopback_port })).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            last_namespace(),
+            format!("host-db.internal-{}", row.loopback_port)
+        );
 
         let (status, _) = call(
             &router,

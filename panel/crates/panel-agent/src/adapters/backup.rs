@@ -62,12 +62,25 @@ pub fn object_key(prefix: &str, name: &str, extension: &str) -> String {
     )
 }
 
-/// Deletes the oldest backups named `<prefix>/<name>-*` beyond `keep`.
-pub async fn prune(client: &S3Client, prefix: &str, name: &str, keep: u32) -> CoreResult<u32> {
+/// Deletes the oldest backups of the series `<prefix>/<name>-<timestamp>.<extension>`
+/// beyond `keep`. Only exact series members count: the listing prefix also
+/// matches longer names (`<name>-staging-…`), which belong to someone else.
+pub async fn prune(
+    client: &S3Client,
+    prefix: &str,
+    name: &str,
+    extension: &str,
+    keep: u32,
+) -> CoreResult<u32> {
     if keep == 0 {
         return Ok(0);
     }
-    let listing = client.list(&format!("{prefix}/{name}-")).await?;
+    let listing: Vec<_> = client
+        .list(&format!("{prefix}/{name}-"))
+        .await?
+        .into_iter()
+        .filter(|o| is_backup_of_series(&o.key, prefix, name, extension))
+        .collect();
     let excess = listing.len().saturating_sub(keep as usize);
     for object in listing.iter().take(excess) {
         client.delete(&object.key).await?;
@@ -210,6 +223,7 @@ async fn tool_command(c: &DatabaseConnection, restore: bool) -> CoreResult<ToolC
             args: vec![
                 s("--single-transaction"),
                 s("--routines"),
+                s("--events"),
                 s("-h"),
                 s(&c.host),
                 s("-P"),
@@ -334,8 +348,11 @@ pub async fn backup_database(params: BackupDatabaseParams) -> CoreResult<BackupO
     ensure_connection(&params.connection)?;
     let c = &params.connection;
     let client = S3Client::new(&params.target)?;
-    let name = format!("{}-{}", c.engine.as_str(), c.database);
+    let name = params
+        .series_name()
+        .ok_or_else(|| CoreError::Validation("invalid backup namespace".into()))?;
     let key = object_key(&params.prefix, &name, c.engine.extension());
+    ensure_path(&key, "key")?;
     let secrets = [
         c.password.as_str(),
         params.target.secret_key.as_str(),
@@ -365,7 +382,14 @@ pub async fn backup_database(params: BackupDatabaseParams) -> CoreResult<BackupO
         &secrets,
     )
     .await?;
-    let pruned = prune(&client, &params.prefix, &name, params.retention_count).await?;
+    let pruned = prune(
+        &client,
+        &params.prefix,
+        &name,
+        c.engine.extension(),
+        params.retention_count,
+    )
+    .await?;
     Ok(BackupOutcome {
         key,
         size_bytes: size,
@@ -455,7 +479,14 @@ pub async fn backup_volume(
         },
     )
     .await?;
-    let pruned = prune(&client, &params.prefix, &name, params.retention_count).await?;
+    let pruned = prune(
+        &client,
+        &params.prefix,
+        &name,
+        "tar.gz",
+        params.retention_count,
+    )
+    .await?;
     Ok(BackupOutcome {
         key,
         size_bytes: result,
@@ -595,6 +626,11 @@ mod tests {
                     password: "hunter2-secret".into(),
                 };
                 let tool = rt.block_on(tool_command(&conn, restore)).unwrap();
+                if matches!(engine, BackupEngine::Mysql) && !restore {
+                    for flag in ["--single-transaction", "--routines", "--events"] {
+                        assert!(tool.args.iter().any(|a| a == flag), "mysqldump {flag}");
+                    }
+                }
                 assert!(
                     tool.args.iter().all(|a| !a.contains("hunter2-secret")),
                     "{engine:?} puts the password on argv"
@@ -651,12 +687,21 @@ mod tests {
         conn.host = "db".into();
         conn.database = "a;b".into();
         assert!(ensure_connection(&conn).is_err());
-        let params = BackupDatabaseParams {
+        let mut params = BackupDatabaseParams {
             target: target("http://127.0.0.1:1"),
             prefix: "../escape".into(),
             connection: conn,
             retention_count: 1,
+            namespace: None,
         };
+        assert!(matches!(
+            rt.block_on(backup_database(params.clone())),
+            Err(CoreError::Validation(_))
+        ));
+        // A namespace cannot climb out of the destination prefix.
+        params.prefix = "pfx".into();
+        params.connection.database = "app".into();
+        params.namespace = Some("../other".into());
         assert!(matches!(
             rt.block_on(backup_database(params)),
             Err(CoreError::Validation(_))
@@ -715,7 +760,12 @@ mod tests {
             .put_object("pfx/postgres-other-20250101T000000Z.sql.gz", b"o".to_vec())
             .await
             .unwrap();
-        assert_eq!(prune(&client, "pfx", "postgres-app", 2).await.unwrap(), 2);
+        assert_eq!(
+            prune(&client, "pfx", "postgres-app", "sql.gz", 2)
+                .await
+                .unwrap(),
+            2
+        );
         let left: Vec<String> = client
             .list("pfx/")
             .await
@@ -727,7 +777,86 @@ mod tests {
         assert!(left.contains(&"pfx/postgres-app-20260103T000000Z.sql.gz".to_string()));
         assert!(!left.contains(&key.to_string()));
         assert!(left.contains(&"pfx/postgres-other-20250101T000000Z.sql.gz".to_string()));
-        assert_eq!(prune(&client, "pfx", "postgres-app", 0).await.unwrap(), 0);
+        assert_eq!(
+            prune(&client, "pfx", "postgres-app", "sql.gz", 0)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Two services each with a database `app` (and a service whose slug
+    /// extends the other's) keep separate series: retention of one never
+    /// deletes another's backups.
+    #[tokio::test]
+    async fn retention_never_crosses_services() {
+        let (endpoint, _mock) = start_mock_s3().await;
+        let client = S3Client::new(&target(&endpoint)).unwrap();
+        let conn = |database: &str| DatabaseConnection {
+            engine: BackupEngine::Postgres,
+            host: "127.0.0.1".into(),
+            port: 5432,
+            database: database.into(),
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let series = |slug: &str, database: &str| {
+            BackupDatabaseParams {
+                target: target(&endpoint),
+                prefix: "pfx".into(),
+                connection: conn(database),
+                retention_count: 1,
+                namespace: Some(service_backup_namespace(slug)),
+            }
+            .series_name()
+            .unwrap()
+        };
+        let shop = series("shop", "app");
+        let blog = series("blog", "app");
+        let shop_app = series("shop-app", "main");
+        assert_ne!(shop, blog);
+
+        let mut keys = Vec::new();
+        for name in [&shop, &blog, &shop_app] {
+            for day in ["01", "02", "03"] {
+                keys.push(format!("pfx/{name}-202601{day}T000000Z.sql.gz"));
+            }
+        }
+        // A backup from before namespacing, and volume series that share
+        // a listing prefix.
+        keys.push("pfx/postgres-app-20250101T000000Z.sql.gz".into());
+        for day in ["01", "02"] {
+            keys.push(format!("pfx/volume-shop-data-202601{day}T000000Z.tar.gz"));
+            keys.push(format!("pfx/volume-shop-data-x-202601{day}T000000Z.tar.gz"));
+        }
+        for key in &keys {
+            client.put_object(key, b"x".to_vec()).await.unwrap();
+        }
+
+        // The shop service keeps 1: only its own two oldest go.
+        assert_eq!(prune(&client, "pfx", &shop, "sql.gz", 1).await.unwrap(), 2);
+        assert_eq!(
+            prune(&client, "pfx", "volume-shop-data", "tar.gz", 1)
+                .await
+                .unwrap(),
+            1
+        );
+        let left: Vec<String> = client
+            .list("pfx/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        let gone: Vec<&String> = keys.iter().filter(|k| !left.contains(k)).collect();
+        assert_eq!(
+            gone,
+            vec![
+                &format!("pfx/{shop}-20260101T000000Z.sql.gz"),
+                &format!("pfx/{shop}-20260102T000000Z.sql.gz"),
+                &"pfx/volume-shop-data-20260101T000000Z.tar.gz".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
