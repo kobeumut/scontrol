@@ -269,7 +269,9 @@ pub async fn lock_deploy_claims(
 /// advisory lock, which keeps the "nothing running" check race-free even
 /// with several workers (or several panel-api processes). A preview that is
 /// being removed is never claimed; preview teardown takes the same lock, so
-/// it either sees a claimed deployment as running or claims none.
+/// it either sees a claimed deployment as running or claims none. Nothing
+/// is claimed on a server while a Docker cleanup runs there; starting a
+/// cleanup takes the same lock (`db::observability::start_run`).
 pub async fn claim_next_deployment(pool: &PgPool) -> sqlx::Result<Option<ClaimedDeployment>> {
     claim_next_deployment_of(pool, None).await
 }
@@ -296,12 +298,19 @@ pub async fn claim_next_deployment_of(
                      SELECT 1 FROM preview_deployments p
                      WHERE p.preview_project_id = d.project_id AND p.status = 'closing'
                  )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM compose_projects cp
+                     JOIN docker_cleanup_runs c ON c.server_id = cp.server_id
+                     WHERE cp.id = d.project_id AND c.status = 'running'
+                       AND c.started_at > now() - $2::int * interval '1 second'
+                 )
                ORDER BY d.queued_at
                LIMIT 1
                FOR UPDATE SKIP LOCKED
            )
            RETURNING id, project_id, pull_images, rollback_of"#,
         only_project,
+        super::observability::CLEANUP_STALE_SECS,
     )
     .fetch_optional(&mut *tx)
     .await?;

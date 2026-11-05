@@ -250,14 +250,57 @@ pub async fn recent_runs(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<CleanupR
     .await
 }
 
-/// Starts a run row. `Ok(None)` while another run is active.
+/// A `running` cleanup older than this is treated as lost: it no longer
+/// holds back deployments, and the next start on its server marks it
+/// failed. Well above `services::observability::CLEANUP_TIMEOUT`, so only
+/// a run whose panel-api died or whose result could not be stored is hit.
+pub const CLEANUP_STALE_SECS: i32 = 60 * 60;
+
+/// What [`start_run`] did.
+#[derive(Debug)]
+pub enum StartRun {
+    Started(CleanupRun),
+    /// Another cleanup is running on the server.
+    CleanupRunning,
+    /// Deployments are queued or running on the server.
+    DeploymentsActive(i64),
+}
+
+/// Starts a run row unless the server is busy. Runs under the deployment
+/// claim lock (`db::compose_projects::lock_deploy_claims`): a claim refuses
+/// a server with a running cleanup, and this refuses a server with a queued
+/// or running deployment, so a prune never overlaps a pull or build there.
 pub async fn start_run(
     pool: &PgPool,
     server: Uuid,
     trigger: &str,
     older_than_hours: i32,
-) -> sqlx::Result<Option<CleanupRun>> {
-    sqlx::query_as(&format!(
+) -> sqlx::Result<StartRun> {
+    let mut tx = pool.begin().await?;
+    super::compose_projects::lock_deploy_claims(&mut tx).await?;
+    sqlx::query(
+        "UPDATE docker_cleanup_runs SET status = 'failed', finished_at = now(),
+                error_message = 'no result within the time limit'
+         WHERE server_id = $1 AND status = 'running'
+           AND started_at < now() - $2::int * interval '1 second'",
+    )
+    .bind(server)
+    .bind(CLEANUP_STALE_SECS)
+    .execute(&mut *tx)
+    .await?;
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM compose_deployments d
+         JOIN compose_projects p ON p.id = d.project_id
+         WHERE p.server_id = $1 AND d.status IN ('queued', 'running')",
+    )
+    .bind(server)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active > 0 {
+        tx.commit().await?;
+        return Ok(StartRun::DeploymentsActive(active));
+    }
+    let run: Option<CleanupRun> = sqlx::query_as(&format!(
         "INSERT INTO docker_cleanup_runs (id, trigger, status, older_than_hours, server_id)
          VALUES ($1, $2, 'running', $3, $4)
          ON CONFLICT DO NOTHING
@@ -267,8 +310,10 @@ pub async fn start_run(
     .bind(trigger)
     .bind(older_than_hours)
     .bind(server)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(run.map_or(StartRun::CleanupRunning, StartRun::Started))
 }
 
 pub async fn finish_run(

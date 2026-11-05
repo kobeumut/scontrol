@@ -58,6 +58,9 @@ Durable project context that is not obvious from the code. Read it together with
   - How to apply: any future incremental reader (metrics, mail logs) passes its cursor in and out the same way.
 - Decision: `$host` is client-controlled, so hosts are normalized and capped per chunk, with the rest counted as `_other`.
   - Why: a flood of random `Host` headers must not create unbounded rows.
+- **Docker cleanup and deployments exclude each other per server; `image prune -a` is gone (decided 2026-11-05, GENE-83).** On Docker 29's containerd image store a prune deletes the leases of in-flight pulls (moby/moby#53321, Dokploy #5714), and a builder prune can drop cache under a running build. So `start_run` refuses while a deployment is queued or running on the server and the claim query skips a server with a running cleanup, both under the deployment claim advisory lock; a scheduled cleanup on a busy server is retried at the next 5-minute check rather than recorded. `image prune -a` also deleted rollback pins (an older release's image is used by no container), so tagged images are now removed one reference at a time, skipping pins and anything a container (running or stopped) uses; stopped services keep their containers (`compose stop`), so their images stay (Dokploy #5698).
+  - Why a spawned task and a stale cutoff: the scheduler's 120 s per-server timeout used to cancel a long cleanup and leave its row `running` until a restart; now that a running row also holds back deployments, the row must always be finished, and a lost one must not block a server forever.
+  - How to apply: anything new that pulls or builds images on a server goes through the deployment queue, or takes `lock_deploy_claims` and checks `docker_cleanup_runs` the same way.
 
 ## Server and container metrics (GENE-73)
 
