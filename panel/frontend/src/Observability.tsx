@@ -146,7 +146,7 @@ function DockerCleanup({ docker }: { docker: boolean }) {
       <h2>Docker cleanup</h2>
       <button className="action" disabled={action.busy || running || !form} onClick={runNow}>{running ? 'Cleaning…' : 'Clean up now'}</button>
     </div>
-    <p className="hint">Runs <span className="mono">docker image prune -a</span> and <span className="mono">docker builder prune -a</span> with an age filter. Images used by a container are never removed.</p>
+    <p className="hint">Removes dangling images, unused images, and build cache older than the age filter. Images used by a container (stopped ones included) and rollback releases are kept. A cleanup waits while deployments are queued or running on the server, and deployments wait for a running cleanup.</p>
     <StateView state={overview} />
     <ErrorLine error={action.error} />
     {form && <div className="toolbar">
