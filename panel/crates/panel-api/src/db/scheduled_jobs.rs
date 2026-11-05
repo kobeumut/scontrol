@@ -81,6 +81,8 @@ pub struct JobInput<'a> {
 pub struct JobRef {
     pub job_id: Uuid,
     pub project_slug: String,
+    /// The server whose agent runs the job.
+    pub server_id: Uuid,
 }
 
 pub async fn create(
@@ -218,7 +220,7 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
 pub async fn list_refs(pool: &PgPool) -> sqlx::Result<Vec<JobRef>> {
     sqlx::query_as!(
         JobRef,
-        r#"SELECT j.id AS job_id, p.slug AS project_slug
+        r#"SELECT j.id AS job_id, p.slug AS project_slug, p.server_id
            FROM job_schedules j JOIN compose_projects p ON p.id = j.compose_project_id"#
     )
     .fetch_all(pool)

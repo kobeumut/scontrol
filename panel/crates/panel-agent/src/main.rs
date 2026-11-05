@@ -9,6 +9,7 @@
 
 mod adapters;
 mod config;
+mod remote;
 
 use adapters::LocalAdapter;
 use clap::{Parser, Subcommand};
@@ -18,9 +19,8 @@ use panel_core::agent_protocol::{AgentRequest, AgentResponse, StreamFrame};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -44,6 +44,19 @@ enum HelperCommand {
         project_slug: String,
         job_id: uuid::Uuid,
     },
+    /// Creates this host's remote-agent key (0600) and prints a certificate
+    /// signing request to paste into the panel's Servers screen.
+    #[command(name = "remote-init")]
+    RemoteInit {
+        /// The hostname or IP address the panel connects to.
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value = config::DEFAULT_REMOTE_DIR)]
+        dir: PathBuf,
+        /// Replace an existing key (certificate rotation).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -60,6 +73,20 @@ fn main() -> anyhow::Result<()> {
             ref project_slug,
             job_id,
         }) => run_scheduled_job(&args.config, project_slug, job_id),
+        Some(HelperCommand::RemoteInit {
+            ref host,
+            ref dir,
+            force,
+        }) => {
+            let csr = remote::init(host, dir, force)?;
+            println!("{csr}");
+            eprintln!(
+                "Key written to {}. Paste the request above into the panel, then save the \
+                 returned certificate as agent.pem and the CA as ca.pem in the same directory.",
+                dir.join("agent.key").display()
+            );
+            Ok(())
+        }
         None => serve(args),
     }
 }
@@ -131,25 +158,62 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         adapter.config.metrics_interval_secs,
     );
 
+    if let Some(remote) = adapter.config.remote.clone() {
+        let remote_adapter = adapter.clone();
+        tokio::spawn(async move {
+            let served = remote::serve(remote, move |stream| {
+                let (read_half, write_half) = tokio::io::split(stream);
+                handle_connection(
+                    read_half,
+                    write_half,
+                    remote_adapter.clone(),
+                    Some(remote::IDLE_TIMEOUT),
+                )
+            })
+            .await;
+            if let Err(error) = served {
+                tracing::error!(%error, "remote listener stopped");
+            }
+        });
+    }
+
     loop {
         let (stream, _addr) = listener.accept().await?;
         let adapter = adapter.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, adapter).await {
+            let (read_half, write_half) = stream.into_split();
+            if let Err(e) = handle_connection(read_half, write_half, adapter, None).await {
                 tracing::warn!(error = %e, "connection handler error");
             }
         });
     }
 }
 
-async fn handle_connection(stream: UnixStream, adapter: Arc<LocalAdapter>) -> anyhow::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+/// Serves requests on one connection until the client closes it. With
+/// `idle`, a connection that sends nothing for that long is closed (remote
+/// clients keep connections open for reuse).
+async fn handle_connection<R, W>(
+    read_half: R,
+    mut write_half: W,
+    adapter: Arc<LocalAdapter>,
+    idle: Option<std::time::Duration>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = match idle {
+            Some(limit) => match tokio::time::timeout(limit, reader.read_line(&mut line)).await {
+                Ok(read) => read?,
+                Err(_) => return Ok(()),
+            },
+            None => reader.read_line(&mut line).await?,
+        };
         if n == 0 {
             return Ok(());
         }
@@ -170,30 +234,34 @@ async fn handle_connection(stream: UnixStream, adapter: Arc<LocalAdapter>) -> an
             },
         };
 
-        let mut serialized = serde_json::to_string(&response)?;
-        serialized.push('\n');
-        write_half.write_all(serialized.as_bytes()).await?;
+        write_json(&mut write_half, &response).await?;
     }
 }
 
-async fn write_json<T: serde::Serialize>(
-    write_half: &mut OwnedWriteHalf,
+async fn write_json<T: serde::Serialize, W: AsyncWrite + Unpin>(
+    write_half: &mut W,
     value: &T,
 ) -> anyhow::Result<()> {
     let mut serialized = serde_json::to_string(value)?;
     serialized.push('\n');
     write_half.write_all(serialized.as_bytes()).await?;
+    // TLS buffers writes; the Unix socket flush is a no-op.
+    write_half.flush().await?;
     Ok(())
 }
 
 /// Writes a streamed response (see `agent_protocol`) and closes the
 /// connection. A client that hangs up, detected by EOF on its side of the
 /// socket or by a failed write, drops `lines`, which stops the follower.
-async fn stream_lines(
+async fn stream_lines<R, W>(
     lines: panel_core::error::CoreResult<LogLines>,
-    mut reader: BufReader<OwnedReadHalf>,
-    mut write_half: OwnedWriteHalf,
-) -> anyhow::Result<()> {
+    mut reader: BufReader<R>,
+    mut write_half: W,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut lines = match lines {
         Ok(lines) => lines,
         Err(error) => {

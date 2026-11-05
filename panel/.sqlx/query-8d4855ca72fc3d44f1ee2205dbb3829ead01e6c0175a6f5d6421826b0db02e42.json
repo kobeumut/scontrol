@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects WHERE owner_user_id = $1 ORDER BY created_at DESC",
+  "query": "SELECT id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status, created_at, updated_at FROM compose_projects ORDER BY created_at DESC",
   "describe": {
     "columns": [
       {
@@ -35,31 +35,35 @@
       },
       {
         "ordinal": 6,
+        "name": "server_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
         "name": "source",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
-      "Left": [
-        "Uuid"
-      ]
+      "Left": []
     },
     "nullable": [
+      false,
       false,
       false,
       false,
@@ -72,5 +76,5 @@
       false
     ]
   },
-  "hash": "8a5e49b1ef3ecb90c759517e0c1f71832466dfad15572052a4b3320adbfc909d"
+  "hash": "8d4855ca72fc3d44f1ee2205dbb3829ead01e6c0175a6f5d6421826b0db02e42"
 }

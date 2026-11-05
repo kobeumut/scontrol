@@ -40,10 +40,15 @@ struct CreateUserBody {
 }
 
 async fn create_user(
-    AdminUser(_): AdminUser,
+    AdminUser(actor): AdminUser,
     State(state): State<AppState>,
     Json(body): Json<CreateUserBody>,
 ) -> ApiResult<Json<User>> {
+    // `system:admin` through a role must not mint an installation admin,
+    // who holds every permission (including `access:manage`).
+    if body.is_admin && !actor.is_admin {
+        return Err(ApiError::Forbidden);
+    }
     if !panel_core::types::validate::is_valid_username(&body.username) {
         return Err(ApiError::BadRequest("invalid username".into()));
     }
@@ -60,10 +65,17 @@ async fn create_user(
 }
 
 async fn disable_totp(
-    AdminUser(_): AdminUser,
+    AdminUser(actor): AdminUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let target = users::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    // Only an installation admin may weaken another installation admin.
+    if target.is_admin && !actor.is_admin {
+        return Err(ApiError::Forbidden);
+    }
     users::disable_totp(&state.db, id).await?;
     Ok(Json(serde_json::json!({ "totp_enabled": false })))
 }

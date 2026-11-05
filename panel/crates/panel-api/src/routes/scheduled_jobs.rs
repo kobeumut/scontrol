@@ -10,7 +10,7 @@
 //! Runs are collected from the agent by `services::scheduled_jobs`; their
 //! output stays on the agent and is read here by byte offset.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, Authenticated, Principal, ServiceAccess};
 use crate::db;
 use crate::db::scheduled_jobs::{JobInput, JobRunRow};
 use crate::error::{ApiError, ApiResult};
@@ -21,6 +21,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use panel_core::adapters::{ScheduledJobRef, ScheduledJobRunLogParams, UpsertScheduledJobParams};
 use panel_core::error::CoreError;
+use panel_core::rbac::Permission;
 use panel_core::schedule::{
     JobSchedule, ScheduledJob, ScheduledJobSpec, DEFAULT_JOB_TIMEOUT_SECS, JOB_RUNS_RETAINED,
     MAX_JOBS_PER_PROJECT,
@@ -127,7 +128,7 @@ fn stored_spec(job: &ScheduledJob) -> ScheduledJobSpec {
 }
 
 async fn list(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<ScheduledJob>>> {
@@ -138,7 +139,7 @@ async fn list(
 }
 
 async fn show(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path((id, job_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<ScheduledJob>> {
@@ -146,11 +147,18 @@ async fn show(
 }
 
 async fn create(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user,
+        service,
+        ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<JobBody>,
 ) -> ApiResult<(StatusCode, Json<ScheduledJob>)> {
+    // A job runs a command in the service's containers, as deployed code
+    // does: configuring one needs `services:deploy` too.
+    user.require(Permission::ServicesDeploy, service.target())?;
     let project = find_project(&state, id).await?;
     if matches!(project.source, ComposeSource::Static(_)) {
         return Err(ApiError::BadRequest(
@@ -176,7 +184,9 @@ async fn create(
     .map_err(|e| conflict_on_unique(e, "a job with this name already exists"))?;
 
     let installed = state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .upsert_scheduled_job(UpsertScheduledJobParams {
             job_id,
             project_slug: project.slug.clone(),
@@ -187,7 +197,9 @@ async fn create(
     if let Err(error) = installed {
         // Undo both sides: the agent may have written part of the units.
         let _ = state
-            .agent
+            .agents
+            .for_server_id(&state.db, project.server_id)
+            .await?
             .remove_scheduled_job(ScheduledJobRef {
                 project_slug: project.slug.clone(),
                 job_id,
@@ -196,16 +208,23 @@ async fn create(
         db::scheduled_jobs::delete(&state.db, job_id).await?;
         return Err(error.into());
     }
-    audit(&state, user.id, "create_scheduled_job", &job, &project).await;
+    audit(&state, &user, "create_scheduled_job", &job, &project).await;
     Ok((StatusCode::CREATED, Json(job)))
 }
 
 async fn replace(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user,
+        service,
+        ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path((id, job_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<JobBody>,
 ) -> ApiResult<Json<ScheduledJob>> {
+    // A job runs a command in the service's containers, as deployed code
+    // does: configuring one needs `services:deploy` too.
+    user.require(Permission::ServicesDeploy, service.target())?;
     let project = find_project(&state, id).await?;
     let previous = find_job(&state, id, job_id).await?;
     let (spec, on_calendar) = body.validate()?;
@@ -220,7 +239,9 @@ async fn replace(
     .ok_or_else(|| ApiError::NotFound("scheduled job not found".into()))?;
 
     let installed = state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .upsert_scheduled_job(UpsertScheduledJobParams {
             job_id,
             project_slug: project.slug.clone(),
@@ -243,7 +264,9 @@ async fn replace(
         )
         .await?;
         let _ = state
-            .agent
+            .agents
+            .for_server_id(&state.db, project.server_id)
+            .await?
             .upsert_scheduled_job(UpsertScheduledJobParams {
                 job_id,
                 project_slug: project.slug.clone(),
@@ -253,19 +276,23 @@ async fn replace(
             .await;
         return Err(error.into());
     }
-    audit(&state, user.id, "update_scheduled_job", &job, &project).await;
+    audit(&state, &user, "update_scheduled_job", &job, &project).await;
     Ok(Json(job))
 }
 
 async fn remove(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path((id, job_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let project = find_project(&state, id).await?;
     let job = find_job(&state, id, job_id).await?;
     match state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .remove_scheduled_job(ScheduledJobRef {
             project_slug: project.slug.clone(),
             job_id,
@@ -276,28 +303,32 @@ async fn remove(
         Err(error) => return Err(error.into()),
     }
     db::scheduled_jobs::delete(&state.db, job_id).await?;
-    audit(&state, user.id, "remove_scheduled_job", &job, &project).await;
+    audit(&state, &user, "remove_scheduled_job", &job, &project).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
 /// Starts a run now (also for a disabled job). `409` while a run of the
 /// job is in progress; runs never overlap.
 async fn run_now(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path((id, job_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let project = find_project(&state, id).await?;
     let job = find_job(&state, id, job_id).await?;
     state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .run_scheduled_job(ScheduledJobRef {
             project_slug: project.slug.clone(),
             job_id,
         })
         .await?;
     state.job_runs.run_started();
-    audit(&state, user.id, "run_scheduled_job", &job, &project).await;
+    audit(&state, &user, "run_scheduled_job", &job, &project).await;
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "started": true })),
@@ -305,7 +336,7 @@ async fn run_now(
 }
 
 async fn runs(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path((id, job_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Vec<JobRunRow>>> {
@@ -330,7 +361,7 @@ struct RunLogResponse {
 }
 
 async fn run_log(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path((id, job_id, run_id)): Path<(Uuid, Uuid, Uuid)>,
     Query(query): Query<LogQuery>,
@@ -341,7 +372,9 @@ async fn run_log(
         .await?
         .ok_or_else(|| ApiError::NotFound("job run not found".into()))?;
     let chunk = state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .read_scheduled_job_run_log(ScheduledJobRunLogParams {
             project_slug: project.slug,
             job_id,
@@ -365,7 +398,7 @@ struct PreviewBody {
 
 /// The `OnCalendar=` values a schedule produces, for the editor.
 async fn preview(
-    AdminUser(_): AdminUser,
+    _: Authenticated,
     Json(body): Json<PreviewBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let schedule = match body.schedule {
@@ -378,6 +411,8 @@ async fn preview(
     Ok(Json(serde_json::json!({ "on_calendar": on_calendar })))
 }
 
+/// The service. Its timers and run records live on the agent of the
+/// server it runs on.
 async fn find_project(state: &AppState, id: Uuid) -> ApiResult<ComposeProject> {
     db::compose_projects::find_by_id(&state.db, id)
         .await?
@@ -406,15 +441,15 @@ fn conflict_on_unique(error: anyhow::Error, message: &str) -> ApiError {
 /// than its program (arguments may carry data the operator typed in).
 async fn audit(
     state: &AppState,
-    user_id: Uuid,
+    principal: &Principal,
     action: &str,
     job: &ScheduledJob,
     project: &ComposeProject,
 ) {
     db::audit::record(
         &state.db,
-        Some(user_id),
-        "user",
+        Some(principal.id),
+        principal.actor_kind(),
         action,
         Some(&job.id.to_string()),
         serde_json::json!({

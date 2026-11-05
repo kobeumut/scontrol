@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT j.id AS job_id, p.slug AS project_slug\n           FROM job_schedules j JOIN compose_projects p ON p.id = j.compose_project_id",
+  "query": "SELECT j.id AS job_id, p.slug AS project_slug, p.server_id\n           FROM job_schedules j JOIN compose_projects p ON p.id = j.compose_project_id",
   "describe": {
     "columns": [
       {
@@ -12,6 +12,11 @@
         "ordinal": 1,
         "name": "project_slug",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "server_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -19,8 +24,9 @@
     },
     "nullable": [
       false,
+      false,
       false
     ]
   },
-  "hash": "3e873f79b68153f4fc5ae1359cc786c4d4c4a196849ca363ed97b854a36e2fa8"
+  "hash": "9a9c1b1342f6513dbfee3f5b3d8f618268d88d4abc5421c309bbc6995b84de7e"
 }

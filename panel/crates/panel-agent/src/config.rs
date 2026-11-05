@@ -129,6 +129,11 @@ pub struct AgentConfig {
     #[serde(default)]
     pub runtime_features: RuntimeFeatures,
 
+    /// Serve the same RPC to a remote panel over mutual TLS. Absent on the
+    /// panel's own host, which uses only the Unix socket.
+    #[serde(default)]
+    pub remote: Option<RemoteConfig>,
+
     /// The file this configuration was loaded from. Generated scheduled-job
     /// units pass it back to the agent's helper mode.
     #[allow(dead_code)]
@@ -157,6 +162,38 @@ impl Default for RuntimeFeatures {
             antivirus: true,
         }
     }
+}
+
+/// `[remote]`: the mutual-TLS listener of an agent on a remote host. The
+/// key never leaves this host: `panel-agent remote-init` writes it with a
+/// CSR, the panel signs the CSR, and the operator installs the returned
+/// certificate and the panel CA next to it. A new certificate file is picked
+/// up on the next connection, so rotation needs no restart.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteConfig {
+    /// `address:port` to listen on, for example `0.0.0.0:7843`.
+    pub listen: String,
+    #[serde(default = "default_remote_ca")]
+    pub ca_cert: PathBuf,
+    #[serde(default = "default_remote_cert")]
+    pub cert: PathBuf,
+    /// Must be a regular file with mode 0600 (or stricter).
+    #[serde(default = "default_remote_key")]
+    pub key: PathBuf,
+}
+
+pub const DEFAULT_REMOTE_DIR: &str = "/etc/scontrol/remote";
+
+fn default_remote_ca() -> PathBuf {
+    PathBuf::from(DEFAULT_REMOTE_DIR).join("ca.pem")
+}
+
+fn default_remote_cert() -> PathBuf {
+    PathBuf::from(DEFAULT_REMOTE_DIR).join("agent.pem")
+}
+
+fn default_remote_key() -> PathBuf {
+    PathBuf::from(DEFAULT_REMOTE_DIR).join("agent.key")
 }
 
 /// Where the installer writes `agent.toml`.
@@ -289,6 +326,7 @@ impl Default for AgentConfig {
                 mail: true,
                 antivirus: true,
             },
+            remote: None,
             config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
         }
     }

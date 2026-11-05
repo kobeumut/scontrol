@@ -1,5 +1,5 @@
 import { FormEvent, useMemo, useRef, useState } from 'react';
-import { api, formatTime, useApi } from './api';
+import { api, formatTime, LOCAL_SERVER_ID, Server, useApi } from './api';
 import { ErrorLine, StateView, useAction } from './ui';
 
 type Range = '1h' | '6h' | '24h' | '7d' | '30d';
@@ -27,7 +27,7 @@ type AlertSettings = {
   enabled: boolean; cpu_pct: number; memory_pct: number; disk_pct: number; container_memory_pct: number;
   hysteresis_pct: number; trigger_samples: number; clear_samples: number;
 };
-type AlertState = { key: string; firing: boolean; last_value: number; changed_at: string };
+type AlertState = { server_id: string; server_name: string; key: string; firing: boolean; last_value: number; changed_at: string };
 type Alerts = { settings: AlertSettings; firing: AlertState[] };
 
 /** Categorical slots 1 and 2 (validated: CVD ΔE 24.7, normal ΔE 33.6 on the card surface). */
@@ -54,8 +54,10 @@ function alertLabel(key: string, projects: Map<string, string>): string {
 
 export function Monitoring({ docker }: { docker: boolean }) {
   const [range, setRange] = useState<Range>('1h');
-  const current = useApi<Current>('/metrics/current', 15000);
-  const server = useApi<ServerSeries>(`/metrics/server?range=${range}`, range === '1h' ? 30000 : 120000);
+  const [serverId, setServerId] = useState(LOCAL_SERVER_ID);
+  const servers = useApi<Server[]>('/servers');
+  const current = useApi<Current>(`/metrics/current?server_id=${serverId}`, 15000);
+  const server = useApi<ServerSeries>(`/metrics/server?range=${range}&server_id=${serverId}`, range === '1h' ? 30000 : 120000);
   const alerts = useApi<Alerts>('/metrics/alerts', 30000);
   const host = current.data?.host;
   const projects = useMemo(() => new Map((current.data?.containers ?? []).map((c) => [c.compose_project_id, c.project_name])), [current.data]);
@@ -64,6 +66,11 @@ export function Monitoring({ docker }: { docker: boolean }) {
   return <section className="panel">
     <div className="panel-title">
       <h2>Monitoring</h2>
+      {servers.data && servers.data.length > 1 && <label className="inline">Server
+        <select value={serverId} onChange={(e) => setServerId(e.target.value)}>
+          {servers.data.map((s) => <option key={s.id} value={s.id}>{s.name}{s.status !== 'online' ? ` (${s.status})` : ''}</option>)}
+        </select>
+      </label>}
       <div className="segmented" role="group" aria-label="Time range">
         {RANGES.map((r) => <button key={r} className={range === r ? 'selected' : ''} onClick={() => setRange(r)}>{r}</button>)}
       </div>
@@ -82,7 +89,7 @@ export function Monitoring({ docker }: { docker: boolean }) {
 
     {alerts.data && alerts.data.firing.length > 0 && <div className="state warn" role="alert">
       <strong>⚠ {alerts.data.firing.length} alert{alerts.data.firing.length > 1 ? 's' : ''} firing:</strong>{' '}
-      {alerts.data.firing.map((a) => `${alertLabel(a.key, projects)} at ${pct(a.last_value)} since ${formatTime(a.changed_at)}`).join(' · ')}
+      {alerts.data.firing.map((a) => `${a.server_id === LOCAL_SERVER_ID ? '' : `${a.server_name}: `}${alertLabel(a.key, projects)} at ${pct(a.last_value)} since ${formatTime(a.changed_at)}`).join(' · ')}
     </div>}
 
     <h3>Server</h3>

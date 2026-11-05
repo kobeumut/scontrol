@@ -14,7 +14,7 @@
 //! never leaves the agent. A linked GitHub App installation stores only the
 //! App and installation IDs; tokens are minted per deployment.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, Authenticated, ServiceAccess};
 use crate::db;
 use crate::db::projects::EnvScope;
 use crate::error::{ApiError, ApiResult};
@@ -28,6 +28,7 @@ use panel_core::adapters::{
     CancelDeploymentParams, ComposeProjectActionParams, ComposeProjectLogsParams,
     DeploymentLogParams, FollowComposeLogsParams, GitHttpCredentials, WriteGitCredentialsParams,
 };
+use panel_core::rbac::{Permission, Target};
 use panel_core::types::validate::GitTransport;
 use panel_core::types::{
     validate, ComposeDomain, ComposeProject, ComposeServiceInfo, ComposeSource, DeploymentInfo,
@@ -89,21 +90,42 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list(
-    AdminUser(user): AdminUser,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<ComposeProject>>> {
-    // Admin is currently the only Docker-project actor; still keep this
-    // owner-aware branch to retain the correct model for future RBAC.
-    let projects = if user.is_admin {
-        db::compose_projects::list_all(&state.db).await?
-    } else {
-        db::compose_projects::list_for_owner(&state.db, user.id).await?
-    };
-    Ok(Json(projects))
+    let projects = db::compose_projects::list_all(&state.db).await?;
+    if principal.authority.user.superuser && principal.api_key_id.is_none() {
+        return Ok(Json(projects));
+    }
+    // Only the services whose environment grants `services:read`.
+    let environments: std::collections::HashMap<Uuid, Uuid> =
+        sqlx::query_as::<_, (Uuid, Uuid)>("SELECT id, project_id FROM environments")
+            .fetch_all(&state.db)
+            .await?
+            .into_iter()
+            .collect();
+    Ok(Json(
+        projects
+            .into_iter()
+            .filter(|service| {
+                environments
+                    .get(&service.environment_id)
+                    .is_some_and(|project| {
+                        principal.allows(
+                            Permission::ServicesRead,
+                            Target::Environment {
+                                project: *project,
+                                environment: service.environment_id,
+                            },
+                        )
+                    })
+            })
+            .collect(),
+    ))
 }
 
 async fn show(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<ComposeProject>> {
@@ -119,6 +141,14 @@ struct CreateProjectBody {
     /// default project's `production` environment when omitted.
     #[serde(default)]
     environment_id: Option<Uuid>,
+    /// Server to place the service on. When omitted: this host, unless it
+    /// is draining or full (see `place`).
+    #[serde(default)]
+    server_id: Option<Uuid>,
+    /// Without `server_id`, pick the least loaded eligible server instead
+    /// of this host.
+    #[serde(default)]
+    auto_place: bool,
     /// Write-only values of the service layer; stored sealed, never returned.
     #[serde(default)]
     environment: Vec<(String, String)>,
@@ -149,10 +179,33 @@ struct CreatedProject {
 }
 
 async fn create(
-    AdminUser(user): AdminUser,
+    Authenticated(user): Authenticated,
     State(state): State<AppState>,
     Json(body): Json<CreateProjectBody>,
 ) -> ApiResult<(StatusCode, Json<CreatedProject>)> {
+    // Without an environment the service goes to the creator's default
+    // project, which may not exist yet: that needs a global grant.
+    let target = match body.environment_id {
+        Some(environment_id) => {
+            let environment = db::projects::find_environment(&state.db, environment_id)
+                .await?
+                .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
+            Target::Environment {
+                project: environment.project_id,
+                environment: environment.id,
+            }
+        }
+        None => Target::Global,
+    };
+    user.require(Permission::ServicesCreate, target)?;
+    // Creating can also write the variable layer and queue the first
+    // deployment; each needs its own permission.
+    if !body.environment.is_empty() {
+        user.require(Permission::VariablesUpdate, target)?;
+    }
+    if body.deploy {
+        user.require(Permission::ServicesDeploy, target)?;
+    }
     validate_project_input(&body.name, &body.slug, &body.environment)?;
     validate_source(&body.source)?;
     let token_host = match &body.git_credentials {
@@ -162,11 +215,7 @@ async fn create(
         }
         None => None,
     };
-    if let Some(environment_id) = body.environment_id {
-        db::projects::find_environment(&state.db, environment_id)
-            .await?
-            .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
-    }
+    let server_id = place(&state, body.server_id, body.auto_place, &body.source).await?;
     if let Some(registry_id) = body.registry_id {
         if db::registries::find(&state.db, registry_id)
             .await?
@@ -189,6 +238,18 @@ async fn create(
     )
     .await
     .map_err(|e| conflict_on_unique(e, "a project with this slug already exists"))?;
+    if server_id != db::servers::LOCAL_SERVER_ID {
+        if let Err(error) = db::servers::place_service(&state.db, project.id, server_id).await {
+            db::compose_projects::delete(&state.db, project.id)
+                .await
+                .ok();
+            return Err(error.into());
+        }
+    }
+    let project = ComposeProject {
+        server_id,
+        ..project
+    };
 
     // The row exists first so the slug is reserved before the agent writes
     // anything under it; if a step fails, the row is rolled back.
@@ -219,7 +280,9 @@ async fn create(
     if let Err(error) = prepared {
         // Removes whatever the agent already wrote under the slug.
         state
-            .agent
+            .agents
+            .for_server_id(&state.db, project.server_id)
+            .await?
             .remove_compose_project(ComposeProjectActionParams {
                 project_slug: project.slug.clone(),
             })
@@ -249,7 +312,7 @@ async fn create(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "create_compose_project",
         Some(&project.slug),
         serde_json::json!({ "project_id": project.id, "source_kind": source_kind(&project.source) }),
@@ -266,6 +329,44 @@ async fn create(
     ))
 }
 
+/// The server a new service goes on: the requested one if it can take it;
+/// with `auto`, the least loaded eligible server; otherwise this host, or
+/// the least loaded eligible server when this host is draining or full.
+/// Never a remote server the request did not ask for while this host can
+/// take the service, so adding a server changes nothing for existing
+/// clients.
+pub(crate) async fn place(
+    state: &AppState,
+    requested: Option<Uuid>,
+    auto: bool,
+    source: &ComposeSource,
+) -> ApiResult<Uuid> {
+    use crate::services::placement::{choose, ineligible_reason};
+    // A static site runs no container, only files and a host Nginx vhost.
+    let needs_docker = !matches!(source, ComposeSource::Static(_));
+    if let Some(id) = requested {
+        let server = db::servers::find(&state.db, id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("server not found".into()))?;
+        return match ineligible_reason(&server, needs_docker) {
+            Some(reason) => Err(ApiError::Conflict(reason)),
+            None => Ok(server.id),
+        };
+    }
+    let servers = db::servers::list(&state.db).await?;
+    if !auto {
+        let local = servers
+            .iter()
+            .find(|s| s.id == db::servers::LOCAL_SERVER_ID);
+        if local.is_some_and(|l| ineligible_reason(l, needs_docker).is_none()) {
+            return Ok(db::servers::LOCAL_SERVER_ID);
+        }
+    }
+    choose(&servers, needs_docker)
+        .map(|server| server.id)
+        .ok_or_else(|| ApiError::Conflict("no server can take this service".into()))
+}
+
 #[derive(Deserialize, Default)]
 struct DeployProjectBody {
     /// Replaces the environment before deploying; omit to keep it.
@@ -276,12 +377,21 @@ struct DeployProjectBody {
 }
 
 async fn deploy(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user,
+        service,
+        ..
+    }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     body: Option<Json<DeployProjectBody>>,
 ) -> ApiResult<(StatusCode, Json<DeploymentInfo>)> {
     let body = body.map(|Json(body)| body).unwrap_or_default();
+    // Replacing the environment writes the variable layer: that is
+    // `variables:update`, checked before anything changes.
+    if body.environment.is_some() {
+        user.require(Permission::VariablesUpdate, service.target())?;
+    }
     let project = find_project(&state, id).await?;
     if let Some(environment) = body.environment {
         env_layers::replace(
@@ -305,7 +415,7 @@ async fn deploy(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "deploy_compose_project",
         Some(&project.slug),
         serde_json::json!({ "project_id": project.id, "deployment_id": deployment.id }),
@@ -319,7 +429,9 @@ async fn deploy(
 /// its pinned images again with the current environment and domains, with
 /// no fetch, build, or pull.
 async fn rollback(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path((id, target)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<(StatusCode, Json<DeploymentInfo>)> {
@@ -331,7 +443,7 @@ async fn rollback(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "rollback_compose_project",
         Some(&project.slug),
         serde_json::json!({
@@ -347,7 +459,7 @@ async fn rollback(
 
 /// The non-secret release snapshot a succeeded deployment recorded.
 async fn deployment_snapshot(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<DeploymentSnapshot>> {
@@ -366,7 +478,9 @@ struct EnvironmentBody {
 
 /// Replaces the write-only environment; it applies on the next deployment.
 async fn replace_environment(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::VariablesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<EnvironmentBody>,
@@ -385,7 +499,7 @@ async fn replace_environment(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "replace_compose_environment",
         Some(&project.slug),
         audit,
@@ -398,7 +512,7 @@ async fn replace_environment(
 /// Key names of the service's own, environment, and project variables, and
 /// which layer wins per key. Values are never returned.
 async fn variables(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::VariablesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<ServiceVariables>> {
@@ -416,7 +530,9 @@ pub(crate) struct VariablesBody {
 /// Replaces the service layer. An entry without `value` keeps the stored
 /// value; keys left out are removed. Applies on the next deployment.
 async fn update_variables(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::VariablesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<VariablesBody>,
@@ -432,7 +548,7 @@ async fn update_variables(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "update_service_variables",
         Some(&project.slug),
         serde_json::json!({ "project_id": project.id, "keys": keys }),
@@ -446,7 +562,7 @@ async fn update_variables(
 }
 
 async fn stop(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -457,7 +573,9 @@ async fn stop(
         ));
     }
     state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .stop_compose_project(ComposeProjectActionParams {
             project_slug: project.slug,
         })
@@ -467,7 +585,9 @@ async fn stop(
 }
 
 async fn remove(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesDelete>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -478,7 +598,9 @@ async fn remove(
         ));
     }
     match state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .remove_compose_project(ComposeProjectActionParams {
             project_slug: project.slug.clone(),
         })
@@ -492,7 +614,7 @@ async fn remove(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "remove_compose_project",
         Some(&project.slug),
         serde_json::json!({ "project_id": project.id }),
@@ -503,14 +625,16 @@ async fn remove(
 }
 
 async fn services(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<ComposeServiceInfo>>> {
     let project = find_project(&state, id).await?;
     Ok(Json(
         state
-            .agent
+            .agents
+            .for_server_id(&state.db, project.server_id)
+            .await?
             .list_compose_project_services(ComposeProjectActionParams {
                 project_slug: project.slug,
             })
@@ -525,14 +649,16 @@ struct LogQuery {
 
 /// Bounded tail of the running containers' logs.
 async fn logs(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let project = find_project(&state, id).await?;
     let logs = state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .compose_project_logs(ComposeProjectLogsParams {
             project_slug: project.slug,
             tail_lines: query.tail.unwrap_or(200),
@@ -556,7 +682,7 @@ struct LogStreamQuery {
 /// agent stops `docker compose logs --follow` when this response is
 /// dropped, i.e. when the browser disconnects.
 async fn logs_stream(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<LogStreamQuery>,
@@ -572,7 +698,9 @@ async fn logs_stream(
         return Err(ApiError::BadRequest("invalid service name".into()));
     }
     let rx = state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .follow_compose_logs(FollowComposeLogsParams {
             project_slug: project.slug,
             service,
@@ -607,7 +735,7 @@ async fn logs_stream(
 }
 
 async fn deployments(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<DeploymentInfo>>> {
@@ -618,7 +746,7 @@ async fn deployments(
 }
 
 async fn deployment(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<DeploymentInfo>> {
@@ -642,7 +770,7 @@ struct DeploymentLogResponse {
 /// Incremental deployment log: poll with the returned `next_offset` until
 /// `eof` is true and `status` is no longer `queued` or `running`.
 async fn deployment_log(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<DeploymentLogQuery>,
@@ -650,7 +778,9 @@ async fn deployment_log(
     let project = find_project(&state, id).await?;
     let deployment = find_deployment(&state, id, deployment_id).await?;
     let chunk = state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .read_deployment_log(DeploymentLogParams {
             project_slug: project.slug,
             deployment_id,
@@ -668,7 +798,11 @@ async fn deployment_log(
 /// running one. A running deployment answers `202`: the worker records the
 /// `cancelled` status once the agent has stopped its process group.
 async fn cancel_deployment(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user,
+        service,
+        ..
+    }: ServiceAccess<perm::ServicesDeploy>,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<(StatusCode, Json<DeploymentInfo>)> {
@@ -682,7 +816,9 @@ async fn cancel_deployment(
         }
         DeploymentStatus::Queued | DeploymentStatus::Running => {
             let signalled = state
-                .agent
+                .agents
+                .for_server_id(&state.db, service.server_id)
+                .await?
                 .cancel_deployment(CancelDeploymentParams { deployment_id })
                 .await?;
             if !signalled {
@@ -701,7 +837,7 @@ async fn cancel_deployment(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "cancel_compose_deployment",
         Some(&deployment_id.to_string()),
         serde_json::json!({ "project_id": id }),
@@ -715,7 +851,7 @@ async fn cancel_deployment(
 }
 
 async fn domains(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<ComposeDomain>>> {
@@ -745,11 +881,19 @@ struct DomainChange<T> {
 }
 
 async fn add_domain(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user,
+        service,
+        ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<AddDomainBody>,
 ) -> ApiResult<(StatusCode, Json<DomainChange<ComposeDomain>>)> {
+    // Applying the binding right away is a deployment.
+    if body.redeploy {
+        user.require(Permission::ServicesDeploy, service.target())?;
+    }
     let project = find_project(&state, id).await?;
     if matches!(project.source, ComposeSource::Database(_)) {
         return Err(ApiError::BadRequest(
@@ -785,7 +929,7 @@ async fn add_domain(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "add_compose_domain",
         Some(&domain),
         serde_json::json!({ "project_id": id, "service": body.service_name, "https": body.https }),
@@ -817,11 +961,19 @@ struct RemoveDomainQuery {
 }
 
 async fn remove_domain(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user,
+        service,
+        ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path((id, domain_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<RemoveDomainQuery>,
 ) -> ApiResult<Json<DomainChange<serde_json::Value>>> {
+    let redeploy = query.redeploy.unwrap_or(true);
+    if redeploy {
+        user.require(Permission::ServicesDeploy, service.target())?;
+    }
     let project = find_project(&state, id).await?;
     if !db::compose_projects::delete_domain(&state.db, id, domain_id).await? {
         return Err(ApiError::NotFound("domain binding not found".into()));
@@ -829,14 +981,14 @@ async fn remove_domain(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "remove_compose_domain",
         Some(&project.slug),
         serde_json::json!({ "project_id": id, "domain_id": domain_id }),
     )
     .await
     .ok();
-    let deployment = if query.redeploy.unwrap_or(true) {
+    let deployment = if redeploy {
         Some(
             state
                 .deploy_queue
@@ -874,19 +1026,22 @@ fn webhook_path(id: Uuid) -> String {
 }
 
 async fn webhook_status(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<WebhookStatus>> {
-    let _ = find_project(&state, id).await?;
+    Ok(Json(webhook_status_of(&state, id).await?))
+}
+
+async fn webhook_status_of(state: &AppState, id: Uuid) -> ApiResult<WebhookStatus> {
     let enabled = db::compose_projects::webhook_nonce(&state.db, id)
         .await?
         .is_some();
-    Ok(Json(WebhookStatus {
+    Ok(WebhookStatus {
         enabled,
         path: webhook_path(id),
         watch_paths: db::compose_projects::webhook_watch_paths(&state.db, id).await?,
-    }))
+    })
 }
 
 #[derive(Deserialize)]
@@ -897,7 +1052,9 @@ struct UpdateWebhookBody {
 /// Replaces the watch paths. Works whether or not the webhook is enabled,
 /// and never changes the secret.
 async fn update_webhook(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateWebhookBody>,
@@ -926,23 +1083,29 @@ async fn update_webhook(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "update_compose_webhook",
         Some(&project.slug),
         serde_json::json!({ "project_id": id, "watch_paths": watch_paths }),
     )
     .await
     .ok();
-    webhook_status(AdminUser(user), State(state), Path(id)).await
+    Ok(Json(webhook_status_of(&state, id).await?))
 }
 
 /// Enables the push webhook, or rotates its secret if already enabled. The
 /// previous secret stops working immediately.
 async fn rotate_webhook(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user,
+        service,
+        ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<WebhookCredentials>> {
+    // The secret lets its holder trigger deployments.
+    user.require(Permission::ServicesDeploy, service.target())?;
     let project = find_project(&state, id).await?;
     if project.source.git_checkout().is_none() {
         return Err(ApiError::BadRequest(
@@ -954,7 +1117,7 @@ async fn rotate_webhook(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "rotate_compose_webhook",
         Some(&project.slug),
         serde_json::json!({ "project_id": id }),
@@ -968,7 +1131,9 @@ async fn rotate_webhook(
 }
 
 async fn disable_webhook(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
@@ -977,7 +1142,7 @@ async fn disable_webhook(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "disable_compose_webhook",
         Some(&project.slug),
         serde_json::json!({ "project_id": id }),
@@ -1018,7 +1183,7 @@ struct GitHubAppLinkBody {
 }
 
 async fn git_access(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<GitAccess>> {
@@ -1085,7 +1250,9 @@ async fn check_github_app_link(
 /// Links a GitHub App installation. Deployments then mint a short-lived,
 /// repository-scoped token instead of using a stored one.
 async fn link_github_app(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(link): Json<GitHubAppLinkBody>,
@@ -1101,7 +1268,7 @@ async fn link_github_app(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "link_compose_github_app",
         Some(&project.slug),
         serde_json::json!({
@@ -1116,7 +1283,9 @@ async fn link_github_app(
 }
 
 async fn unlink_github_app(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
@@ -1125,7 +1294,7 @@ async fn unlink_github_app(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "unlink_compose_github_app",
         Some(&project.slug),
         serde_json::json!({ "project_id": id }),
@@ -1138,7 +1307,9 @@ async fn unlink_github_app(
 /// Creates the project's SSH deploy key, or replaces it: the old key stops
 /// working once it is removed from the Git host.
 async fn generate_deploy_key(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<GitAccess>> {
@@ -1158,7 +1329,9 @@ async fn generate_deploy_key(
         ));
     }
     let public_key = state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .generate_deploy_key(ComposeProjectActionParams {
             project_slug: project.slug.clone(),
         })
@@ -1167,7 +1340,7 @@ async fn generate_deploy_key(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "generate_compose_deploy_key",
         Some(&project.slug),
         serde_json::json!({ "project_id": id }),
@@ -1178,13 +1351,17 @@ async fn generate_deploy_key(
 }
 
 async fn remove_deploy_key(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     let project = find_project(&state, id).await?;
     state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .remove_deploy_key(ComposeProjectActionParams {
             project_slug: project.slug.clone(),
         })
@@ -1193,7 +1370,7 @@ async fn remove_deploy_key(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "remove_compose_deploy_key",
         Some(&project.slug),
         serde_json::json!({ "project_id": id }),
@@ -1206,7 +1383,9 @@ async fn remove_deploy_key(
 /// Replaces the write-only HTTPS token. It is bound to the host of the
 /// project's remote, taken from the project rather than the request.
 async fn set_git_token(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(credentials): Json<GitHttpCredentials>,
@@ -1218,7 +1397,7 @@ async fn set_git_token(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "set_compose_git_token",
         Some(&project.slug),
         serde_json::json!({ "project_id": id, "host": host }),
@@ -1229,7 +1408,9 @@ async fn set_git_token(
 }
 
 async fn remove_git_token(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
@@ -1242,7 +1423,7 @@ async fn remove_git_token(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "remove_compose_git_token",
         Some(&project.slug),
         serde_json::json!({ "project_id": id }),
@@ -1261,7 +1442,9 @@ async fn write_git_token(
 ) -> ApiResult<()> {
     let stored_host = credentials.as_ref().map(|_| host.to_string());
     state
-        .agent
+        .agents
+        .for_server_id(&state.db, project.server_id)
+        .await?
         .write_git_credentials(WriteGitCredentialsParams {
             project_slug: project.slug.clone(),
             host: host.to_string(),
@@ -1311,7 +1494,7 @@ struct ProjectRegistry {
 }
 
 async fn project_registry(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<ProjectRegistry>> {
@@ -1322,7 +1505,9 @@ async fn project_registry(
 }
 
 async fn set_project_registry(
-    AdminUser(user): AdminUser,
+    ServiceAccess {
+        principal: user, ..
+    }: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<ProjectRegistry>,
@@ -1340,7 +1525,7 @@ async fn set_project_registry(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "set_compose_registry",
         Some(&project.slug),
         serde_json::json!({ "project_id": id, "registry_id": body.registry_id }),

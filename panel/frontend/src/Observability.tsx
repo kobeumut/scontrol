@@ -12,7 +12,8 @@ type Point = {
 };
 type RequestStats = {
   hours: number; step_minutes: number; hosts: HostTotals[]; series: Point[];
-  source: { last_read_at: string | null; last_error: string | null };
+  /** How reading each server's access log went. */
+  sources: { server_id: string; server_name: string; last_read_at: string | null; last_error: string | null }[];
 };
 type CleanupSettings = { enabled: boolean; interval_hours: number; older_than_hours: number };
 type CleanupRun = {
@@ -61,8 +62,8 @@ function RequestStatsPanel() {
     </div>
     <p className="hint">Per-minute counts from the Nginx JSON access log: status classes, average latency and bandwidth by domain. Headers and query strings are never logged.</p>
     <StateView state={stats} />
-    {data?.source.last_error && <p className="state warn">Reading the access log failed: {data.source.last_error}</p>}
-    {data && !data.source.last_read_at && !data.source.last_error && <p className="state">The access log has not been read yet. Statistics appear once Nginx writes <span className="mono">scontrol-access.json.log</span>.</p>}
+    {data?.sources.filter((s) => s.last_error).map((s) => <p key={s.server_id} className="state warn">Reading the access log of {s.server_name} failed: {s.last_error}</p>)}
+    {data && !data.sources.some((s) => s.last_read_at) && !data.sources.some((s) => s.last_error) && <p className="state">The access log has not been read yet. Statistics appear once Nginx writes <span className="mono">scontrol-access.json.log</span>.</p>}
     {data && <>
       <div className="toolbar">
         <label>Domain
