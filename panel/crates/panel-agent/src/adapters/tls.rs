@@ -13,6 +13,7 @@ pub async fn issue_certificate(domain: &str, admin_email: &str) -> CoreResult<()
             "invalid email: {admin_email}"
         )));
     }
+    let _guard = super::nginx::CONFIG_LOCK.lock().await;
     run(
         "certbot",
         &[

@@ -33,11 +33,12 @@
 use crate::db;
 use crate::db::previews::{NewPreview, PreviewRow, SettingsRow};
 use crate::error::{ApiError, ApiResult};
+use crate::services::agent_pool::AgentPool;
 use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::{self, GitHubApps};
 use crate::services::secret_box::SecretBox;
 use chrono::{DateTime, Utc};
-use panel_core::adapters::{AdapterPort, CancelDeploymentParams, ComposeProjectActionParams};
+use panel_core::adapters::{CancelDeploymentParams, RemoveComposeProjectParams};
 use panel_core::error::CoreError;
 use panel_core::previews::{
     self, is_expired, PrProvider, PreviewPlan, PreviewStatus, PullRequestEvent, ResourceLimits,
@@ -48,7 +49,6 @@ use panel_core::types::{
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -101,13 +101,13 @@ impl Previews {
     }
 
     /// Spawns the TTL / teardown sweeper. Call once, from the HTTP process.
-    pub fn start_sweeper(&self, db: PgPool, agent: Arc<dyn AdapterPort>) {
+    pub fn start_sweeper(&self, db: PgPool, agents: AgentPool) {
         let previews = self.clone();
         tokio::spawn(async move {
             // Let the queue workers settle after a restart first.
             tokio::time::sleep(Duration::from_secs(60)).await;
             loop {
-                match sweep(&db, agent.as_ref(), &previews, Utc::now()).await {
+                match sweep(&db, &agents, &previews, Utc::now()).await {
                     Ok(report) if report.expired > 0 || report.removed > 0 => {
                         tracing::info!(
                             expired = report.expired,
@@ -558,7 +558,7 @@ pub fn limits_of(settings: &SettingsRow) -> ResourceLimits {
 /// the webhook answers with.
 pub async fn handle_event(
     db: &PgPool,
-    agent: Arc<dyn AdapterPort>,
+    agents: AgentPool,
     queue: &DeployQueue,
     previews: &Previews,
     parent: &ComposeProject,
@@ -570,7 +570,12 @@ pub async fn handle_event(
     {
         return Ok(json!({ "ignored": "previews do not have previews" }));
     }
-    let Some(settings) = db::previews::settings(db, parent.id)
+    let mut tx = db.begin().await?;
+    db::previews::lock_parent(&mut tx, parent.id).await?;
+    if db::previews::is_deleting(&mut tx, parent.id).await? {
+        return Ok(json!({"ignored": "project deletion is in progress"}));
+    }
+    let Some(settings) = db::previews::settings_in(&mut tx, parent.id)
         .await?
         .filter(|s| s.enabled)
     else {
@@ -587,8 +592,6 @@ pub async fn handle_event(
         .ok_or_else(|| ApiError::BadRequest("project does not deploy from Git".into()))?;
     let source_json = serde_json::to_value(&source).map_err(anyhow::Error::from)?;
 
-    let mut tx = db.begin().await?;
-    db::previews::lock_parent(&mut tx, parent.id).await?;
     let existing = db::previews::status_in(&mut tx, parent.id, number).await?;
     let active = db::previews::count_active(&mut tx, parent.id).await?;
     let status = existing
@@ -732,7 +735,7 @@ pub async fn handle_event(
         }
         PreviewPlan::Destroy => {
             audit("close_preview", json!({ "reason": "closed" })).await;
-            spawn_teardown(db.clone(), agent, previews.clone(), parent.id, number);
+            spawn_teardown(db.clone(), agents, previews.clone(), parent.id, number);
             Ok(json!({ "preview": slug, "closing": true }))
         }
         PreviewPlan::LimitReached { limit } => {
@@ -769,7 +772,7 @@ fn unique_conflict(error: sqlx::Error, slug: &str) -> ApiError {
 
 pub fn spawn_teardown(
     db: PgPool,
-    agent: Arc<dyn AdapterPort>,
+    agents: AgentPool,
     previews: Previews,
     parent: Uuid,
     number: i64,
@@ -783,7 +786,7 @@ pub fn spawn_teardown(
                 return;
             }
         };
-        if let Err(error) = teardown(&db, agent.as_ref(), &previews, &row).await {
+        if let Err(error) = teardown(&db, &agents, &previews, &row).await {
             // The sweeper retries.
             tracing::warn!(preview = %row.slug, %error, "preview teardown failed");
         }
@@ -797,10 +800,14 @@ pub fn spawn_teardown(
 /// sweeper comes back for it.
 pub async fn teardown(
     db: &PgPool,
-    agent: &dyn AdapterPort,
+    agents: &AgentPool,
     previews: &Previews,
     row: &PreviewRow,
 ) -> ApiResult<bool> {
+    // Hold only this parent's lock through removal: a duplicate teardown must
+    // not delete a newly recreated project with the same slug.
+    let mut lifecycle = db.begin().await?;
+    db::previews::lock_parent(&mut lifecycle, row.parent_project_id).await?;
     // Under the claim lock: a worker either claimed a job before this (it is
     // `running` here and gets cancelled) or can no longer claim one (queued
     // jobs are cancelled and the claim skips closing previews).
@@ -830,23 +837,31 @@ pub async fn teardown(
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
+    // Never fall back to the panel host if the owning server is unavailable.
+    let agent = agents.for_service(db, row.preview_project_id).await?;
     if let Some(deployment_id) = running {
-        agent
-            .cancel_deployment(CancelDeploymentParams { deployment_id })
-            .await
-            .ok();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.cancel_deployment(CancelDeploymentParams { deployment_id }),
+        )
+        .await;
         return Ok(false);
     }
-    match agent
-        .remove_compose_project(ComposeProjectActionParams {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        agent.remove_compose_project(RemoveComposeProjectParams {
             project_slug: row.slug.clone(),
-        })
-        .await
+            expected_project_id: Some(row.preview_project_id),
+        }),
+    )
+    .await
+    .map_err(|_| ApiError::Conflict("preview removal timed out; cleanup will retry".into()))?
     {
         Ok(()) | Err(CoreError::NotFound(_)) => {}
         Err(error) => return Err(error.into()),
     }
     db::compose_projects::delete(db, row.preview_project_id).await?;
+    lifecycle.commit().await?;
     db::audit::record(
         db,
         None,
@@ -872,15 +887,43 @@ pub async fn teardown(
 /// now. Used when previews are disabled and before the parent is removed.
 pub async fn close_all(
     db: &PgPool,
-    agent: &dyn AdapterPort,
+    agents: &AgentPool,
     previews: &Previews,
     parent: Uuid,
     reason: &str,
 ) -> ApiResult<usize> {
-    db::previews::mark_all_closing(db, parent, reason).await?;
+    let mut tx = db.begin().await?;
+    db::previews::lock_parent(&mut tx, parent).await?;
+    // Parent deletion is irreversible even if remote cleanup must be retried.
+    sqlx::query("UPDATE compose_projects SET deleting = TRUE WHERE id = $1")
+        .bind(parent)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE preview_settings SET enabled = FALSE WHERE project_id = $1")
+        .bind(parent)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE preview_deployments SET status = 'closing', close_reason = $2 WHERE parent_project_id = $1 AND status = 'active'")
+        .bind(parent).bind(reason).execute(&mut *tx).await?;
+    tx.commit().await?;
+    cleanup_closing(db, agents, previews, parent).await
+}
+
+/// Process only the rows already marked by the disable transaction. A stale
+/// task must not disable again or select previews created after re-enabling.
+pub async fn cleanup_closing(
+    db: &PgPool,
+    agents: &AgentPool,
+    previews: &Previews,
+    parent: Uuid,
+) -> ApiResult<usize> {
     let mut pending = 0;
-    for row in db::previews::list_for_parent(db, parent).await? {
-        if !teardown(db, agent, previews, &row).await? {
+    for row in db::previews::list_for_parent(db, parent)
+        .await?
+        .into_iter()
+        .filter(|r| r.status == "closing")
+    {
+        if !teardown(db, agents, previews, &row).await? {
             pending += 1;
         }
     }
@@ -896,7 +939,7 @@ pub struct SweepReport {
 /// Expires idle previews and tears down every closing one.
 pub async fn sweep(
     db: &PgPool,
-    agent: &dyn AdapterPort,
+    agents: &AgentPool,
     previews: &Previews,
     now: DateTime<Utc>,
 ) -> ApiResult<SweepReport> {
@@ -910,7 +953,7 @@ pub async fn sweep(
         }
     }
     for row in db::previews::list_closing(db).await? {
-        match teardown(db, agent, previews, &row).await {
+        match teardown(db, agents, previews, &row).await {
             Ok(true) => report.removed += 1,
             Ok(false) => {}
             Err(error) => tracing::warn!(preview = %row.slug, %error, "preview teardown failed"),

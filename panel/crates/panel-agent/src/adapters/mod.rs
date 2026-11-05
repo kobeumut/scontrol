@@ -382,7 +382,7 @@ impl AdapterPort for LocalAdapter {
         }
     }
 
-    async fn remove_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()> {
+    async fn remove_compose_project(&self, params: RemoveComposeProjectParams) -> CoreResult<()> {
         #[cfg(feature = "docker")]
         {
             if !self.config.docker_enabled() {

@@ -12,6 +12,9 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+#[path = "rbac_stage4_tests.rs"]
+mod stage4;
+
 enum Auth<'a> {
     Cookie(&'a str),
     Bearer(&'a str),
