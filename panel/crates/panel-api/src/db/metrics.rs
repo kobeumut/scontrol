@@ -77,15 +77,16 @@ pub struct ContainerPoint {
 /// replaces the first.
 pub async fn insert_server_sample(
     pool: &PgPool,
+    server: Uuid,
     bucket: DateTime<Utc>,
     s: &ServerSample,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO server_metrics (resolution_secs, bucket, cpu_pct, mem_used_bytes, \
              mem_total_bytes, load1, disk_used_bytes, disk_total_bytes, disk_read_bps, \
-             disk_write_bps, samples) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1) \
-         ON CONFLICT (resolution_secs, bucket) DO UPDATE SET \
+             disk_write_bps, samples, server_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, $11) \
+         ON CONFLICT (server_id, resolution_secs, bucket) DO UPDATE SET \
              cpu_pct = EXCLUDED.cpu_pct, mem_used_bytes = EXCLUDED.mem_used_bytes, \
              mem_total_bytes = EXCLUDED.mem_total_bytes, load1 = EXCLUDED.load1, \
              disk_used_bytes = EXCLUDED.disk_used_bytes, \
@@ -102,6 +103,7 @@ pub async fn insert_server_sample(
     .bind(s.disk_total_bytes)
     .bind(s.disk_read_bps)
     .bind(s.disk_write_bps)
+    .bind(server)
     .execute(pool)
     .await?;
     Ok(())
@@ -151,16 +153,16 @@ pub async fn insert_container_samples(
 pub async fn rollup(pool: &PgPool, from: i32, to: i32, since: DateTime<Utc>) -> sqlx::Result<()> {
     let since = bucket_start(since, to);
     sqlx::query(
-        "INSERT INTO server_metrics (resolution_secs, bucket, cpu_pct, mem_used_bytes, \
+        "INSERT INTO server_metrics (server_id, resolution_secs, bucket, cpu_pct, mem_used_bytes, \
              mem_total_bytes, load1, disk_used_bytes, disk_total_bytes, disk_read_bps, \
              disk_write_bps, samples) \
-         SELECT $2, to_timestamp((floor(extract(epoch FROM bucket) / $2) * $2)::double precision) AS b, \
+         SELECT server_id, $2, to_timestamp((floor(extract(epoch FROM bucket) / $2) * $2)::double precision) AS b, \
              avg(cpu_pct)::real, avg(mem_used_bytes)::bigint, max(mem_total_bytes), \
              avg(load1)::real, avg(disk_used_bytes)::bigint, max(disk_total_bytes), \
              avg(disk_read_bps), avg(disk_write_bps), sum(samples)::int \
          FROM server_metrics WHERE resolution_secs = $1 AND bucket >= $3 \
-         GROUP BY b \
-         ON CONFLICT (resolution_secs, bucket) DO UPDATE SET \
+         GROUP BY server_id, b \
+         ON CONFLICT (server_id, resolution_secs, bucket) DO UPDATE SET \
              cpu_pct = EXCLUDED.cpu_pct, mem_used_bytes = EXCLUDED.mem_used_bytes, \
              mem_total_bytes = EXCLUDED.mem_total_bytes, load1 = EXCLUDED.load1, \
              disk_used_bytes = EXCLUDED.disk_used_bytes, \
@@ -215,16 +217,19 @@ pub async fn prune(pool: &PgPool, now: DateTime<Utc>) -> sqlx::Result<u64> {
 
 pub async fn server_series(
     pool: &PgPool,
+    server: Uuid,
     resolution: i32,
     since: DateTime<Utc>,
 ) -> sqlx::Result<Vec<ServerPoint>> {
     sqlx::query_as(
         "SELECT bucket, cpu_pct, mem_used_bytes, mem_total_bytes, load1, disk_used_bytes, \
              disk_total_bytes, disk_read_bps, disk_write_bps \
-         FROM server_metrics WHERE resolution_secs = $1 AND bucket >= $2 ORDER BY bucket",
+         FROM server_metrics WHERE resolution_secs = $1 AND bucket >= $2 AND server_id = $3 \
+         ORDER BY bucket",
     )
     .bind(resolution)
     .bind(since)
+    .bind(server)
     .fetch_all(pool)
     .await
 }
@@ -249,8 +254,21 @@ pub async fn container_series(
 }
 
 /// `(id, slug, name)` of every Compose project, to map container labels.
+#[cfg(test)]
 pub async fn project_slugs(pool: &PgPool) -> sqlx::Result<Vec<(Uuid, String, String)>> {
     sqlx::query_as("SELECT id, slug, name FROM compose_projects")
+        .fetch_all(pool)
+        .await
+}
+
+/// `(id, slug, name)` of the Compose projects placed on `server`: only
+/// these are mapped from that server's container labels.
+pub async fn project_slugs_on(
+    pool: &PgPool,
+    server: Uuid,
+) -> sqlx::Result<Vec<(Uuid, String, String)>> {
+    sqlx::query_as("SELECT id, slug, name FROM compose_projects WHERE server_id = $1")
+        .bind(server)
         .fetch_all(pool)
         .await
 }
@@ -332,6 +350,8 @@ pub async fn update_alert_settings(
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct AlertStateRow {
+    pub server_id: Uuid,
+    pub server_name: String,
     pub key: String,
     pub firing: bool,
     pub streak: i32,
@@ -349,20 +369,28 @@ impl AlertStateRow {
     }
 }
 
-pub async fn alert_states(pool: &PgPool) -> sqlx::Result<HashMap<String, AlertStateRow>> {
-    let rows: Vec<AlertStateRow> = sqlx::query_as(
-        "SELECT key, firing, streak, last_value, changed_at, updated_at FROM metric_alert_state",
-    )
-    .fetch_all(pool)
-    .await?;
+const STATE_SELECT: &str = "SELECT a.server_id, s.name AS server_name, a.key, a.firing, \
+     a.streak, a.last_value, a.changed_at, a.updated_at \
+     FROM metric_alert_state a JOIN servers s ON s.id = a.server_id";
+
+/// The alert states of one server, by metric key.
+pub async fn alert_states(
+    pool: &PgPool,
+    server: Uuid,
+) -> sqlx::Result<HashMap<String, AlertStateRow>> {
+    let rows: Vec<AlertStateRow> =
+        sqlx::query_as(&format!("{STATE_SELECT} WHERE a.server_id = $1"))
+            .bind(server)
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().map(|row| (row.key.clone(), row)).collect())
 }
 
+/// Firing alerts of every server.
 pub async fn firing_alerts(pool: &PgPool) -> sqlx::Result<Vec<AlertStateRow>> {
-    sqlx::query_as(
-        "SELECT key, firing, streak, last_value, changed_at, updated_at \
-         FROM metric_alert_state WHERE firing ORDER BY changed_at",
-    )
+    sqlx::query_as(&format!(
+        "{STATE_SELECT} WHERE a.firing ORDER BY a.changed_at"
+    ))
     .fetch_all(pool)
     .await
 }
@@ -370,15 +398,16 @@ pub async fn firing_alerts(pool: &PgPool) -> sqlx::Result<Vec<AlertStateRow>> {
 /// Saves a metric's state. `changed` moves `changed_at` (an edge happened).
 pub async fn save_alert_state(
     pool: &PgPool,
+    server: Uuid,
     key: &str,
     tracker: AlertTracker,
     value: f64,
     changed: bool,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO metric_alert_state (key, firing, streak, last_value) \
-         VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (key) DO UPDATE SET firing = EXCLUDED.firing, streak = EXCLUDED.streak, \
+        "INSERT INTO metric_alert_state (key, firing, streak, last_value, server_id) \
+         VALUES ($1, $2, $3, $4, $6) \
+         ON CONFLICT (server_id, key) DO UPDATE SET firing = EXCLUDED.firing, streak = EXCLUDED.streak, \
              last_value = EXCLUDED.last_value, updated_at = now(), \
              changed_at = CASE WHEN $5 THEN now() ELSE metric_alert_state.changed_at END",
     )
@@ -387,6 +416,7 @@ pub async fn save_alert_state(
     .bind(tracker.streak.min(i32::MAX as u32) as i32)
     .bind(value as f32)
     .bind(changed)
+    .bind(server)
     .execute(pool)
     .await?;
     Ok(())
@@ -394,10 +424,15 @@ pub async fn save_alert_state(
 
 /// Forgets metrics that no longer exist (an unmounted disk, a removed
 /// service), so a later metric with the same key starts clean.
-pub async fn delete_alert_states_except(pool: &PgPool, keep: &[String]) -> sqlx::Result<u64> {
+pub async fn delete_alert_states_except(
+    pool: &PgPool,
+    server: Uuid,
+    keep: &[String],
+) -> sqlx::Result<u64> {
     Ok(
-        sqlx::query("DELETE FROM metric_alert_state WHERE NOT (key = ANY($1))")
+        sqlx::query("DELETE FROM metric_alert_state WHERE server_id = $2 AND NOT (key = ANY($1))")
             .bind(keep)
+            .bind(server)
             .execute(pool)
             .await?
             .rows_affected(),

@@ -10,12 +10,18 @@
 //! lives in `metric_alert_state`, so a restart neither repeats nor loses an
 //! alert.
 //!
+//! Every server is collected from its own agent, at once and each bounded
+//! by [`SERVER_TIMEOUT`]. Host metrics and alert state are kept per server;
+//! a remote server's alerts name it.
+//!
 //! Every [`MAINTENANCE_INTERVAL`] raw rows are averaged into 5 min buckets,
 //! those into 1 h buckets, and each resolution is pruned to its retention
 //! (24 h / 7 d / 30 d, `db::metrics::RETENTION`).
 
 use crate::db;
 use crate::db::metrics::{AlertSettings, ContainerSample, ServerSample};
+use crate::db::servers::Server;
+use crate::services::agent_pool::AgentPool;
 use crate::services::notifications::{Notification, Notifier};
 use chrono::{DateTime, Utc};
 use panel_core::adapters::AdapterPort;
@@ -25,17 +31,19 @@ use panel_core::metrics::{
 };
 use serde_json::json;
 use sqlx::PgPool;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
 pub const COLLECT_INTERVAL: Duration = Duration::from_secs(RAW_RESOLUTION_SECS as u64);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Longest one server's collection may take.
+const SERVER_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Default)]
 pub struct MetricsCollector {
-    latest: Arc<RwLock<Option<MetricsSnapshot>>>,
+    latest: Arc<RwLock<HashMap<Uuid, MetricsSnapshot>>>,
 }
 
 impl MetricsCollector {
@@ -43,39 +51,73 @@ impl MetricsCollector {
         Self::default()
     }
 
-    /// The most recent snapshot collected from the agent.
-    pub fn latest(&self) -> Option<MetricsSnapshot> {
-        self.latest.read().map(|g| g.clone()).unwrap_or(None)
+    /// The most recent snapshot collected from `server`'s agent.
+    pub fn latest_for(&self, server: Uuid) -> Option<MetricsSnapshot> {
+        self.latest
+            .read()
+            .ok()
+            .and_then(|latest| latest.get(&server).cloned())
     }
 
+    #[cfg(test)]
     pub fn set_latest(&self, snapshot: MetricsSnapshot) {
+        self.set_latest_for(db::servers::LOCAL_SERVER_ID, snapshot);
+    }
+
+    pub fn set_latest_for(&self, server: Uuid, snapshot: MetricsSnapshot) {
         if let Ok(mut latest) = self.latest.write() {
-            *latest = Some(snapshot);
+            latest.insert(server, snapshot);
         }
     }
 
     /// Spawns the collector loop. Call once, from the HTTP process.
-    pub fn start(&self, db: PgPool, agent: Arc<dyn AdapterPort>, notifier: Notifier) {
+    pub fn start(&self, db: PgPool, agents: AgentPool, notifier: Notifier) {
         let collector = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(COLLECT_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_maintenance: Option<tokio::time::Instant> = None;
-            let mut warned = false;
+            let mut warned: HashSet<Uuid> = HashSet::new();
             loop {
                 ticker.tick().await;
-                let previous = collector.latest().map(|s| s.sampled_at);
-                match collect_once(&db, agent.as_ref(), &notifier, previous).await {
-                    Ok(Some(snapshot)) => {
-                        warned = false;
-                        collector.set_latest(snapshot);
+                let servers = match db::servers::list(&db).await {
+                    Ok(servers) => servers,
+                    Err(error) => {
+                        tracing::warn!(%error, "listing servers for metrics failed");
+                        Vec::new()
                     }
-                    Ok(None) => {}
-                    Err(error) if !warned => {
-                        warned = true;
-                        tracing::warn!(%error, "collecting metrics failed");
+                };
+                let passes = servers.iter().map(|server| {
+                    let (db, agents, notifier, collector) = (&db, &agents, &notifier, &collector);
+                    async move {
+                        let previous = collector.latest_for(server.id).map(|s| s.sampled_at);
+                        let pass = async {
+                            let agent = agents
+                                .for_server_id(db, server.id)
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                            collect_server(db, agent.as_ref(), notifier, server, previous).await
+                        };
+                        let result = tokio::time::timeout(SERVER_TIMEOUT, pass)
+                            .await
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
+                        (server, result)
                     }
-                    Err(_) => {}
+                });
+                for (server, result) in futures::future::join_all(passes).await {
+                    match result {
+                        Ok(Some(snapshot)) => {
+                            warned.remove(&server.id);
+                            collector.set_latest_for(server.id, snapshot);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            // Once per outage, not every 30 s.
+                            if warned.insert(server.id) {
+                                tracing::warn!(server = %server.name, %error, "collecting metrics failed");
+                            }
+                        }
+                    }
                 }
                 if last_maintenance.is_none_or(|at| at.elapsed() >= MAINTENANCE_INTERVAL) {
                     last_maintenance = Some(tokio::time::Instant::now());
@@ -109,12 +151,28 @@ pub async fn maintain(db: &PgPool, now: DateTime<Utc>) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// One collection pass. Returns the snapshot when it was new (a snapshot
-/// already collected, same `sampled_at`, is not stored or evaluated again).
+/// One collection pass on this host.
+#[cfg(test)]
 pub async fn collect_once(
     db: &PgPool,
     agent: &dyn AdapterPort,
     notifier: &Notifier,
+    previous: Option<DateTime<Utc>>,
+) -> anyhow::Result<Option<MetricsSnapshot>> {
+    let local = db::servers::find(db, db::servers::LOCAL_SERVER_ID)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the local server row is missing"))?;
+    collect_server(db, agent, notifier, &local, previous).await
+}
+
+/// One collection pass on `server`, asking its `agent`. Returns the
+/// snapshot when it was new (a snapshot already collected, same
+/// `sampled_at`, is not stored or evaluated again).
+pub async fn collect_server(
+    db: &PgPool,
+    agent: &dyn AdapterPort,
+    notifier: &Notifier,
+    server: &Server,
     previous: Option<DateTime<Utc>>,
 ) -> anyhow::Result<Option<MetricsSnapshot>> {
     let Some(snapshot) = agent.metrics_snapshot().await? else {
@@ -123,13 +181,14 @@ pub async fn collect_once(
     if previous == Some(snapshot.sampled_at) {
         return Ok(None);
     }
-    let projects = db::metrics::project_slugs(db).await?;
+    let projects = db::metrics::project_slugs_on(db, server.id).await?;
     let bucket = db::metrics::bucket_start(snapshot.sampled_at, RAW_RESOLUTION_SECS);
-    db::metrics::insert_server_sample(db, bucket, &server_sample(&snapshot)).await?;
+    db::metrics::insert_server_sample(db, server.id, bucket, &server_sample(&snapshot)).await?;
     let services = service_samples(&snapshot, &projects);
     db::metrics::insert_container_samples(db, bucket, &services).await?;
 
-    for alert in evaluate_alerts(db, &snapshot, &services, &projects).await? {
+    let label = (server.id != db::servers::LOCAL_SERVER_ID).then_some(server.name.as_str());
+    for alert in evaluate_alerts(db, server.id, label, &snapshot, &services, &projects).await? {
         notifier.broadcast(db.clone(), alert.notification());
     }
     Ok(Some(snapshot))
@@ -320,6 +379,8 @@ impl AlertEvent {
 /// them back on starts clean.
 pub async fn evaluate_alerts(
     db: &PgPool,
+    server: Uuid,
+    server_name: Option<&str>,
     snapshot: &MetricsSnapshot,
     services: &[ContainerSample],
     projects: &[(Uuid, String, String)],
@@ -329,8 +390,14 @@ pub async fn evaluate_alerts(
         db::metrics::clear_alert_states(db).await?;
         return Ok(Vec::new());
     }
-    let states = db::metrics::alert_states(db).await?;
-    let watched = watched_metrics(snapshot, services, projects, &settings);
+    let states = db::metrics::alert_states(db, server).await?;
+    let mut watched = watched_metrics(snapshot, services, projects, &settings);
+    // A remote server's alerts say which server they are about.
+    if let Some(name) = server_name {
+        for metric in &mut watched {
+            metric.label = format!("{} on {name}", metric.label);
+        }
+    }
     let mut events = Vec::new();
     for metric in &watched {
         let rule = settings.rule(metric.threshold);
@@ -340,7 +407,8 @@ pub async fn evaluate_alerts(
             .unwrap_or_default();
         let transition = tracker.observe(metric.value, &rule);
         let changed = transition != AlertTransition::None;
-        db::metrics::save_alert_state(db, &metric.key, tracker, metric.value, changed).await?;
+        db::metrics::save_alert_state(db, server, &metric.key, tracker, metric.value, changed)
+            .await?;
         if changed {
             events.push(AlertEvent {
                 metric: metric.clone(),
@@ -350,13 +418,15 @@ pub async fn evaluate_alerts(
         }
     }
     let keep: Vec<String> = watched.into_iter().map(|m| m.key).collect();
-    db::metrics::delete_alert_states_except(db, &keep).await?;
+    db::metrics::delete_alert_states_except(db, server, &keep).await?;
     Ok(events)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    const LOCAL: Uuid = db::servers::LOCAL_SERVER_ID;
     use crate::test_support;
     use panel_core::adapters::mock::MockAdapter;
     use panel_core::metrics::{ContainerMetrics, DiskUsage, HostMetrics, LoadAvg};
@@ -533,7 +603,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none());
             previous = Some(collected.sampled_at);
-            let state = db::metrics::alert_states(&pool).await.unwrap();
+            let state = db::metrics::alert_states(&pool, LOCAL).await.unwrap();
             edges.push(state["host:cpu"].firing);
         }
         assert_eq!(
@@ -541,7 +611,9 @@ pub(crate) mod tests {
             vec![false, true, true, true, true, true, false, false]
         );
 
-        let raw = db::metrics::server_series(&pool, 30, start).await.unwrap();
+        let raw = db::metrics::server_series(&pool, LOCAL, 30, start)
+            .await
+            .unwrap();
         assert_eq!(raw.len(), cpu.len());
         assert_eq!(raw[1].cpu_pct, 95.0);
         assert_eq!(raw[0].disk_total_bytes, 100 << 30);
@@ -553,7 +625,9 @@ pub(crate) mod tests {
         maintain(&pool, start + chrono::Duration::minutes(10))
             .await
             .unwrap();
-        let medium = db::metrics::server_series(&pool, 300, start).await.unwrap();
+        let medium = db::metrics::server_series(&pool, LOCAL, 300, start)
+            .await
+            .unwrap();
         assert_eq!(medium.len(), 1);
         let mean = cpu.iter().sum::<f64>() / cpu.len() as f64;
         assert!((f64::from(medium[0].cpu_pct) - mean).abs() < 0.01);
@@ -562,12 +636,12 @@ pub(crate) mod tests {
         maintain(&pool, start + chrono::Duration::hours(25))
             .await
             .unwrap();
-        assert!(db::metrics::server_series(&pool, 30, start)
+        assert!(db::metrics::server_series(&pool, LOCAL, 30, start)
             .await
             .unwrap()
             .is_empty());
         assert_eq!(
-            db::metrics::server_series(&pool, 300, start)
+            db::metrics::server_series(&pool, LOCAL, 300, start)
                 .await
                 .unwrap()
                 .len(),
@@ -601,7 +675,7 @@ pub(crate) mod tests {
         snap.host.disks[0].used_bytes = 95 << 30;
         snap.containers = vec![container(&project.1, "web", 950, Some(1000))];
         let services = service_samples(&snap, &projects);
-        let events = evaluate_alerts(&pool, &snap, &services, &projects)
+        let events = evaluate_alerts(&pool, LOCAL, None, &snap, &services, &projects)
             .await
             .unwrap();
         let fired: Vec<&str> = events.iter().map(|e| e.metric.key.as_str()).collect();
@@ -626,9 +700,11 @@ pub(crate) mod tests {
 
         // The service went away: its state is dropped without a "resolved".
         snap.containers.clear();
-        let events = evaluate_alerts(&pool, &snap, &[], &projects).await.unwrap();
+        let events = evaluate_alerts(&pool, LOCAL, None, &snap, &[], &projects)
+            .await
+            .unwrap();
         assert!(events.is_empty());
-        let states = db::metrics::alert_states(&pool).await.unwrap();
+        let states = db::metrics::alert_states(&pool, LOCAL).await.unwrap();
         assert!(states.keys().all(|k| !k.starts_with("container:")));
         assert!(states["disk:/"].firing);
 
@@ -638,11 +714,95 @@ pub(crate) mod tests {
         db::metrics::update_alert_settings(&pool, &settings)
             .await
             .unwrap();
-        evaluate_alerts(&pool, &snap, &[], &projects).await.unwrap();
-        assert!(db::metrics::alert_states(&pool).await.unwrap().is_empty());
+        evaluate_alerts(&pool, LOCAL, None, &snap, &[], &projects)
+            .await
+            .unwrap();
+        assert!(db::metrics::alert_states(&pool, LOCAL)
+            .await
+            .unwrap()
+            .is_empty());
         settings.enabled = true;
         db::metrics::update_alert_settings(&pool, &settings)
             .await
             .unwrap();
+    }
+
+    /// A remote server's host metrics and alerts are its own: they neither
+    /// mix with this host's series nor share its alert state, and its alerts
+    /// name it.
+    #[tokio::test]
+    async fn servers_keep_separate_metrics_and_alerts() {
+        let _serial = test_support::METRICS_TESTS.lock().await;
+        let pool = test_support::test_pool().await;
+        test_support::reset_metrics(&pool).await;
+        let adapter = Arc::new(MockAdapter::new());
+        let notifier = test_support::app_state(pool.clone(), adapter.clone()).notifier;
+        let mut settings = db::metrics::alert_settings(&pool).await.unwrap();
+        settings.trigger_samples = 1;
+        settings.clear_samples = 1;
+        db::metrics::update_alert_settings(&pool, &settings)
+            .await
+            .unwrap();
+        let id = Uuid::new_v4();
+        let name = format!("m-{}", &id.simple().to_string()[..8]);
+        db::servers::insert(
+            &pool,
+            db::servers::NewServer {
+                id,
+                name: &name,
+                transport: db::servers::Transport::SshSocket,
+                address: "/run/scontrol/remote/m.sock",
+                max_services: None,
+            },
+        )
+        .await
+        .unwrap();
+        let remote = db::servers::find(&pool, id).await.unwrap().unwrap();
+
+        let at = Utc::now();
+        *adapter.metrics.lock().unwrap() = Some(snapshot(at, 97.0));
+        collect_server(&pool, adapter.as_ref(), &notifier, &remote, None)
+            .await
+            .unwrap()
+            .expect("a new snapshot");
+        *adapter.metrics.lock().unwrap() = Some(snapshot(at, 10.0));
+        collect_once(&pool, adapter.as_ref(), &notifier, None)
+            .await
+            .unwrap()
+            .expect("a new snapshot");
+
+        let since = at - chrono::Duration::minutes(5);
+        let remote_points = db::metrics::server_series(&pool, id, 30, since)
+            .await
+            .unwrap();
+        let local_points = db::metrics::server_series(&pool, LOCAL, 30, since)
+            .await
+            .unwrap();
+        assert_eq!(remote_points.len(), 1);
+        assert_eq!(local_points.len(), 1);
+        assert_eq!(remote_points[0].cpu_pct, 97.0);
+        assert_eq!(local_points[0].cpu_pct, 10.0);
+
+        let remote_state = db::metrics::alert_states(&pool, id).await.unwrap();
+        assert!(remote_state["host:cpu"].firing);
+        assert!(!db::metrics::alert_states(&pool, LOCAL).await.unwrap()["host:cpu"].firing);
+        let firing = db::metrics::firing_alerts(&pool).await.unwrap();
+        assert!(firing
+            .iter()
+            .any(|a| a.server_id == id && a.server_name == name));
+
+        // The remote label names the server.
+        let events = evaluate_alerts(&pool, id, Some(&name), &snapshot(at, 10.0), &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].metric.label.ends_with(&format!("on {name}")),
+            "{}",
+            events[0].metric.label
+        );
+
+        db::servers::delete(&pool, id).await.unwrap();
+        test_support::reset_metrics(&pool).await;
     }
 }

@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { RegistrySelect } from './Registries';
+import { placement, ServerSelect } from './Servers';
 import {
   api, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
   DATABASE_ENGINE_LABELS,
@@ -9,6 +10,7 @@ import {
 import { ScheduledJobs } from './ScheduledJobs';
 import { DomainOptions } from './DomainOptions';
 import { Terminal } from './Terminal';
+import { Previews } from './Previews';
 import { ErrorLine, StateView, useAction } from './ui';
 import { LayeredVariables } from './Variables';
 
@@ -101,6 +103,7 @@ function CreateProjectForm({ projects, buildTools, onCreated }: { projects?: Pro
   const [tokenUser, setTokenUser] = useState('x-access-token');
   const [token, setToken] = useState('');
   const [registryId, setRegistryId] = useState('');
+  const [serverId, setServerId] = useState('');
   const [deployNow, setDeployNow] = useState<boolean>();
   const action = useAction();
   const fromGit = kind !== 'raw' && kind !== 'image';
@@ -144,6 +147,7 @@ function CreateProjectForm({ projects, buildTools, onCreated }: { projects?: Pro
         body: {
           name: name.trim(), slug: slug.trim(), environment_id: environmentId || undefined, source,
           environment: toPairs(env), git_credentials, github_app, deploy, registry_id: registryId || undefined,
+          ...placement(serverId),
         },
       });
       setToken('');
@@ -205,6 +209,7 @@ function CreateProjectForm({ projects, buildTools, onCreated }: { projects?: Pro
     </fieldset>}
     {transport === 'ssh' && <p className="hint">SSH remote: after creating, generate the project deploy key under Git access, add it to the repository as a read-only deploy key, then deploy.</p>}
     <RegistrySelect value={registryId} onChange={setRegistryId} />
+    <ServerSelect value={serverId} onChange={setServerId} />
     <fieldset><legend>Service variables (write-only)</legend>
       <p className="hint">Inherited from the project and environment; set here to override them for this service only.</p>
       <EnvEditor rows={env} onChange={setEnv} /></fieldset>
@@ -422,6 +427,7 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <RegistryPanel projectId={id} />
       {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
       {gitCheckout(project.data.source) && <Webhook projectId={id} />}
+      {gitCheckout(project.data.source) && <Previews projectId={id} />}
     </>}
   </section>;
 }

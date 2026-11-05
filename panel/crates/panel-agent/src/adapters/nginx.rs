@@ -264,20 +264,21 @@ fn render_static_location(
 }
 
 /// Renders the vhost for one project domain binding. Port 80 always serves
-/// the ACME HTTP-01 webroot; with `tls` it redirects everything else to a
-/// 443 server using the certbot-managed certificate.
+/// the ACME HTTP-01 webroot; with `tls` (the certbot lineage to use: the
+/// domain itself, or a wildcard certificate covering it) it redirects
+/// everything else to a 443 server using that certificate.
 #[cfg(feature = "docker")]
 pub fn render_compose_vhost(
     cfg: &AgentConfig,
     project_slug: &str,
     domain: &str,
     target: &VhostTarget<'_>,
-    tls: bool,
+    tls: Option<&str>,
     options: &VhostOptions,
     secrets_dir: &std::path::Path,
 ) -> String {
     let acme_root = cfg.acme_webroot.to_string_lossy();
-    let http_body = if tls {
+    let http_body = if tls.is_some() {
         "    location / {\n        return 301 https://$host$request_uri;\n    }\n".to_string()
     } else {
         target.render(options, secrets_dir)
@@ -296,11 +297,11 @@ server {{\n\
 \n\
 {http_body}}}\n"
     );
-    if tls {
+    if let Some(certificate) = tls {
         let (cert, key) = if options.custom_cert {
             (secrets_dir.join("cert.pem"), secrets_dir.join("key.pem"))
         } else {
-            let live = cfg.letsencrypt_live_dir.join(domain);
+            let live = cfg.letsencrypt_live_dir.join(certificate);
             (live.join("fullchain.pem"), live.join("privkey.pem"))
         };
         let body = target.render(options, secrets_dir);
@@ -436,7 +437,7 @@ mod tests {
             "shop",
             "shop.example.com",
             &target,
-            false,
+            None,
             &VhostOptions::default(),
             dir,
         );
@@ -450,7 +451,7 @@ mod tests {
             "shop",
             "shop.example.com",
             &target,
-            true,
+            Some("shop.example.com"),
             &VhostOptions::default(),
             dir,
         );
@@ -471,7 +472,7 @@ mod tests {
             "site",
             "site.example.com",
             &spa,
-            false,
+            None,
             &VhostOptions::default(),
             dir,
         );
@@ -487,7 +488,7 @@ mod tests {
             "site",
             "site.example.com",
             &files,
-            true,
+            Some("site.example.com"),
             &VhostOptions::default(),
             dir,
         );
@@ -516,7 +517,7 @@ mod tests {
             "shop",
             "shop.example.com",
             &target,
-            false,
+            None,
             &redirect,
             dir,
         );
@@ -530,15 +531,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let out = render_compose_vhost(
-            &cfg,
-            "shop",
-            "shop.example.com",
-            &target,
-            false,
-            &plain,
-            dir,
-        );
+        let out =
+            render_compose_vhost(&cfg, "shop", "shop.example.com", &target, None, &plain, dir);
         assert!(out.contains("return 301 https://x.example.com/a;"));
 
         // A target that bypassed validation never reaches the file.
@@ -550,8 +544,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let out =
-            render_compose_vhost(&cfg, "shop", "shop.example.com", &target, false, &evil, dir);
+        let out = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, None, &evil, dir);
         assert!(out.contains("return 500;") && !out.contains("a.com"));
 
         let auth = VhostOptions {
@@ -559,8 +552,7 @@ mod tests {
             path_prefix: Some("/admin/".into()),
             ..Default::default()
         };
-        let out =
-            render_compose_vhost(&cfg, "shop", "shop.example.com", &target, false, &auth, dir);
+        let out = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, None, &auth, dir);
         assert!(out.contains("location /admin/ {"));
         assert!(out.contains("proxy_pass http://127.0.0.1:40001/;"));
         assert!(out.contains("location = /admin {"));
@@ -569,11 +561,32 @@ mod tests {
         let acme = out.find("acme-challenge").unwrap();
         assert!(out.find("auth_basic ").unwrap() > acme);
 
+        let wildcard = render_compose_vhost(
+            &cfg,
+            "shop",
+            "shop.example.com",
+            &target,
+            Some("preview.example.com"),
+            &auth,
+            dir,
+        );
+        assert!(wildcard.contains("/etc/letsencrypt/live/preview.example.com/fullchain.pem"));
+        assert!(wildcard.contains("server_name shop.example.com;"));
+        assert!(wildcard.contains(&format!("auth_basic_user_file {}/htpasswd;", dir.display())));
+
         let cert = VhostOptions {
             custom_cert: true,
             ..Default::default()
         };
-        let out = render_compose_vhost(&cfg, "shop", "shop.example.com", &target, true, &cert, dir);
+        let out = render_compose_vhost(
+            &cfg,
+            "shop",
+            "shop.example.com",
+            &target,
+            Some("shop.example.com"),
+            &cert,
+            dir,
+        );
         assert!(out.contains(&format!("ssl_certificate {}/cert.pem;", dir.display())));
         assert!(out.contains(&format!("ssl_certificate_key {}/key.pem;", dir.display())));
         assert!(!out.contains("letsencrypt"));

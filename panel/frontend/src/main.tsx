@@ -1,6 +1,8 @@
 import { FormEvent, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { api, ApiError, Capability, Site, useApi, User } from './api';
+import { Access } from './Access';
+import { AccessMe, api, ApiError, Capability, holdsGlobally, Site, useApi, User } from './api';
+import { ApiKeys } from './ApiKeys';
 import { ComposeProjects } from './ComposeProjects';
 import { Databases } from './Databases';
 import { GitHubApps } from './GitHubApps';
@@ -11,6 +13,7 @@ import { Backups } from './Backups';
 import { Observability } from './Observability';
 import { Registries } from './Registries';
 import { Templates } from './Templates';
+import { Servers } from './Servers';
 import './styles.css';
 
 function Login({ onSignedIn }: { onSignedIn: () => void }) {
@@ -58,7 +61,10 @@ function Sites() {
 function App() {
   const health = useApi<{ status: string; capabilities?: Capability }>('/health/agent', 30000);
   const me = useApi<User>('/auth/me');
-  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'templates' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications' | 'observability' | 'monitoring'>('projects');
+  const access = useApi<AccessMe>(me.data ? '/access/me' : null);
+  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'templates' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications' | 'observability' | 'monitoring' | 'servers' | 'access' | 'keys'>('projects');
+  const canSeeServers = holdsGlobally(access.data, 'servers:read');
+  const canManageAccess = holdsGlobally(access.data, 'access:manage');
   const docker = health.data?.capabilities?.docker;
 
   const signOut = async () => {
@@ -97,8 +103,14 @@ function App() {
           <button className={active === 'sites' ? 'selected' : ''} onClick={() => setActive('sites')}>Hosted sites</button>
           <button className={active === 'github' ? 'selected' : ''} onClick={() => setActive('github')}>GitHub Apps</button>
           <button className={active === 'notifications' ? 'selected' : ''} onClick={() => setActive('notifications')}>Notifications</button>
+          {canSeeServers && <button className={active === 'servers' ? 'selected' : ''} onClick={() => setActive('servers')}>Servers</button>}
+          {canManageAccess && <button className={active === 'access' ? 'selected' : ''} onClick={() => setActive('access')}>Access</button>}
+          <button className={active === 'keys' ? 'selected' : ''} onClick={() => setActive('keys')}>API keys</button>
         </nav>
         {active === 'sites' ? <Sites />
+          : active === 'servers' ? <Servers canManage={holdsGlobally(access.data, 'servers:manage')} />
+          : active === 'access' ? <Access />
+          : active === 'keys' ? <ApiKeys me={access.data} />
           : active === 'observability' ? <Observability isAdmin={me.data.is_admin} docker={docker !== false} />
           : active === 'monitoring' ? <Monitoring docker={docker !== false} />
           : active === 'notifications' ? <Notifications />

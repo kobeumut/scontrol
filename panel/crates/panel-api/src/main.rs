@@ -67,19 +67,23 @@ async fn main() -> anyhow::Result<()> {
     }
     state.deploy_queue.start_workers(
         state.db.clone(),
-        state.agent.clone(),
+        state.agents.clone(),
         state.notifier.clone(),
         state.secret_box.clone(),
         state.github_apps.clone(),
+        state.previews.clone(),
         config.deploy_workers,
     );
+    state
+        .previews
+        .start_sweeper(state.db.clone(), state.agent.clone());
     tracing::info!(
         workers = config.deploy_workers,
         "deployment workers started"
     );
     state.job_runs.start(
         state.db.clone(),
-        state.agent.clone(),
+        state.agents.clone(),
         state.notifier.clone(),
     );
 
@@ -87,13 +91,15 @@ async fn main() -> anyhow::Result<()> {
     if interrupted > 0 {
         tracing::warn!(interrupted, "marked interrupted docker cleanups as failed");
     }
-    services::observability::start(state.db.clone(), state.agent.clone());
+    services::observability::start(state.db.clone(), state.agents.clone());
 
     state.metrics.start(
         state.db.clone(),
-        state.agent.clone(),
+        state.agents.clone(),
         state.notifier.clone(),
     );
+
+    state.agents.start_health_checks(state.db.clone());
 
     let router = routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

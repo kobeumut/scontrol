@@ -7,6 +7,7 @@ use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
 use crate::services::metrics::MetricsCollector;
 use crate::services::notifications::Notifier;
+use crate::services::previews::Previews;
 use crate::services::scheduled_jobs::JobRunCollector;
 use crate::services::secret_box::SecretBox;
 use crate::services::webhook::WebhookKey;
@@ -50,7 +51,12 @@ pub fn app_state(pool: PgPool, adapter: Arc<MockAdapter>) -> AppState {
     let key = [42u8; 32];
     AppState {
         db: pool,
+        agents: crate::services::agent_pool::AgentPool::new(
+            adapter.clone(),
+            SecretBox::derive(&key),
+        ),
         agent: adapter,
+        api_keys: Default::default(),
         cookie_cipher: CookieCipher::new(&key),
         session_ttl_hours: 1,
         deploy_queue: DeployQueue::new(),
@@ -60,6 +66,11 @@ pub fn app_state(pool: PgPool, adapter: Arc<MockAdapter>) -> AppState {
         github_apps: github_apps(),
         job_runs: JobRunCollector::new(),
         metrics: MetricsCollector::new(),
+        previews: Previews::with_api_base(
+            SecretBox::derive(&key),
+            github_apps(),
+            "http://127.0.0.1:9",
+        ),
     }
 }
 
@@ -120,6 +131,10 @@ pub async fn http_receiver() -> (String, tokio::sync::mpsc::Receiver<(String, St
     });
     (url, rx)
 }
+
+/// Tests that replace the shared panel PKI rows run one at a time.
+pub static PKI_TESTS: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
 
 /// Metrics tests share the global metric tables, so they run one at a time.
 pub static METRICS_TESTS: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =

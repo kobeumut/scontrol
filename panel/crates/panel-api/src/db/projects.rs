@@ -153,18 +153,6 @@ pub async fn list_all(pool: &PgPool) -> sqlx::Result<Vec<Project>> {
     Ok(records.into_iter().map(Into::into).collect())
 }
 
-pub async fn list_for_owner(pool: &PgPool, owner_user_id: Uuid) -> sqlx::Result<Vec<Project>> {
-    let records = sqlx::query_as!(
-        ProjectRecord,
-        r#"SELECT id, name, slug, owner_user_id, created_at, updated_at FROM projects
-           WHERE owner_user_id = $1 ORDER BY name, created_at"#,
-        owner_user_id
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(records.into_iter().map(Into::into).collect())
-}
-
 pub async fn rename(pool: &PgPool, id: Uuid, name: &str) -> sqlx::Result<bool> {
     let updated = sqlx::query!(
         "UPDATE projects SET name = $1, updated_at = now() WHERE id = $2",

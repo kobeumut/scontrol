@@ -1,7 +1,20 @@
-//! Shared Unix-socket RPC client implementing [`AdapterPort`] by talking to
+//! Shared agent RPC client implementing [`AdapterPort`] by talking to
 //! `panel-agent`. Used by both `panel-api` (per-request, unprivileged) and
 //! `panel-cli` (direct host administration). Never builds or runs shell
 //! commands itself — see `panel-agent` for the privileged side.
+//!
+//! Two transports carry the same line protocol: the local Unix socket (also
+//! used for an SSH-forwarded socket of a remote host) and mutual TLS to a
+//! remote agent (see [`crate::pki`]). Over TLS the agent's certificate must
+//! chain to the panel CA, name the configured host, and match one of the
+//! fingerprints the panel recorded for that server.
+//!
+//! Over TLS a connection is kept open after a call and reused by the next
+//! one ([`MAX_IDLE`] per client, idle at most [`IDLE_FOR`]), so a remote
+//! call usually costs no handshake. Only a request that changes nothing is
+//! retried when a reused connection turns out to be closed; anything else
+//! reports the failure rather than risk running twice. Streamed requests
+//! always use their own connection.
 
 use crate::adapters::*;
 use crate::agent_protocol::{AgentRequest, AgentResponse, StreamFrame};
@@ -14,58 +27,189 @@ use crate::types::{
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
+
+type BoxReader = BufReader<Box<dyn AsyncRead + Send + Unpin>>;
+type BoxWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// How long connecting (TCP plus TLS handshake) to a remote agent may take.
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle remote connections kept per client.
+pub const MAX_IDLE: usize = 4;
+/// Idle remote connections older than this are closed instead of reused
+/// (the agent closes them after five minutes).
+pub const IDLE_FOR: Duration = Duration::from_secs(60);
+
+type Connection = (BoxReader, BoxWriter);
+
+#[derive(Clone)]
+enum Transport {
+    Unix(PathBuf),
+    Tls(Arc<TlsTarget>),
+}
+
+/// A remote agent reached over mutual TLS.
+pub struct TlsTarget {
+    /// `host:port` to connect to.
+    pub address: String,
+    /// The host the agent certificate must name.
+    pub server_name: String,
+    pub config: Arc<rustls::ClientConfig>,
+    /// SHA-256 fingerprints (hex) the agent's leaf certificate may have:
+    /// the current one and, during a rotation, the previous one.
+    pub pinned_fingerprints: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct AgentClient {
-    socket_path: PathBuf,
+    transport: Transport,
+    /// Open connections ready for the next call (TLS only).
+    idle: Arc<std::sync::Mutex<Vec<(Connection, std::time::Instant)>>>,
 }
 
 impl AgentClient {
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
         Self {
-            socket_path: socket_path.as_ref().to_path_buf(),
+            transport: Transport::Unix(socket_path.as_ref().to_path_buf()),
+            idle: Default::default(),
         }
     }
 
-    /// Sends `request` and reads the first response line. Returns the
-    /// reader too, for streamed responses that continue on the connection.
-    async fn send(
-        &self,
-        request: AgentRequest,
-    ) -> CoreResult<(serde_json::Value, BufReader<OwnedReadHalf>, OwnedWriteHalf)> {
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            CoreError::External(format!(
-                "connecting to agent at {}: {e}",
-                self.socket_path.display()
-            ))
-        })?;
-        let (read_half, mut write_half) = stream.into_split();
+    pub fn tls(target: TlsTarget) -> Self {
+        Self {
+            transport: Transport::Tls(Arc::new(target)),
+            idle: Default::default(),
+        }
+    }
 
-        let mut payload = serde_json::to_string(&request)
+    /// A pooled connection that has not been idle too long.
+    fn take_idle(&self) -> Option<Connection> {
+        if !matches!(self.transport, Transport::Tls(_)) {
+            return None;
+        }
+        let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some((connection, since)) = idle.pop() {
+            if since.elapsed() < IDLE_FOR {
+                return Some(connection);
+            }
+        }
+        None
+    }
+
+    fn put_idle(&self, connection: Connection) {
+        if !matches!(self.transport, Transport::Tls(_)) {
+            return;
+        }
+        let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        idle.retain(|(_, since)| since.elapsed() < IDLE_FOR);
+        if idle.len() < MAX_IDLE {
+            idle.push((connection, std::time::Instant::now()));
+        }
+    }
+
+    async fn connect(&self) -> CoreResult<(BoxReader, BoxWriter)> {
+        match &self.transport {
+            Transport::Unix(path) => {
+                let stream = UnixStream::connect(path).await.map_err(|e| {
+                    CoreError::External(format!("connecting to agent at {}: {e}", path.display()))
+                })?;
+                let (read_half, write_half) = stream.into_split();
+                Ok((BufReader::new(Box::new(read_half)), Box::new(write_half)))
+            }
+            Transport::Tls(target) => {
+                let stream = tokio::time::timeout(REMOTE_CONNECT_TIMEOUT, connect_tls(target))
+                    .await
+                    .map_err(|_| {
+                        CoreError::External(format!(
+                            "connecting to agent at {}: timed out",
+                            target.address
+                        ))
+                    })??;
+                let (read_half, write_half) = tokio::io::split(stream);
+                Ok((BufReader::new(Box::new(read_half)), Box::new(write_half)))
+            }
+        }
+    }
+
+    /// Writes `request` on `connection` and reads the response line. Errors
+    /// are transport failures only (the agent's own error answers are in
+    /// the response); `Ok(None)` when the agent had closed the connection.
+    async fn exchange(
+        connection: &mut Connection,
+        request: &AgentRequest,
+    ) -> CoreResult<Option<AgentResponse>> {
+        let (reader, write_half) = connection;
+        let mut payload = serde_json::to_string(request)
             .map_err(|e| CoreError::External(format!("encoding agent request: {e}")))?;
         payload.push('\n');
         write_half
             .write_all(payload.as_bytes())
             .await
             .map_err(|e| CoreError::External(format!("writing to agent: {e}")))?;
+        write_half
+            .flush()
+            .await
+            .map_err(|e| CoreError::External(format!("writing to agent: {e}")))?;
 
-        let mut reader = BufReader::new(read_half);
         let mut line = String::new();
-        reader
+        let read = reader
             .read_line(&mut line)
             .await
             .map_err(|e| CoreError::External(format!("reading from agent: {e}")))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        serde_json::from_str(line.trim())
+            .map(Some)
+            .map_err(|e| CoreError::External(format!("decoding agent response: {e}")))
+    }
 
-        let response: AgentResponse = serde_json::from_str(line.trim())
-            .map_err(|e| CoreError::External(format!("decoding agent response: {e}")))?;
-        Ok((response.into_core_result()?, reader, write_half))
+    fn closed() -> CoreError {
+        CoreError::External("the agent closed the connection".into())
+    }
+
+    /// One request on a new connection, which is kept for reuse after a
+    /// complete answer.
+    async fn fresh_exchange(&self, request: &AgentRequest) -> CoreResult<AgentResponse> {
+        let mut connection = self.connect().await?;
+        let response = Self::exchange(&mut connection, request)
+            .await?
+            .ok_or_else(Self::closed)?;
+        self.put_idle(connection);
+        Ok(response)
+    }
+
+    /// Sends `request` on a new connection and reads the first response
+    /// line. Returns the connection too, for streamed responses that
+    /// continue on it (it is never pooled).
+    async fn send(&self, request: AgentRequest) -> CoreResult<(serde_json::Value, Connection)> {
+        let mut connection = self.connect().await?;
+        let response = Self::exchange(&mut connection, &request)
+            .await?
+            .ok_or_else(Self::closed)?;
+        Ok((response.into_core_result()?, connection))
     }
 
     async fn call<T: DeserializeOwned>(&self, request: AgentRequest) -> CoreResult<T> {
-        let (data, _, _) = self.send(request).await?;
+        let response = match self.take_idle() {
+            Some(mut connection) => match Self::exchange(&mut connection, &request).await {
+                Ok(Some(response)) => {
+                    self.put_idle(connection);
+                    response
+                }
+                // A reused connection that failed: only a request that
+                // changes nothing is sent again, because for the rest the
+                // agent may have acted before the connection went away.
+                _ if is_read_only(&request) => self.fresh_exchange(&request).await?,
+                Ok(None) => return Err(Self::closed()),
+                Err(error) => return Err(error),
+            },
+            None => self.fresh_exchange(&request).await?,
+        };
+        let data = response.into_core_result()?;
         serde_json::from_value(data)
             .map_err(|e| CoreError::External(format!("decoding agent payload: {e}")))
     }
@@ -74,7 +218,7 @@ impl AgentClient {
     /// the receiver is dropped; the connection is closed in every case,
     /// which is what stops the follower on the agent.
     async fn stream_lines(&self, request: AgentRequest) -> CoreResult<LogLines> {
-        let (_, mut reader, write_half) = self.send(request).await?;
+        let (_, (mut reader, write_half)) = self.send(request).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(LOG_LINES_CAPACITY);
         tokio::spawn(async move {
             let _write_half = write_half;
@@ -356,5 +500,371 @@ impl AdapterPort for AgentClient {
 
     async fn close_terminal(&self, params: TerminalCloseParams) -> CoreResult<()> {
         self.call(AgentRequest::CloseTerminal(params)).await
+    }
+}
+
+/// Requests that only read state, so sending one twice is harmless.
+fn is_read_only(request: &AgentRequest) -> bool {
+    matches!(
+        request,
+        AgentRequest::Capabilities
+            | AgentRequest::ListContainers
+            | AgentRequest::ListComposeProjectServices(_)
+            | AgentRequest::ComposeProjectLogs(_)
+            | AgentRequest::ReadDeploymentLog(_)
+            | AgentRequest::ListScheduledJobRuns(_)
+            | AgentRequest::ReadScheduledJobRunLog(_)
+            | AgentRequest::ReadNginxStats(_)
+            | AgentRequest::ListBackups(_)
+            | AgentRequest::MetricsSnapshot
+    )
+}
+
+async fn connect_tls(target: &TlsTarget) -> CoreResult<tokio_rustls::client::TlsStream<TcpStream>> {
+    let server_name = rustls::ServerName::try_from(target.server_name.as_str()).map_err(|_| {
+        CoreError::Validation(format!("invalid agent host '{}'", target.server_name))
+    })?;
+    let tcp = TcpStream::connect(&target.address).await.map_err(|e| {
+        CoreError::External(format!("connecting to agent at {}: {e}", target.address))
+    })?;
+    tcp.set_nodelay(true).ok();
+    let stream = tokio_rustls::TlsConnector::from(target.config.clone())
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| {
+            CoreError::External(format!(
+                "TLS handshake with agent at {}: {e}",
+                target.address
+            ))
+        })?;
+    let leaf = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .ok_or_else(|| CoreError::External("agent presented no certificate".into()))?;
+    let fingerprint = crate::pki::fingerprint_der(&leaf.0);
+    if !target
+        .pinned_fingerprints
+        .iter()
+        .any(|pin| pin.eq_ignore_ascii_case(&fingerprint))
+    {
+        return Err(CoreError::PermissionDenied(format!(
+            "agent at {} presented a certificate the panel did not issue for this server",
+            target.address
+        )));
+    }
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    //! A mock remote agent: a TLS 1.3 listener built with the same
+    //! `pki::server_config` the real agent uses, answering the line protocol.
+    use super::*;
+    use crate::pki::{self, KeyedCert};
+    use tokio::net::TcpListener;
+
+    struct Pki {
+        ca: KeyedCert,
+        agent: KeyedCert,
+        agent_fingerprint: String,
+        client: KeyedCert,
+    }
+
+    fn pki_for(host: &str) -> Pki {
+        let ca = pki::generate_ca().unwrap();
+        let request = pki::generate_agent_csr(host).unwrap();
+        let (cert_pem, info) =
+            pki::sign_agent_csr(&ca, &request.cert_pem, host, uuid::Uuid::nil(), 1).unwrap();
+        let (client, _) = pki::issue_client_cert(&ca, 1).unwrap();
+        Pki {
+            ca,
+            agent: KeyedCert {
+                cert_pem,
+                key_pem: request.key_pem,
+            },
+            agent_fingerprint: info.fingerprint,
+            client,
+        }
+    }
+
+    struct MockAgent {
+        address: String,
+        /// Requests read.
+        served: Arc<std::sync::atomic::AtomicUsize>,
+        /// TLS connections accepted.
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Serves until dropped, like the agent: many requests per connection
+    /// (or one, then a close, with `one_shot`). Answers `Capabilities`;
+    /// everything else gets a `not_found` error answer.
+    async fn mock_agent_with(ca_pem: &str, identity: &KeyedCert, one_shot: bool) -> MockAgent {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let config = pki::server_config(ca_pem, identity).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (served, connections) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (served_count, connection_count) = (served.clone(), connections.clone());
+        tokio::spawn(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(config);
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                let (served, connections) = (served_count.clone(), connection_count.clone());
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    connections.fetch_add(1, SeqCst);
+                    let (read_half, mut write_half) = tokio::io::split(stream);
+                    let mut reader = BufReader::new(read_half);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        served.fetch_add(1, SeqCst);
+                        let response = match serde_json::from_str::<AgentRequest>(line.trim()) {
+                            Ok(AgentRequest::Capabilities) => {
+                                AgentResponse::ok(&AgentCapabilities {
+                                    docker: true,
+                                    mail: false,
+                                    antivirus: false,
+                                    version: "remote-mock".into(),
+                                    build_tools: Vec::new(),
+                                })
+                            }
+                            _ => AgentResponse::Err {
+                                kind: "not_found".into(),
+                                message: "unsupported in mock".into(),
+                            },
+                        };
+                        let mut out = serde_json::to_string(&response).unwrap();
+                        out.push('\n');
+                        write_half.write_all(out.as_bytes()).await.unwrap();
+                        write_half.flush().await.unwrap();
+                        if one_shot {
+                            write_half.shutdown().await.ok();
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        MockAgent {
+            address,
+            served,
+            connections,
+        }
+    }
+
+    async fn mock_agent(
+        ca_pem: &str,
+        identity: &KeyedCert,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let agent = mock_agent_with(ca_pem, identity, false).await;
+        (agent.address, agent.served)
+    }
+
+    fn client(
+        address: &str,
+        host: &str,
+        ca_pem: &str,
+        identity: &KeyedCert,
+        pins: Vec<String>,
+    ) -> AgentClient {
+        AgentClient::tls(TlsTarget {
+            address: address.to_string(),
+            server_name: host.to_string(),
+            config: pki::client_config(ca_pem, identity).unwrap(),
+            pinned_fingerprints: pins,
+        })
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_round_trip() {
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let agent = client(
+            &address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        let capabilities = agent.capabilities().await.unwrap();
+        assert_eq!(capabilities.version, "remote-mock");
+        // Errors travel back as the matching core error.
+        let error = agent.list_containers().await.unwrap_err();
+        assert!(matches!(error, CoreError::NotFound(_)));
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_agent_certificate_is_refused() {
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        // Valid chain and name, but not the certificate recorded for the server.
+        let agent = client(
+            &address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec!["00".repeat(32)],
+        );
+        let error = agent.capabilities().await.unwrap_err();
+        assert!(matches!(error, CoreError::PermissionDenied(_)), "{error}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_agent_must_name_the_configured_host() {
+        let pki = pki_for("agent-a.example.com");
+        let (address, _) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let agent = client(
+            &address,
+            "agent-b.example.com",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        assert!(agent.capabilities().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_client_from_another_ca_is_rejected_by_the_agent() {
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let other_ca = pki::generate_ca().unwrap();
+        let (foreign_client, _) = pki::issue_client_cert(&other_ca, 1).unwrap();
+        // Trusts the right CA for the server, but presents a foreign identity.
+        let agent = AgentClient::tls(TlsTarget {
+            address: address.clone(),
+            server_name: "127.0.0.1".into(),
+            config: {
+                let mut roots = rustls::RootCertStore::empty();
+                for der in rustls_pemfile::certs(&mut pki.ca.cert_pem.as_bytes()).unwrap() {
+                    roots.add(&rustls::Certificate(der)).unwrap();
+                }
+                let cert = rustls_pemfile::certs(&mut foreign_client.cert_pem.as_bytes()).unwrap();
+                let key =
+                    rustls_pemfile::pkcs8_private_keys(&mut foreign_client.key_pem.as_bytes())
+                        .unwrap();
+                Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_safe_defaults()
+                        .with_root_certificates(roots)
+                        .with_client_auth_cert(
+                            cert.into_iter().map(rustls::Certificate).collect(),
+                            rustls::PrivateKey(key[0].clone()),
+                        )
+                        .unwrap(),
+                )
+            },
+            pinned_fingerprints: vec![pki.agent_fingerprint.clone()],
+        });
+        assert!(agent.capabilities().await.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_agent_certificate_cannot_act_as_the_panel() {
+        // A compromised agent host holds a CA-signed certificate; it carries
+        // only `serverAuth`, so another agent refuses it as a client.
+        let pki = pki_for("127.0.0.1");
+        let (address, served) = mock_agent(&pki.ca.cert_pem, &pki.agent).await;
+        let agent = client(
+            &address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.agent,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        assert!(agent.capabilities().await.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_agent_fails_cleanly() {
+        let pki = pki_for("127.0.0.1");
+        let agent = client(
+            "127.0.0.1:9",
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint],
+        );
+        assert!(matches!(
+            agent.capabilities().await,
+            Err(CoreError::External(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_connections_are_reused() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let pki = pki_for("127.0.0.1");
+        let mock = mock_agent_with(&pki.ca.cert_pem, &pki.agent, false).await;
+        let agent = client(
+            &mock.address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        for _ in 0..5 {
+            agent.capabilities().await.unwrap();
+        }
+        // An error answer leaves the connection usable too.
+        assert!(matches!(
+            agent.list_containers().await,
+            Err(CoreError::NotFound(_))
+        ));
+        agent.capabilities().await.unwrap();
+        assert_eq!(mock.served.load(SeqCst), 7);
+        assert_eq!(
+            mock.connections.load(SeqCst),
+            1,
+            "one handshake for every call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_pooled_connection_is_retried_only_for_reads() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let pki = pki_for("127.0.0.1");
+        // Closes every connection after one answer, like a restarted agent.
+        let mock = mock_agent_with(&pki.ca.cert_pem, &pki.agent, true).await;
+        let agent = client(
+            &mock.address,
+            "127.0.0.1",
+            &pki.ca.cert_pem,
+            &pki.client,
+            vec![pki.agent_fingerprint.clone()],
+        );
+        agent.capabilities().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The pooled connection is dead; a read goes again on a new one.
+        agent.capabilities().await.unwrap();
+        assert_eq!(mock.served.load(SeqCst), 2);
+        assert_eq!(mock.connections.load(SeqCst), 2);
+
+        // A change is not sent twice: the failure is reported instead.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stop = agent
+            .stop_compose_project(ComposeProjectActionParams {
+                project_slug: "web".into(),
+            })
+            .await;
+        assert!(matches!(stop, Err(CoreError::External(_))), "{stop:?}");
+        assert_eq!(mock.served.load(SeqCst), 2, "the agent never saw the stop");
+        // The next call opens a fresh connection and works.
+        agent.capabilities().await.unwrap();
+        assert_eq!(mock.connections.load(SeqCst), 3);
     }
 }

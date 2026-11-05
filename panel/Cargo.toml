@@ -50,3 +50,5 @@ tower-cookies = "0.10"
 futures = "0.3"
 bytes = "1"
 time = "0.3"
+rustls-pemfile = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }

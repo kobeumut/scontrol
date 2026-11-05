@@ -15,6 +15,7 @@ struct ProjectRecord {
     owner_user_id: Uuid,
     environment_id: Uuid,
     env_layered: bool,
+    server_id: Uuid,
     source: serde_json::Value,
     status: String,
     created_at: DateTime<Utc>,
@@ -30,6 +31,7 @@ impl ProjectRecord {
             owner_user_id: self.owner_user_id,
             environment_id: self.environment_id,
             env_layered: self.env_layered,
+            server_id: self.server_id,
             source: serde_json::from_value(self.source)?,
             status: DeploymentStatus::from_str(&self.status).map_err(anyhow::Error::msg)?,
             created_at: self.created_at,
@@ -131,7 +133,7 @@ pub async fn create(
         r#"INSERT INTO compose_projects
                (id, name, slug, owner_user_id, environment_id, env_layered, source)
            VALUES ($1, $2, $3, $4, $5, TRUE, $6)
-           RETURNING id, name, slug, owner_user_id, environment_id, env_layered, source, status,
+           RETURNING id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status,
                      created_at, updated_at"#,
         id,
         name,
@@ -148,7 +150,7 @@ pub async fn create(
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<ComposeProject>> {
     let record = sqlx::query_as!(
         ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects WHERE id = $1",
+        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status, created_at, updated_at FROM compose_projects WHERE id = $1",
         id,
     )
     .fetch_optional(pool)
@@ -156,27 +158,10 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<Compos
     record.map(ProjectRecord::into_project).transpose()
 }
 
-pub async fn list_for_owner(
-    pool: &PgPool,
-    owner_user_id: Uuid,
-) -> anyhow::Result<Vec<ComposeProject>> {
-    let records = sqlx::query_as!(
-        ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects WHERE owner_user_id = $1 ORDER BY created_at DESC",
-        owner_user_id,
-    )
-    .fetch_all(pool)
-    .await?;
-    records
-        .into_iter()
-        .map(ProjectRecord::into_project)
-        .collect()
-}
-
 pub async fn list_all(pool: &PgPool) -> anyhow::Result<Vec<ComposeProject>> {
     let records = sqlx::query_as!(
         ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects ORDER BY created_at DESC",
+        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status, created_at, updated_at FROM compose_projects ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -215,6 +200,31 @@ pub async fn enqueue_deployment(
     rollback_of: Option<Uuid>,
 ) -> anyhow::Result<DeploymentInfo> {
     let mut tx = pool.begin().await?;
+    let info = enqueue_deployment_in(
+        &mut tx,
+        id,
+        project_id,
+        log_path,
+        pull_images,
+        trigger,
+        rollback_of,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(info)
+}
+
+/// [`enqueue_deployment`] inside the caller's transaction, so the job
+/// commits (or not) together with the state change that justified it.
+pub async fn enqueue_deployment_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    project_id: Uuid,
+    log_path: &str,
+    pull_images: bool,
+    trigger: &str,
+    rollback_of: Option<Uuid>,
+) -> anyhow::Result<DeploymentInfo> {
     let record = sqlx::query_as!(
         DeploymentRecord,
         r#"INSERT INTO compose_deployments
@@ -230,44 +240,68 @@ pub async fn enqueue_deployment(
         trigger,
         rollback_of,
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     // Only an idle project shows "queued"; a running one keeps its status.
     sqlx::query!(
         "UPDATE compose_projects SET status = 'queued', updated_at = now() WHERE id = $1 AND status <> 'running'",
         project_id
     )
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     record.into_info()
+}
+
+/// Lock shared by the claim query and preview teardown (see
+/// [`claim_next_deployment`]).
+pub async fn lock_deploy_claims(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> sqlx::Result<()> {
+    sqlx::query!("SELECT pg_advisory_xact_lock(hashtext('scontrol.compose_deploy_claim'))")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Claims the oldest queued deployment whose project has nothing running,
 /// so deployments of one project run strictly in order while different
 /// projects run in parallel. Claims are serialised with a transaction-scoped
 /// advisory lock, which keeps the "nothing running" check race-free even
-/// with several workers (or several panel-api processes).
+/// with several workers (or several panel-api processes). A preview that is
+/// being removed is never claimed; preview teardown takes the same lock, so
+/// it either sees a claimed deployment as running or claims none.
 pub async fn claim_next_deployment(pool: &PgPool) -> sqlx::Result<Option<ClaimedDeployment>> {
+    claim_next_deployment_of(pool, None).await
+}
+
+/// [`claim_next_deployment`], optionally limited to one project (tests).
+pub async fn claim_next_deployment_of(
+    pool: &PgPool,
+    only_project: Option<Uuid>,
+) -> sqlx::Result<Option<ClaimedDeployment>> {
     let mut tx = pool.begin().await?;
-    sqlx::query!("SELECT pg_advisory_xact_lock(hashtext('scontrol.compose_deploy_claim'))")
-        .execute(&mut *tx)
-        .await?;
+    lock_deploy_claims(&mut tx).await?;
     let claimed = sqlx::query!(
         r#"UPDATE compose_deployments
            SET status = 'running', started_at = now()
            WHERE id = (
                SELECT d.id FROM compose_deployments d
                WHERE d.status = 'queued'
+                 AND ($1::uuid IS NULL OR d.project_id = $1)
                  AND NOT EXISTS (
                      SELECT 1 FROM compose_deployments r
                      WHERE r.project_id = d.project_id AND r.status = 'running'
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM preview_deployments p
+                     WHERE p.preview_project_id = d.project_id AND p.status = 'closing'
                  )
                ORDER BY d.queued_at
                LIMIT 1
                FOR UPDATE SKIP LOCKED
            )
-           RETURNING id, project_id, pull_images, rollback_of"#
+           RETURNING id, project_id, pull_images, rollback_of"#,
+        only_project,
     )
     .fetch_optional(&mut *tx)
     .await?;
@@ -672,6 +706,26 @@ pub async fn find_queued_deployment(
         project_id,
     )
     .fetch_optional(pool)
+    .await?;
+    record.map(DeploymentRecord::into_info).transpose()
+}
+
+/// [`find_queued_deployment`] inside the caller's transaction.
+pub async fn find_queued_deployment_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+) -> anyhow::Result<Option<DeploymentInfo>> {
+    let record = sqlx::query_as!(
+        DeploymentRecord,
+        r#"SELECT id, project_id, status, log_path, trigger, commit_sha, queued_at, started_at,
+                  finished_at, error_message, rollback_of,
+                  (status = 'succeeded' AND snapshot IS NOT NULL AND release_retained) AS "rollback_available!"
+           FROM compose_deployments
+           WHERE project_id = $1 AND status = 'queued'
+           ORDER BY queued_at LIMIT 1"#,
+        project_id,
+    )
+    .fetch_optional(&mut **tx)
     .await?;
     record.map(DeploymentRecord::into_info).transpose()
 }

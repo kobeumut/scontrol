@@ -1,3 +1,4 @@
+pub mod api_keys;
 pub mod audit;
 pub mod backups;
 pub mod compose_projects;
@@ -9,9 +10,12 @@ pub mod github_apps;
 pub mod metrics;
 pub mod notifications;
 pub mod observability;
+pub mod previews;
 pub mod projects;
+pub mod rbac;
 pub mod registries;
 pub mod scheduled_jobs;
+pub mod servers;
 pub mod sites;
 pub mod users;
 
@@ -27,5 +31,6 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 
 pub async fn run_migrations(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(pool).await?;
+    rbac::sync_catalog(pool).await?;
     Ok(())
 }

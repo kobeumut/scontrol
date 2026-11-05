@@ -25,9 +25,19 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     }
     .ok_or_else(|| anyhow::anyhow!("no admin user found; run `panel-cli user create --admin` first"))?;
 
+    let authority = panel_core::rbac::Authority {
+        user: if user.is_admin {
+            panel_core::rbac::GrantSet::superuser()
+        } else {
+            panel_core::rbac::GrantSet::new(crate::db::rbac::user_grants(&state.db, user.id).await?)
+        },
+        key: None,
+    };
     let identity = McpIdentity {
         user_id: user.id,
         is_admin: user.is_admin,
+        authority,
+        api_key_id: None,
     };
 
     let stdin = tokio::io::stdin();
@@ -47,7 +57,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
         }
 
         let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            Ok(request) => server::handle_request(&state, identity, request).await,
+            Ok(request) => server::handle_request(&state, identity.clone(), request).await,
             Err(e) => {
                 tracing::warn!(error = %e, "invalid MCP request over stdio");
                 continue;

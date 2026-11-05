@@ -80,12 +80,13 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Server and container metrics | Agent samples `/proc` and cgroup v2 every 10–30 s, with no process spawn. Kept as a downsampled ring in PostgreSQL. Threshold alerts fire on edge transitions | D4 | ✅ |
 | Request stats | Nginx JSON `log_format`, read incrementally with offset tracking and aggregated into PostgreSQL | D4 | ✅ |
 | Docker cleanup | Scheduled `docker image prune` / `builder prune` argv with an `until=` filter; freed space reported | D4 | ✅ |
-| Rollbacks | Tag each successful build `<slug>/<service>:deploy-<id>` and keep the last N. Rollback = compose up pinned to that tag plus the stored non-secret config snapshot. Static sites and database services are not rolled back yet | D5 | ✅ || Preview deployments | PR webhook → `<slug>-pr-<n>` project on a wildcard subdomain, with limit and TTL cleanup, and a PR comment through the GitHub API | D5 | ⬜ |
+| Rollbacks | Tag each successful build `<slug>/<service>:deploy-<id>` and keep the last N. Rollback = compose up pinned to that tag plus the stored non-secret config snapshot. Static sites and database services are not rolled back yet | D5 | ✅ |
+| Preview deployments | PR webhook → `<slug>-pr-<n>` project on a wildcard subdomain, with limit and TTL cleanup, resource limits, and a PR comment through the GitHub/Gitea/GitLab API. Same-repository requests only | D5 | ✅ |
+| Multi-server | The same agent on remote hosts over mTLS, or an SSH-forwarded Unix socket with one persistent connection | D6 | ✅ (not yet run against real remote hosts) |
+| RBAC and API keys | A resource/action permission table checked in Axum extractors, with project and environment scoping. API keys hashed with Argon2. Nothing paywalled | D6 | ✅ |
 | Templates | A vetted catalogue (TOML + Compose) shipped with the panel, using the same validator as user Compose and variable generators in Rust | D5 | ✅ (WordPress, Ghost, Directus, Plausible, Uptime Kuma; Next.js not yet) |
 | Redirects, basic auth, path prefix, custom certs | Typed vhost options: `return 301/302`, `auth_basic_user_file`, `location /prefix/`, certificate files stored 0600 | D5 | ✅ |
 | Web terminal | Agent-side PTY running `docker exec` argv only, behind admin RBAC and audit. No host root shell | D5 | ✅ |
-| Multi-server | The same agent on remote hosts over mTLS, or an SSH-forwarded Unix socket with one persistent connection | D6 | ⬜ |
-| RBAC and API keys | A resource/action permission table checked in Axum extractors, with project and environment scoping. API keys hashed with Argon2. Nothing paywalled | D6 | ⬜ |
 | Swarm cluster management | — | — | ✖ (multi-host by placement, not Swarm) |
 | Vault and DNS providers, Vector, enterprise SSO/SCIM | — | — | ✖ for now |
 
@@ -135,6 +136,9 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 
 **D6: Scale-out.**
 - Remote agents, RBAC, and API keys.
+- Done: the panel PKI (ECDSA CA, CSR enrollment, pinned agent certificates, automatic client-certificate renewal, agent-certificate rotation with a grace window), the agent's TLS 1.3 listener, SSH-forwarded sockets, servers with health checks, draining and capacity, least-loaded placement, per-server routing of Compose operations and deployments; RBAC (permission catalog, built-in and custom roles, global/project/environment bindings, typed Axum extractors, fail-closed checks, no escalation through bindings or roles); API keys (Argon2id-hashed, shown once, scoped grants narrowed by the owner's current grants, session-only management).
+- Also done: scheduled jobs, backups, database services, metrics, request statistics, and Docker cleanup per server; persistent mTLS connections; per-service RBAC for jobs, database services, and metrics; RBAC-aware MCP with API keys; installer agent-only mode and an SSH-tunnel unit.
+- Open: an end-to-end run on real hosts.
 
 ## 6. Security differences from Dokploy
 
@@ -146,3 +150,5 @@ These are deliberate, not just parity:
 - Webhooks require HMAC, not only a URL token.
 - Cancelling a deployment kills only that deployment's process group.
 - The web terminal never opens a root shell on the host.
+- Remote agents use a private CA with single-purpose certificates (an agent certificate cannot authenticate as the panel), pinned fingerprints, and keys that never leave their host; nothing is reachable without a client certificate.
+- API keys are stored only as Argon2id hashes, can never exceed their owner's current grants, and cannot manage keys, roles, or server-wide settings.

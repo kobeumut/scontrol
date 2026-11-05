@@ -1,4 +1,4 @@
-use crate::auth::AuthUser;
+use crate::auth::Authenticated;
 use crate::mcp::{self, protocol::JsonRpcRequest, McpIdentity};
 use crate::state::AppState;
 use axum::extract::State;
@@ -11,17 +11,14 @@ pub fn router() -> Router<AppState> {
 }
 
 /// HTTP transport for MCP: authenticated the same way as the rest of the
-/// API (session cookie), so an MCP client acts with exactly the calling
-/// user's permissions — no separate, wider-scoped credential.
+/// API (session cookie or API key), so an MCP client acts with exactly the
+/// caller's permissions (a key's narrowed ones) and no wider credential.
 async fn handle(
-    AuthUser(user): AuthUser,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Json<Value> {
-    let identity = McpIdentity {
-        user_id: user.id,
-        is_admin: user.is_admin,
-    };
+    let identity = McpIdentity::from_principal(&principal);
     let response = mcp::handle_request(&state, identity, request).await;
     Json(serde_json::to_value(response).unwrap())
 }

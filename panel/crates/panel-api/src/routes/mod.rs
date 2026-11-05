@@ -1,4 +1,6 @@
+pub mod access;
 pub mod admin;
+pub mod api_keys;
 pub mod auth;
 pub mod backups;
 pub mod compose_projects;
@@ -13,9 +15,11 @@ pub mod mcp;
 pub mod metrics;
 pub mod notifications;
 pub mod observability;
+pub mod previews;
 pub mod projects;
 pub mod registries;
 pub mod scheduled_jobs;
+pub mod servers;
 pub mod sites;
 pub mod templates;
 pub mod terminal;
@@ -49,6 +53,9 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/templates", templates::router())
         .nest("/api/webhooks", webhooks::router())
         .nest("/api/admin", admin::router())
+        .nest("/api/access", access::router())
+        .nest("/api/api-keys", api_keys::router())
+        .nest("/api/servers", servers::router())
         // `/health` serves Nginx/systemd probes; the SPA calls everything
         // under `/api`, so the same handlers are mounted there too.
         .nest("/health", health::router())
@@ -57,3 +64,5 @@ pub fn build_router(state: AppState) -> Router {
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
+#[cfg(test)]
+mod rbac_tests;

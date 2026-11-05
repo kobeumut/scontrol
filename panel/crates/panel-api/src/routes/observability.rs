@@ -19,6 +19,7 @@ use chrono::{Duration, Utc};
 use panel_core::observability::{DEFAULT_PRUNE_AGE_HOURS, MAX_PRUNE_AGE_HOURS};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -45,7 +46,8 @@ struct RequestStats {
     step_minutes: i32,
     hosts: Vec<HostTotals>,
     series: Vec<SeriesPoint>,
-    source: CursorStatus,
+    /// How reading each server's access log went.
+    sources: Vec<CursorStatus>,
 }
 
 /// Chart resolution: about 240 points whatever the window.
@@ -82,7 +84,7 @@ async fn requests(
         step_minutes: step,
         hosts: db::observability::host_totals(&state.db, since).await?,
         series: db::observability::series(&state.db, since, step, host.as_deref()).await?,
-        source: db::observability::cursor_status(&state.db).await?,
+        sources: db::observability::cursor_statuses(&state.db).await?,
     }))
 }
 
@@ -145,6 +147,9 @@ async fn save_settings(
 #[derive(Deserialize, Default)]
 struct RunBody {
     older_than_hours: Option<i32>,
+    /// Server to clean; this host when omitted.
+    #[serde(default)]
+    server_id: Option<Uuid>,
 }
 
 /// One-click cleanup. Only the age can be chosen; the commands are fixed.
@@ -161,7 +166,9 @@ async fn run_now(
             .map(|s| s.older_than_hours as u32)
             .unwrap_or(DEFAULT_PRUNE_AGE_HOURS),
     };
-    let run = service::run_cleanup(&state.db, state.agent.as_ref(), "manual", age).await?;
+    let server = body.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID);
+    let agent = state.agents.for_server_id(&state.db, server).await?;
+    let run = service::run_cleanup(&state.db, agent.as_ref(), server, "manual", age).await?;
     db::audit::record(
         &state.db,
         Some(user.id),

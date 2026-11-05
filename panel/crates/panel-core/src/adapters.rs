@@ -166,6 +166,14 @@ pub struct DeployComposeProjectParams {
     /// environment file and domains.
     #[serde(default)]
     pub rollback: Option<RollbackTarget>,
+    /// Memory, CPU and PID limits the agent applies to every service through
+    /// the generated override (pull request previews).
+    #[serde(default)]
+    pub resource_limits: Option<crate::previews::ResourceLimits>,
+    /// A temporary project (pull request preview): its named volumes are
+    /// removed together with the project instead of surviving it.
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 /// Opens (`Some`) or closes (`None`) outside access to a database service:

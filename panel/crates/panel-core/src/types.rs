@@ -758,6 +758,10 @@ pub struct ComposeProject {
     /// variables the panel never saw: deployments keep its env file as is
     /// (no inheritance) until its environment is saved once.
     pub env_layered: bool,
+    /// The server (agent) the service is placed on; the nil UUID is the
+    /// panel's own host.
+    #[serde(default)]
+    pub server_id: Uuid,
     pub source: ComposeSource,
     pub status: DeploymentStatus,
     pub created_at: DateTime<Utc>,
@@ -975,6 +979,11 @@ pub struct ComposeDomainBinding {
     /// Redirect, basic auth, path prefix, and custom certificate options.
     #[serde(default)]
     pub options: crate::vhost::VhostOptions,
+    /// Serve HTTPS with this existing certbot lineage (a wildcard
+    /// certificate such as `preview.example.com` issued out of band)
+    /// instead of requesting a certificate for `domain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
 }
 
 /// Persisted form of [`ComposeDomainBinding`].

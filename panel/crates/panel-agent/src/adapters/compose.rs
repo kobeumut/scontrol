@@ -14,6 +14,9 @@
 //! env                       0600 merged environment file (`--env-file`)
 //! env.masked                0600 overridden inherited values, masked in logs
 //! scontrol.override.yml     generated loopback port publishing for domains
+//!                           and resource limits of ephemeral projects
+//! .scontrol-ephemeral       marker: a pull request preview, whose named
+//!                           volumes are removed with the project
 //! .scontrol-compose-path    Compose file path relative to code/
 //! domains.json              domains whose vhosts this project owns
 //! logs/<deployment>.log     streamed, redacted, bounded deployment logs
@@ -52,6 +55,7 @@ use panel_core::adapters::{
     LOG_LINES_CAPACITY,
 };
 use panel_core::error::{CoreError, CoreResult};
+use panel_core::previews::{ResourceLimits, PREVIEW_PIDS_LIMIT};
 use panel_core::types::{
     validate, ApplicationBuild, ApplicationSpec, ComposeDeployOutcome, ComposeDomainBinding,
     ComposeServiceInfo, ComposeSource, DatabaseDeployment, DatabaseServiceSpec, DeploymentLogChunk,
@@ -85,6 +89,8 @@ const COMPOSE_PATH_MARKER: &str = ".scontrol-compose-path";
 const DOMAINS_FILE: &str = "domains.json";
 /// Present only for static sites; holds the deployment ID being served.
 const STATIC_MARKER: &str = "static-release";
+/// Present in the root of an ephemeral (pull request preview) project.
+const EPHEMERAL_MARKER: &str = ".scontrol-ephemeral";
 /// Static releases kept per site, the served one included.
 const STATIC_RELEASES_RETAINED: usize = 3;
 const MAX_DOMAIN_BINDINGS: usize = 32;
@@ -174,27 +180,51 @@ async fn deploy_steps(
         root.join(REDIS_CONFIG_FILE),
     ];
     let compose = validate_compose_file(&compose_path, &code_dir, &agent_files).await?;
+    if params.ephemeral {
+        ephemeral_policy(&compose)?;
+    }
     check_bindings_against_compose(&compose, &params.domains)?;
     persist_compose_path(root, &code_dir, &compose_path).await?;
 
+    mark_ephemeral(root, params.ephemeral).await?;
     let override_path = root.join(OVERRIDE_FILE);
-    let override_body = if params.domains.is_empty() {
-        let _ = tokio::fs::remove_file(&override_path).await;
-        None
-    } else {
-        let body = render_override(&params.domains)?;
-        tokio::fs::write(&override_path, &body)
-            .await
-            .map_err(|e| CoreError::Io(format!("writing Compose override: {e}")))?;
-        Some(body)
-    };
+    let service_names: Vec<String> = compose
+        .get("services")
+        .and_then(Yaml::as_mapping)
+        .map(|services| {
+            services
+                .keys()
+                .filter_map(Yaml::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let override_body =
+        if params.domains.is_empty() && params.resource_limits.is_none() && !params.ephemeral {
+            let _ = tokio::fs::remove_file(&override_path).await;
+            None
+        } else {
+            let body = render_override(
+                &params.domains,
+                &service_names,
+                params.resource_limits.as_ref(),
+                params.ephemeral,
+            )?;
+            tokio::fs::write(&override_path, &body)
+                .await
+                .map_err(|e| CoreError::Io(format!("writing Compose override: {e}")))?;
+            Some(body)
+        };
 
     let paths = ProjectPaths {
         code_dir,
         compose: compose_path,
         env: Some(env_path.to_path_buf()),
-        override_file: (!params.domains.is_empty()).then_some(override_path),
+        override_file: override_body.is_some().then_some(override_path),
     };
+    if params.ephemeral {
+        check_ephemeral_publications(&params.project_slug, &paths, &params.domains).await?;
+    }
     // A builder's image exists only locally; there is nothing to pull.
     let builds_locally = matches!(
         &params.source,
@@ -509,8 +539,11 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
         Err(error) => return Err(error),
     };
     let mut args = compose_args(&params.project_slug, &paths);
-    // Do not pass `--volumes`: persistent named volumes survive a project
-    // removal unless an operator explicitly removes them outside the panel.
+    // Never pass `--volumes`: persistent named volumes survive a project
+    // removal unless an operator explicitly removes them outside the panel,
+    // and `--volumes` would also delete explicitly named volumes another
+    // project shares. A pull request preview is temporary by definition, so
+    // the volumes it owns (by label and name prefix) are removed below.
     args.extend(["down".into(), "--remove-orphans".into()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
@@ -519,6 +552,9 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
         return Err(CoreError::External(format!(
             "docker compose removal failed (exit code {code})"
         )));
+    }
+    if root.join(EPHEMERAL_MARKER).is_file() {
+        remove_owned_volumes(&params.project_slug).await?;
     }
     let owned = read_owned_domains(&root).await;
     for domain in &owned {
@@ -833,6 +869,9 @@ fn validate_project_params(params: &DeployComposeProjectParams) -> CoreResult<()
     if let Some(target) = &params.rollback {
         validate_rollback_target(params, target)?;
     }
+    if let Some(limits) = &params.resource_limits {
+        limits.validate().map_err(CoreError::Validation)?;
+    }
     validate_bindings(&params.domains, params.acme_email.as_deref())
 }
 
@@ -948,6 +987,16 @@ fn validate_bindings(
                 binding.domain
             )));
         }
+        if let Some(certificate) = &binding.certificate {
+            // Names a directory under the certbot live dir: domain syntax
+            // only, so no separator or traversal reaches the path.
+            if !validate::is_valid_domain(certificate) {
+                return Err(CoreError::Validation(format!(
+                    "invalid certificate name for {}",
+                    binding.domain
+                )));
+            }
+        }
         if !domains.insert(binding.domain.as_str()) || !host_ports.insert(binding.host_port) {
             return Err(CoreError::Validation(format!(
                 "duplicate domain or host port: {}",
@@ -955,12 +1004,19 @@ fn validate_bindings(
             )));
         }
     }
-    if bindings.iter().any(|b| b.https) && !acme_email.is_some_and(is_plausible_email) {
+    if bindings.iter().any(|b| b.https && b.certificate.is_none())
+        && !acme_email.is_some_and(is_plausible_email)
+    {
         return Err(CoreError::Validation(
             "a valid ACME email is required for HTTPS domains".into(),
         ));
     }
     Ok(())
+}
+
+/// The certbot lineage whose files serve a binding's HTTPS.
+fn certificate_of(binding: &ComposeDomainBinding) -> &str {
+    binding.certificate.as_deref().unwrap_or(&binding.domain)
 }
 
 fn is_plausible_email(email: &str) -> bool {
@@ -991,18 +1047,83 @@ fn check_bindings_against_compose(
     Ok(())
 }
 
+/// Writes or removes the ephemeral marker.
+async fn mark_ephemeral(root: &Path, ephemeral: bool) -> CoreResult<()> {
+    let marker = root.join(EPHEMERAL_MARKER);
+    if ephemeral {
+        tokio::fs::write(&marker, b"pull request preview\n")
+            .await
+            .map_err(|e| CoreError::Io(format!("writing ephemeral marker: {e}")))?;
+    } else {
+        let _ = tokio::fs::remove_file(&marker).await;
+    }
+    Ok(())
+}
+
 /// Generates the override that publishes each bound container port on the
-/// loopback interface only, where the generated Nginx vhost reaches it.
-fn render_override(bindings: &[ComposeDomainBinding]) -> CoreResult<String> {
+/// loopback interface only, where the generated Nginx vhost reaches it, and
+/// (for ephemeral projects) caps every service's memory, CPU and PIDs. The
+/// limits are set both as service keys and as `deploy.resources.limits`, so
+/// a value the Compose file sets in either place is overridden consistently
+/// and Compose never sees two different limits.
+///
+/// For an ephemeral project every service's `ports` is replaced (`!override`
+/// / `!reset`), not merged: Compose appends override sequences to the source
+/// ones, so a preview would otherwise keep the application's own public
+/// publications (and collide with the production project).
+fn render_override(
+    bindings: &[ComposeDomainBinding],
+    service_names: &[String],
+    limits: Option<&ResourceLimits>,
+    ephemeral: bool,
+) -> CoreResult<String> {
     let mut services = serde_yaml::Mapping::new();
+    if let Some(limits) = limits {
+        limits.validate().map_err(CoreError::Validation)?;
+        for name in service_names {
+            if !validate::is_valid_service_name(name) {
+                return Err(CoreError::Validation(format!(
+                    "invalid service name: {name}"
+                )));
+            }
+            let mut service = serde_yaml::Mapping::new();
+            service.insert("mem_limit".into(), Yaml::String(limits.memory()));
+            service.insert("memswap_limit".into(), Yaml::String(limits.memory()));
+            service.insert("cpus".into(), Yaml::String(limits.cpus()));
+            service.insert("pids_limit".into(), Yaml::Number(PREVIEW_PIDS_LIMIT.into()));
+            let mut resource = serde_yaml::Mapping::new();
+            resource.insert("memory".into(), Yaml::String(limits.memory()));
+            resource.insert("cpus".into(), Yaml::String(limits.cpus()));
+            resource.insert("pids".into(), Yaml::Number(PREVIEW_PIDS_LIMIT.into()));
+            let mut resources = serde_yaml::Mapping::new();
+            resources.insert("limits".into(), Yaml::Mapping(resource));
+            let mut deploy = serde_yaml::Mapping::new();
+            deploy.insert("resources".into(), Yaml::Mapping(resources));
+            service.insert("deploy".into(), Yaml::Mapping(deploy));
+            services.insert(Yaml::String(name.clone()), Yaml::Mapping(service));
+        }
+    }
+    if ephemeral {
+        for name in service_names {
+            if !validate::is_valid_service_name(name) {
+                return Err(CoreError::Validation(format!(
+                    "invalid service name: {name}"
+                )));
+            }
+            services
+                .entry(Yaml::String(name.clone()))
+                .or_insert_with(|| Yaml::Mapping(serde_yaml::Mapping::new()));
+        }
+    }
     for binding in bindings {
         let entry = services
             .entry(Yaml::String(binding.service_name.clone()))
-            .or_insert_with(|| {
-                let mut service = serde_yaml::Mapping::new();
+            .or_insert_with(|| Yaml::Mapping(serde_yaml::Mapping::new()));
+        if let Some(service) = entry.as_mapping_mut() {
+            if !service.contains_key("ports") {
                 service.insert("ports".into(), Yaml::Sequence(Vec::new()));
-                Yaml::Mapping(service)
-            });
+            }
+        }
         if let Some(Yaml::Sequence(ports)) = entry.get_mut("ports") {
             ports.push(Yaml::String(format!(
                 "127.0.0.1:{}:{}",
@@ -1010,10 +1131,184 @@ fn render_override(bindings: &[ComposeDomainBinding]) -> CoreResult<String> {
             )));
         }
     }
+    if ephemeral {
+        for (_, service) in services.iter_mut() {
+            let Some(service) = service.as_mapping_mut() else {
+                continue;
+            };
+            let replacement = match service.remove("ports") {
+                Some(ports) => tagged("override", ports),
+                None => tagged("reset", Yaml::Sequence(Vec::new())),
+            };
+            service.insert("ports".into(), replacement);
+        }
+    }
     let mut document = serde_yaml::Mapping::new();
     document.insert("services".into(), Yaml::Mapping(services));
     serde_yaml::to_string(&Yaml::Mapping(document))
         .map_err(|e| CoreError::External(format!("rendering Compose override: {e}")))
+}
+
+fn tagged(tag: &str, value: Yaml) -> Yaml {
+    Yaml::Tagged(Box::new(serde_yaml::value::TaggedValue {
+        tag: serde_yaml::value::Tag::new(tag),
+        value,
+    }))
+}
+
+/// Checks the effective model of an ephemeral project (`docker compose
+/// config`): every published port must be one of its managed loopback
+/// bindings. Guards against a Compose version that would merge instead of
+/// honouring `!override`. The rendered model holds environment values, so it
+/// is parsed in memory and never logged.
+async fn check_ephemeral_publications(
+    slug: &str,
+    paths: &ProjectPaths,
+    bindings: &[ComposeDomainBinding],
+) -> CoreResult<()> {
+    let mut args = compose_args(slug, paths);
+    args.extend(["config".into(), "--format".into(), "json".into()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, stdout, _stderr) = run_allow_nonzero("docker", &refs).await?;
+    if code != 0 {
+        return Err(CoreError::Validation(
+            "the preview's Compose model is invalid (docker compose config failed)".into(),
+        ));
+    }
+    let model: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|_| CoreError::External("docker compose config returned invalid JSON".into()))?;
+    effective_publications_are_managed(&model, bindings)
+}
+
+/// Pure part of [`check_ephemeral_publications`].
+fn effective_publications_are_managed(
+    model: &serde_json::Value,
+    bindings: &[ComposeDomainBinding],
+) -> CoreResult<()> {
+    let Some(services) = model.get("services").and_then(|s| s.as_object()) else {
+        return Ok(());
+    };
+    for (name, service) in services {
+        let Some(ports) = service.get("ports").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for port in ports {
+            let host_ip = port.get("host_ip").and_then(|v| v.as_str()).unwrap_or("");
+            let published = port
+                .get("published")
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
+                .unwrap_or_default();
+            let target = port.get("target").and_then(|v| v.as_u64()).unwrap_or(0);
+            let managed = bindings.iter().any(|b| {
+                &b.service_name == name
+                    && published == b.host_port.to_string()
+                    && target == u64::from(b.container_port)
+            });
+            if host_ip != "127.0.0.1" || !managed {
+                return Err(CoreError::Validation(format!(
+                    "service {name} of a preview would publish a port the panel does not manage"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extra policy for ephemeral (preview) projects: a preview must not reach
+/// any resource outside its own Compose project, because it runs
+/// unreviewed code and is removed with its volumes. Explicit volume or
+/// network names, `external` resources, `volumes_from`, `external_links`,
+/// and namespace sharing with containers are refused.
+fn ephemeral_policy(yaml: &Yaml) -> CoreResult<()> {
+    for section in ["volumes", "networks"] {
+        if let Some(entries) = yaml.get(section).and_then(Yaml::as_mapping) {
+            for (name, entry) in entries {
+                let name = name.as_str().unwrap_or("unknown");
+                let external = match entry.get("external") {
+                    None | Some(Yaml::Null) => false,
+                    Some(Yaml::Bool(value)) => *value,
+                    Some(_) => true,
+                };
+                if external || entry.get("name").is_some() {
+                    let kind = section.trim_end_matches('s');
+                    return Err(CoreError::Validation(format!(
+                        "previews cannot use the {kind} {name}: explicit names and external {section} could share another project's data"
+                    )));
+                }
+            }
+        }
+    }
+    let Some(services) = yaml.get("services").and_then(Yaml::as_mapping) else {
+        return Ok(());
+    };
+    for (name, service) in services {
+        let name = name.as_str().unwrap_or("unknown");
+        for key in ["volumes_from", "external_links"] {
+            if service.get(key).is_some() {
+                return Err(CoreError::Validation(format!(
+                    "service {name} of a preview uses {key}, which reaches other projects"
+                )));
+            }
+        }
+        for key in ["network_mode", "pid", "ipc"] {
+            if service
+                .get(key)
+                .and_then(Yaml::as_str)
+                .is_some_and(|mode| mode.starts_with("container:"))
+            {
+                return Err(CoreError::Validation(format!(
+                    "service {name} of a preview shares the {key} of another container"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Removes the named volumes Compose created for `slug`, and only those: a
+/// volume must carry this project's `com.docker.compose.project` label and
+/// the `<slug>_` prefix Compose gives the volumes it owns. Used instead of
+/// `down --volumes`, which also deletes explicitly named volumes that other
+/// projects may share.
+async fn remove_owned_volumes(slug: &str) -> CoreResult<()> {
+    let filter = format!("label=com.docker.compose.project={slug}");
+    let (code, stdout, _) =
+        run_allow_nonzero("docker", &["volume", "ls", "--quiet", "--filter", &filter]).await?;
+    if code != 0 {
+        return Err(CoreError::External(
+            "listing the preview's volumes failed".into(),
+        ));
+    }
+    for volume in owned_volume_names(slug, &stdout) {
+        let (code, _, _) = run_allow_nonzero("docker", &["volume", "rm", volume]).await?;
+        if code != 0 {
+            return Err(CoreError::External(format!(
+                "removing preview volume {volume} failed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Names from `docker volume ls --quiet` that the project `slug` owns.
+fn owned_volume_names<'a>(slug: &str, listing: &'a str) -> Vec<&'a str> {
+    let prefix = format!("{slug}_");
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|name| {
+            name.strip_prefix(&prefix).is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            })
+        })
+        .collect()
 }
 
 /// Writes vhosts for the desired bindings, removes vhosts of bindings that
@@ -1054,8 +1349,9 @@ async fn apply_domains(
             nginx::read_compose_vhost(cfg, &binding.domain).await,
         ));
         let dir = vhost_secrets::secrets_dir(cfg, &binding.domain);
-        let tls = binding.https
-            && nginx::certificate_available(cfg, &binding.domain, &binding.options, &dir);
+        let tls = (binding.https
+            && nginx::certificate_available(cfg, certificate_of(binding), &binding.options, &dir))
+        .then(|| certificate_of(binding));
         let content = nginx::render_compose_vhost(
             cfg,
             project_slug,
@@ -1099,11 +1395,21 @@ async fn apply_domains(
     }
 
     let mut warnings = Vec::new();
+    // A named (wildcard) certificate is issued out of band, never by certbot
+    // here: an HTTP-01 challenge cannot issue a wildcard.
+    for binding in bindings.iter().filter(|b| {
+        b.https && b.certificate.is_some() && !nginx::certificate_exists(cfg, certificate_of(b))
+    }) {
+        warnings.push(format!(
+            "certificate {} for {} was not found; serving HTTP only",
+            certificate_of(binding),
+            binding.domain
+        ));
+    }
     let mut reload = false;
-    for binding in bindings
-        .iter()
-        .filter(|b| b.https && !nginx::certificate_exists(cfg, &b.domain))
-    {
+    for binding in bindings.iter().filter(|b| {
+        b.https && b.certificate.is_none() && !nginx::certificate_exists(cfg, &b.domain)
+    }) {
         if binding.options.custom_cert {
             // The uploaded certificate replaces ACME for this domain.
             if !nginx::certificate_available(
@@ -1138,7 +1444,7 @@ async fn apply_domains(
                 project_slug,
                 &binding.domain,
                 &target(binding),
-                true,
+                Some(&binding.domain),
                 &binding.options,
                 &vhost_secrets::secrets_dir(cfg, &binding.domain),
             );
@@ -3107,6 +3413,8 @@ mod tests {
             git_credentials: None,
             database,
             rollback: None,
+            resource_limits: None,
+            ephemeral: false,
         };
         let good = DatabaseDeployment {
             loopback_port: 25000,
@@ -3170,6 +3478,8 @@ mod tests {
                 compose_sha256: "a".repeat(64),
                 images,
             }),
+            resource_limits: None,
+            ephemeral: false,
         };
         let own = deployment_image_tag("shop", "web", target).unwrap();
         assert!(validate_project_params(&params(vec![pinned(own)])).is_ok());
@@ -3262,16 +3572,22 @@ mod tests {
             host_port,
             https,
             options: Default::default(),
+            certificate: None,
         }
     }
 
     #[test]
     fn override_publishes_bound_ports_on_loopback_only() {
-        let rendered = render_override(&[
-            binding("a.example.com", "web", 40001, false),
-            binding("b.example.com", "web", 40002, false),
-            binding("api.example.com", "api", 40003, false),
-        ])
+        let rendered = render_override(
+            &[
+                binding("a.example.com", "web", 40001, false),
+                binding("b.example.com", "web", 40002, false),
+                binding("api.example.com", "api", 40003, false),
+            ],
+            &[],
+            None,
+            false,
+        )
         .unwrap();
         let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
         let web_ports = yaml["services"]["web"]["ports"].as_sequence().unwrap();
@@ -3281,6 +3597,123 @@ mod tests {
             yaml["services"]["api"]["ports"][0].as_str(),
             Some("127.0.0.1:40003:3000")
         );
+    }
+
+    #[test]
+    fn override_caps_every_service_of_an_ephemeral_project() {
+        let limits = ResourceLimits {
+            memory_mb: 256,
+            cpu_millis: 250,
+        };
+        let rendered = render_override(
+            &[binding("pr.example.com", "web", 40010, false)],
+            &["web".into(), "worker".into()],
+            Some(&limits),
+            true,
+        )
+        .unwrap();
+        let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
+        for service in ["web", "worker"] {
+            let svc = &yaml["services"][service];
+            assert_eq!(svc["mem_limit"].as_str(), Some("256m"));
+            assert_eq!(svc["memswap_limit"].as_str(), Some("256m"));
+            assert_eq!(svc["cpus"].as_str(), Some("0.25"));
+            assert_eq!(svc["pids_limit"].as_u64(), Some(1024));
+            let limits = &svc["deploy"]["resources"]["limits"];
+            assert_eq!(limits["memory"].as_str(), Some("256m"));
+            assert_eq!(limits["cpus"].as_str(), Some("0.25"));
+        }
+        // Ports replace the source ones instead of merging with them.
+        assert!(rendered.contains("ports: !override"), "{rendered}");
+        assert!(rendered.contains("ports: !reset []"), "{rendered}");
+        let Yaml::Tagged(web) = &yaml["services"]["web"]["ports"] else {
+            panic!("web ports must be tagged: {rendered}");
+        };
+        assert_eq!(web.tag, serde_yaml::value::Tag::new("override"));
+        assert_eq!(web.value[0].as_str(), Some("127.0.0.1:40010:3000"));
+        let Yaml::Tagged(worker) = &yaml["services"]["worker"]["ports"] else {
+            panic!("worker ports must be reset: {rendered}");
+        };
+        assert_eq!(worker.tag, serde_yaml::value::Tag::new("reset"));
+
+        let too_small = ResourceLimits {
+            memory_mb: 1,
+            cpu_millis: 250,
+        };
+        assert!(render_override(&[], &["web".into()], Some(&too_small), true).is_err());
+        assert!(render_override(&[], &["bad name".into()], Some(&limits), true).is_err());
+        assert!(render_override(&[], &["bad name".into()], None, true).is_err());
+    }
+
+    #[test]
+    fn previews_only_publish_managed_loopback_ports() {
+        let bindings = [binding("pr.example.com", "web", 40010, false)];
+        let model = |ports: serde_json::Value| serde_json::json!({ "services": { "web": { "ports": ports }, "db": {} } });
+        let managed = serde_json::json!([
+            { "host_ip": "127.0.0.1", "target": 3000, "published": "40010" }
+        ]);
+        assert!(effective_publications_are_managed(&model(managed), &bindings).is_ok());
+        for bad in [
+            // A source publication merged next to the managed one.
+            serde_json::json!([
+                { "host_ip": "127.0.0.1", "target": 3000, "published": "40010" },
+                { "target": 80, "published": "8080" }
+            ]),
+            serde_json::json!([{ "host_ip": "0.0.0.0", "target": 3000, "published": "40010" }]),
+            serde_json::json!([{ "host_ip": "127.0.0.1", "target": 3000, "published": "40011" }]),
+        ] {
+            assert!(
+                effective_publications_are_managed(&model(bad.clone()), &bindings).is_err(),
+                "{bad}"
+            );
+        }
+        let db_port = serde_json::json!({ "services": { "db": { "ports": [
+            { "host_ip": "127.0.0.1", "target": 5432, "published": "5432" }
+        ] } } });
+        assert!(effective_publications_are_managed(&db_port, &bindings).is_err());
+    }
+
+    #[test]
+    fn previews_cannot_reach_other_projects_resources() {
+        let ok: Yaml = serde_yaml::from_str(
+            "services:\n  web:\n    image: nginx\n    volumes: [data:/data]\n    network_mode: service:db\n  db:\n    image: postgres\nvolumes:\n  data: {}\nnetworks:\n  internal:\n    external: false\n",
+        )
+        .unwrap();
+        ephemeral_policy(&ok).unwrap();
+        for bad in [
+            "services:\n  web:\n    image: nginx\nvolumes:\n  data:\n    name: shop_data\n",
+            "services:\n  web:\n    image: nginx\nvolumes:\n  data:\n    external: true\n",
+            "services:\n  web:\n    image: nginx\nvolumes:\n  data:\n    external:\n      name: shop_data\n",
+            "services:\n  web:\n    image: nginx\nnetworks:\n  prod:\n    external: true\n",
+            "services:\n  web:\n    image: nginx\nnetworks:\n  prod:\n    name: shop_default\n",
+            "services:\n  web:\n    image: nginx\n    volumes_from: [shop-db-1]\n",
+            "services:\n  web:\n    image: nginx\n    external_links: [shop-db-1]\n",
+            "services:\n  web:\n    image: nginx\n    network_mode: container:shop-db-1\n",
+            "services:\n  web:\n    image: nginx\n    pid: container:shop-db-1\n",
+        ] {
+            let yaml: Yaml = serde_yaml::from_str(bad).unwrap();
+            assert!(ephemeral_policy(&yaml).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_the_previews_own_volumes_are_removed() {
+        let listing = "shop-pr-1_data\nshop-pr-1_cache\nshop_data\nshop-pr-12_data\nshop-pr-1_\nshop-pr-1_x;rm\nother\n";
+        assert_eq!(
+            owned_volume_names("shop-pr-1", listing),
+            vec!["shop-pr-1_data", "shop-pr-1_cache"]
+        );
+    }
+
+    #[test]
+    fn named_certificates_skip_acme_and_are_validated() {
+        let mut wildcard = binding("shop-pr-1.preview.example.com", "web", 40011, true);
+        wildcard.certificate = Some("preview.example.com".into());
+        // No ACME email needed: certbot is never asked for a wildcard.
+        assert!(validate_bindings(std::slice::from_ref(&wildcard), None).is_ok());
+        assert_eq!(certificate_of(&wildcard), "preview.example.com");
+        wildcard.certificate = Some("../../etc".into());
+        assert!(validate_bindings(&[wildcard], None).is_err());
     }
 
     #[test]

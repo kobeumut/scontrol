@@ -30,6 +30,8 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 rustix = { version = "1", features = ["fs", "pty", "termios", "stdio", "process"] }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 
 [features]

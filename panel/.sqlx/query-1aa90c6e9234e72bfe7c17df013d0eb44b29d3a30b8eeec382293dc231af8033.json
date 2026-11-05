@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO compose_projects\n               (id, name, slug, owner_user_id, environment_id, env_layered, source)\n           VALUES ($1, $2, $3, $4, $5, TRUE, $6)\n           RETURNING id, name, slug, owner_user_id, environment_id, env_layered, source, status,\n                     created_at, updated_at",
+  "query": "SELECT id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status, created_at, updated_at FROM compose_projects WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -35,33 +35,33 @@
       },
       {
         "ordinal": 6,
+        "name": "server_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
         "name": "source",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Text",
-        "Uuid",
-        "Uuid",
-        "Jsonb"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -74,8 +74,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "7f86325247b0dc0c2f1ad72760a2be4654255dbf842065e95ee1e75d54fdb485"
+  "hash": "1aa90c6e9234e72bfe7c17df013d0eb44b29d3a30b8eeec382293dc231af8033"
 }

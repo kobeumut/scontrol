@@ -21,6 +21,9 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RuntimeDirectory=scontrol
 RuntimeDirectoryMode=0750
+# Keep /run/scontrol/remote (SSH-forwarded agent sockets of remote servers)
+# across agent restarts; the agent replaces its own socket on start.
+RuntimeDirectoryPreserve=yes
 UMask=0007
 
 [Install]
