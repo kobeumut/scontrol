@@ -51,6 +51,10 @@ Durable project context that is not obvious from the code. Read it together with
   - Jobs run only inside a project's containers. Host jobs as root would be arbitrary root execution from the panel, and the per-site `cron` adapter already covers site users.
   - How to apply: a new scheduled feature (backups, Docker cleanup) adds a helper mode or reuses this one with typed parameters, never a command in a unit file or crontab.
 
+- **A volume backup/restore that stops a service must start it again on every path (decided 2026-11-05, GENE-84).** `with_service_stopped` in `adapters/backup.rs` runs an S3 preflight before stopping, arms a `RestartGuard` before `stop`, and reports a failed restart together with the work error.
+  - Why: the old code started the service only after `work.await` returned and dropped the restart error when `work` failed, so a cancelled or panicking operation, or a failing `docker compose start`, left the service down without telling the operator (same failure class as Dokploy #5852/#3995).
+  - How to apply: anything else that stops a service around a host operation reuses `with_service_stopped` (or the same guard pattern): preflight first, guard armed before stop, never `if result.is_ok() { restarted? }`.
+
 ## Request statistics and Docker cleanup (GENE-74)
 
 - Decision: the agent's access-log reader keeps no state; panel-api owns the inode and offset and commits them with the buckets.
