@@ -13,8 +13,14 @@ pub struct Cursor {
     pub byte_offset: i64,
 }
 
-pub async fn cursor(pool: &PgPool) -> sqlx::Result<Cursor> {
-    sqlx::query_as("SELECT file_id, byte_offset FROM nginx_log_cursor WHERE id = 1")
+/// The log cursor of `server`, created at offset 0 on first use.
+pub async fn cursor(pool: &PgPool, server: Uuid) -> sqlx::Result<Cursor> {
+    sqlx::query("INSERT INTO nginx_log_cursor (server_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(server)
+        .execute(pool)
+        .await?;
+    sqlx::query_as("SELECT file_id, byte_offset FROM nginx_log_cursor WHERE server_id = $1")
+        .bind(server)
         .fetch_one(pool)
         .await
 }
@@ -22,6 +28,7 @@ pub async fn cursor(pool: &PgPool) -> sqlx::Result<Cursor> {
 /// Adds the buckets and moves the cursor in one transaction.
 pub async fn apply_chunk(
     pool: &PgPool,
+    server: Uuid,
     buckets: &[RequestBucket],
     file_id: Option<u64>,
     next_offset: u64,
@@ -60,33 +67,45 @@ pub async fn apply_chunk(
     sqlx::query(
         "UPDATE nginx_log_cursor
          SET file_id = $1, byte_offset = $2, last_read_at = now(), last_error = NULL
-         WHERE id = 1",
+         WHERE server_id = $3",
     )
     .bind(file_id.map(|v| v as i64))
     .bind(next_offset as i64)
+    .bind(server)
     .execute(&mut *tx)
     .await?;
     tx.commit().await
 }
 
-pub async fn set_cursor_error(pool: &PgPool, error: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE nginx_log_cursor SET last_error = $1 WHERE id = 1")
-        .bind(error)
-        .execute(pool)
-        .await?;
+pub async fn set_cursor_error(pool: &PgPool, server: Uuid, error: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO nginx_log_cursor (server_id, last_error) VALUES ($2, $1)
+         ON CONFLICT (server_id) DO UPDATE SET last_error = EXCLUDED.last_error",
+    )
+    .bind(error)
+    .bind(server)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct CursorStatus {
+    pub server_id: Uuid,
+    pub server_name: String,
     pub last_read_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }
 
-pub async fn cursor_status(pool: &PgPool) -> sqlx::Result<CursorStatus> {
-    sqlx::query_as("SELECT last_read_at, last_error FROM nginx_log_cursor WHERE id = 1")
-        .fetch_one(pool)
-        .await
+/// How reading each server's log went (servers never read are absent).
+pub async fn cursor_statuses(pool: &PgPool) -> sqlx::Result<Vec<CursorStatus>> {
+    sqlx::query_as(
+        "SELECT c.server_id, s.name AS server_name, c.last_read_at, c.last_error
+         FROM nginx_log_cursor c JOIN servers s ON s.id = c.server_id
+         ORDER BY (c.server_id <> '00000000-0000-0000-0000-000000000000'), s.name",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn prune_stats(pool: &PgPool, keep_days: i32) -> sqlx::Result<u64> {
@@ -207,6 +226,7 @@ pub async fn save_cleanup_settings(
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct CleanupRun {
     pub id: Uuid,
+    pub server_id: Uuid,
     pub trigger: String,
     pub status: String,
     pub older_than_hours: i32,
@@ -217,7 +237,8 @@ pub struct CleanupRun {
     pub error_message: Option<String>,
 }
 
-const RUN_COLUMNS: &str = "id, trigger, status, older_than_hours, started_at, finished_at,
+const RUN_COLUMNS: &str =
+    "id, server_id, trigger, status, older_than_hours, started_at, finished_at,
     images_freed_bytes, builder_freed_bytes, error_message";
 
 pub async fn recent_runs(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<CleanupRun>> {
@@ -232,18 +253,20 @@ pub async fn recent_runs(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<CleanupR
 /// Starts a run row. `Ok(None)` while another run is active.
 pub async fn start_run(
     pool: &PgPool,
+    server: Uuid,
     trigger: &str,
     older_than_hours: i32,
 ) -> sqlx::Result<Option<CleanupRun>> {
     sqlx::query_as(&format!(
-        "INSERT INTO docker_cleanup_runs (id, trigger, status, older_than_hours)
-         VALUES ($1, $2, 'running', $3)
+        "INSERT INTO docker_cleanup_runs (id, trigger, status, older_than_hours, server_id)
+         VALUES ($1, $2, 'running', $3, $4)
          ON CONFLICT DO NOTHING
          RETURNING {RUN_COLUMNS}"
     ))
     .bind(Uuid::new_v4())
     .bind(trigger)
     .bind(older_than_hours)
+    .bind(server)
     .fetch_optional(pool)
     .await
 }
@@ -285,10 +308,17 @@ pub async fn fail_interrupted_runs(pool: &PgPool) -> sqlx::Result<u64> {
     .rows_affected())
 }
 
-pub async fn last_scheduled_start(pool: &PgPool) -> sqlx::Result<Option<DateTime<Utc>>> {
-    sqlx::query_scalar("SELECT MAX(started_at) FROM docker_cleanup_runs WHERE trigger = 'schedule'")
-        .fetch_one(pool)
-        .await
+pub async fn last_scheduled_start(
+    pool: &PgPool,
+    server: Uuid,
+) -> sqlx::Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        "SELECT MAX(started_at) FROM docker_cleanup_runs
+         WHERE trigger = 'schedule' AND server_id = $1",
+    )
+    .bind(server)
+    .fetch_one(pool)
+    .await
 }
 
 /// Keeps the newest 100 cleanup runs.

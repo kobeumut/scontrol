@@ -176,6 +176,105 @@ random_cookie_key() {
   openssl rand -base64 32
 }
 
+# The `[remote]` listener of an agent-only install: mutual TLS on the
+# chosen port, reachable only from the panel's address (UFW).
+readonly REMOTE_PORT_DEFAULT=7843
+
+write_remote_section() {
+  local port="$1"
+  cat >> "${CONFIG_ROOT}/agent.toml" <<EOF
+
+[remote]
+listen = "0.0.0.0:${port}"
+ca_cert = "${CONFIG_ROOT}/remote/ca.pem"
+cert = "${CONFIG_ROOT}/remote/agent.pem"
+key = "${CONFIG_ROOT}/remote/agent.key"
+EOF
+}
+
+# Accepts an IPv4/IPv6 address or CIDR, nothing else (it goes into a UFW rule).
+valid_panel_source() {
+  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] \
+    || [[ "$1" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ && "$1" == *:* ]]
+}
+
+# Hostnames or IP addresses the panel will connect to (the certificate's name).
+valid_agent_host() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || valid_panel_source "$1"
+}
+
+# Agent-only install: a server managed by a scontrol panel elsewhere. No
+# PostgreSQL, panel-api, frontend, or GitHub automation here.
+main_agent() {
+  local repo_url="$1"
+  local docker_enabled=false mail_enabled=false antivirus_enabled=false builders_enabled=false
+  local agent_host panel_source port
+  read -r -p "Hostname or IP address the panel connects to (goes into this agent's certificate): " agent_host || true
+  valid_agent_host "$agent_host" || die "invalid host: ${agent_host}"
+  read -r -p "Panel address allowed to connect (IP or CIDR): " panel_source || true
+  valid_panel_source "$panel_source" || die "invalid address: ${panel_source}"
+  read -r -p "Listen port [${REMOTE_PORT_DEFAULT}]: " port || true
+  port="${port:-$REMOTE_PORT_DEFAULT}"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "invalid port: ${port}"
+  ask_yes_no "Install optional Docker support?" && docker_enabled=true
+  if [[ "$docker_enabled" == true ]]; then
+    ask_yes_no "Install application builders (Nixpacks, Railpack, Buildpacks) for apps without a Dockerfile?" \
+      && builders_enabled=true
+  fi
+  ask_yes_no "Install optional mail support (Postfix/Dovecot/DKIM)?" && mail_enabled=true
+  ask_yes_no "Install optional antivirus support (ClamAV)?" && antivirus_enabled=true
+
+  log "Installing base packages (agent only)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl git gnupg build-essential pkg-config libssl-dev \
+    nginx certbot python3-certbot-nginx ufw cron
+  install_rust
+  clone_or_update_source "$repo_url"
+  create_accounts_and_dirs
+  install_optional_packages "$docker_enabled" "$mail_enabled" "$antivirus_enabled"
+  [[ "$builders_enabled" == true ]] && install_builders
+  write_configuration "$docker_enabled" "$mail_enabled" "$antivirus_enabled"
+  write_remote_section "$port"
+
+  local features=""
+  [[ "$docker_enabled" == true ]] && features="${features:+$features,}docker"
+  [[ "$builders_enabled" == true ]] && features="${features:+$features,}builders"
+  [[ "$mail_enabled" == true ]] && features="${features:+$features,}mail"
+  [[ "$antivirus_enabled" == true ]] && features="${features:+$features,}antivirus"
+  log "Building panel-agent"
+  # shellcheck disable=SC1091
+  [[ -f /root/.cargo/env ]] && . /root/.cargo/env
+  pushd "${INSTALL_ROOT}/panel" >/dev/null
+  local -a cargo_args=(build --release -p panel-agent)
+  [[ -n "$features" ]] && cargo_args+=(--features "$features")
+  SQLX_OFFLINE=true cargo "${cargo_args[@]}"
+  install -m 0755 target/release/panel-agent /usr/local/bin/panel-agent
+  popd >/dev/null
+
+  # The private key is created here and never leaves this server.
+  install -d -o root -g root -m 0700 "${CONFIG_ROOT}/remote"
+  local csr
+  if [[ -f "${CONFIG_ROOT}/remote/agent.key" ]]; then
+    log "Keeping the existing agent key (rotate with: panel-agent remote-init --host ${agent_host} --force)"
+    csr="$(cat "${CONFIG_ROOT}/remote/agent.csr" 2>/dev/null || true)"
+  else
+    csr="$(panel-agent remote-init --host "$agent_host" --dir "${CONFIG_ROOT}/remote")"
+  fi
+
+  ufw allow from "$panel_source" to any port "$port" proto tcp comment 'scontrol panel to agent (mTLS)'
+  install -m 0644 "${INSTALL_ROOT}/systemd/panel-agent.service" /etc/systemd/system/panel-agent.service
+  systemctl daemon-reload
+  systemctl enable --now panel-agent.service
+
+  log "Agent installed. In the panel, open Servers, Add server, Mutual TLS:"
+  log "  address ${agent_host}:${port}, and paste this certificate signing request:"
+  printf '%s\n' "$csr"
+  log "Save the returned certificate as ${CONFIG_ROOT}/remote/agent.pem and the CA as ${CONFIG_ROOT}/remote/ca.pem."
+  log "The agent starts serving the panel as soon as both files exist; no restart is needed."
+}
+
 write_configuration() {
   local docker_enabled="$1" mail_enabled="$2" antivirus_enabled="$3"
   local env_file="${CONFIG_ROOT}/panel-api.env"
@@ -325,6 +424,10 @@ install_services() {
   install -m 0644 "${INSTALL_ROOT}/systemd/panel-api.service" /etc/systemd/system/panel-api.service
   install -m 0644 "${INSTALL_ROOT}/systemd/scontrol-git-sync.path" /etc/systemd/system/scontrol-git-sync.path
   install -m 0644 "${INSTALL_ROOT}/systemd/scontrol-git-sync.service" /etc/systemd/system/scontrol-git-sync.service
+  # Template for SSH-forwarded remote agents (`ssh_socket` servers); enabled
+  # per server by the operator, see the unit file.
+  install -m 0644 "${INSTALL_ROOT}/systemd/scontrol-agent-tunnel@.service" /etc/systemd/system/scontrol-agent-tunnel@.service
+  install -d -o root -g "$PANEL_GROUP" -m 0750 "${CONFIG_ROOT}/tunnels"
   install -m 0755 "${INSTALL_ROOT}/install/auto-pr.sh" /usr/local/lib/scontrol-auto-pr
 
   systemctl daemon-reload
@@ -345,6 +448,13 @@ main() {
 
   local repo_url="${SCONTROL_REPO_URL:-$REPO_URL_DEFAULT}"
   [[ "$repo_url" != *"REPLACE_ME"* ]] || die "set SCONTROL_REPO_URL to this project's Git repository URL"
+
+  # SCONTROL_ROLE=agent skips the question (unattended agent installs).
+  if [[ "${SCONTROL_ROLE:-}" == "agent" ]] \
+    || { [[ -z "${SCONTROL_ROLE:-}" ]] && ask_yes_no "Install only a remote agent (this server is managed by a scontrol panel on another server)?"; }; then
+    main_agent "$repo_url"
+    return
+  fi
 
   local docker_enabled=false mail_enabled=false antivirus_enabled=false
   local builders_enabled=false

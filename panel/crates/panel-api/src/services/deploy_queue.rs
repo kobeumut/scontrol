@@ -27,6 +27,7 @@
 use crate::db;
 use crate::db::compose_projects::ClaimedDeployment;
 use crate::error::{ApiError, ApiResult};
+use crate::services::agent_pool::AgentPool;
 use crate::services::database_services;
 use crate::services::env_layers;
 use crate::services::github_app::{self, GitHubApps};
@@ -68,7 +69,7 @@ impl DeployQueue {
     pub fn start_workers(
         &self,
         db: PgPool,
-        agent: Arc<dyn AdapterPort>,
+        agents: AgentPool,
         notifier: Notifier,
         secrets: SecretBox,
         github: GitHubApps,
@@ -76,11 +77,14 @@ impl DeployQueue {
         workers: usize,
     ) {
         for worker in 0..workers.max(1) {
-            let (db, agent, wake) = (db.clone(), agent.clone(), self.wake.clone());
+            let (db, agents, wake) = (db.clone(), agents.clone(), self.wake.clone());
             let (notifier, secrets, github) = (notifier.clone(), secrets.clone(), github.clone());
             let previews = previews.clone();
             tokio::spawn(async move {
-                worker_loop(worker, db, agent, notifier, secrets, github, previews, wake).await
+                worker_loop(
+                    worker, db, agents, notifier, secrets, github, previews, wake,
+                )
+                .await
             });
         }
     }
@@ -206,7 +210,7 @@ pub fn default_workers() -> usize {
 async fn worker_loop(
     worker: usize,
     db: PgPool,
-    agent: Arc<dyn AdapterPort>,
+    agents: AgentPool,
     notifier: Notifier,
     secrets: SecretBox,
     github: GitHubApps,
@@ -218,7 +222,26 @@ async fn worker_loop(
             Ok(Some(job)) => {
                 tracing::info!(worker, deployment_id = %job.id, project_id = %job.project_id, "deployment started");
                 let (project_id, deployment_id) = (job.project_id, job.id);
-                run_job(&db, agent.as_ref(), &secrets, &github, job).await;
+                // The job runs on the agent of the server its service is on.
+                match agents.for_service(&db, project_id).await {
+                    Ok(agent) => run_job(&db, agent.as_ref(), &secrets, &github, job).await,
+                    Err(error) => {
+                        let message = match &error {
+                            crate::error::ApiError::Core(core) => core.to_string(),
+                            other => other.to_string(),
+                        };
+                        tracing::error!(%deployment_id, %message, "no agent for the deployment");
+                        db::compose_projects::finish_deployment(
+                            &db,
+                            deployment_id,
+                            DeploymentStatus::Failed,
+                            Some(truncate(&message, MAX_ERROR_LEN)),
+                            None,
+                        )
+                        .await
+                        .ok();
+                    }
+                }
                 notifier.deployment_finished(db.clone(), project_id, deployment_id);
                 previews.deployment_finished(db.clone(), project_id, deployment_id);
                 continue;

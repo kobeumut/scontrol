@@ -1,5 +1,7 @@
+use crate::auth::api_keys::VerifiedKeys;
 use crate::auth::session::CookieCipher;
 use crate::config::ApiConfig;
+use crate::services::agent_pool::AgentPool;
 use crate::services::deploy_queue::DeployQueue;
 use crate::services::github_app::GitHubApps;
 use crate::services::metrics::MetricsCollector;
@@ -16,7 +18,12 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    /// The agent on this host (the `local` server).
     pub agent: Arc<dyn AdapterPort>,
+    /// Agents per server; services go to the agent of their server.
+    pub agents: AgentPool,
+    /// Recently verified API key secrets (see `auth::api_keys`).
+    pub api_keys: VerifiedKeys,
     pub cookie_cipher: CookieCipher,
     pub session_ttl_hours: i64,
     pub deploy_queue: DeployQueue,
@@ -35,9 +42,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: PgPool, config: &ApiConfig) -> Self {
+        let agent: Arc<dyn AdapterPort> =
+            Arc::new(AgentClient::new(config.agent_socket_path.clone()));
         Self {
             db,
-            agent: Arc::new(AgentClient::new(config.agent_socket_path.clone())),
+            agents: AgentPool::new(agent.clone(), SecretBox::derive(&config.secret_key)),
+            agent,
+            api_keys: VerifiedKeys::default(),
             cookie_cipher: CookieCipher::new(&config.cookie_key),
             session_ttl_hours: config.session_ttl_hours,
             deploy_queue: DeployQueue::new(),

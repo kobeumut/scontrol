@@ -15,6 +15,7 @@ struct ProjectRecord {
     owner_user_id: Uuid,
     environment_id: Uuid,
     env_layered: bool,
+    server_id: Uuid,
     source: serde_json::Value,
     status: String,
     created_at: DateTime<Utc>,
@@ -30,6 +31,7 @@ impl ProjectRecord {
             owner_user_id: self.owner_user_id,
             environment_id: self.environment_id,
             env_layered: self.env_layered,
+            server_id: self.server_id,
             source: serde_json::from_value(self.source)?,
             status: DeploymentStatus::from_str(&self.status).map_err(anyhow::Error::msg)?,
             created_at: self.created_at,
@@ -130,7 +132,7 @@ pub async fn create(
         r#"INSERT INTO compose_projects
                (id, name, slug, owner_user_id, environment_id, env_layered, source)
            VALUES ($1, $2, $3, $4, $5, TRUE, $6)
-           RETURNING id, name, slug, owner_user_id, environment_id, env_layered, source, status,
+           RETURNING id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status,
                      created_at, updated_at"#,
         id,
         name,
@@ -147,7 +149,7 @@ pub async fn create(
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<ComposeProject>> {
     let record = sqlx::query_as!(
         ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects WHERE id = $1",
+        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status, created_at, updated_at FROM compose_projects WHERE id = $1",
         id,
     )
     .fetch_optional(pool)
@@ -155,27 +157,10 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<Compos
     record.map(ProjectRecord::into_project).transpose()
 }
 
-pub async fn list_for_owner(
-    pool: &PgPool,
-    owner_user_id: Uuid,
-) -> anyhow::Result<Vec<ComposeProject>> {
-    let records = sqlx::query_as!(
-        ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects WHERE owner_user_id = $1 ORDER BY created_at DESC",
-        owner_user_id,
-    )
-    .fetch_all(pool)
-    .await?;
-    records
-        .into_iter()
-        .map(ProjectRecord::into_project)
-        .collect()
-}
-
 pub async fn list_all(pool: &PgPool) -> anyhow::Result<Vec<ComposeProject>> {
     let records = sqlx::query_as!(
         ProjectRecord,
-        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, source, status, created_at, updated_at FROM compose_projects ORDER BY created_at DESC",
+        "SELECT id, name, slug, owner_user_id, environment_id, env_layered, server_id, source, status, created_at, updated_at FROM compose_projects ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await?;
