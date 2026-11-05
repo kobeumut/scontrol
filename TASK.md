@@ -80,6 +80,7 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
   - Environment values are masked first and `search` (case-insensitive substring) is applied second, so a search cannot probe for a secret.
   - UI: service filter, search, timestamps, follow/stop; the browser keeps the last 2,000 lines and does not auto-reconnect (that would replay the tail).
 - [x] Notifications (migration `0006`, `services/notifications.rs`, `routes/notifications.rs`, `frontend/src/Notifications.tsx`).
+  - Message size limits (2026-11-05): every channel's text is cut on `char` boundaries with a `... (log truncated)` marker so long build errors are never rejected: Telegram 4000 UTF-16 units (API limit 4096), Slack 3000, Discord 2000 characters, ntfy 4000 bytes, Gotify/webhook `message`/email 10 000 characters; titles 256 characters on one line; webhook `error_message` data 4000 characters. Telegram sends plain text (no `parse_mode`), so nothing needs HTML escaping.
   - Slack, Discord, Telegram, ntfy, Gotify, generic webhook (`X-Scontrol-Signature: sha256=<HMAC>`), and SMTP (STARTTLS/TLS; plain only to a loopback relay).
   - Per-channel event flags: `deploy_succeeded`, `deploy_failed`, `deploy_cancelled`. Sent in the background after each worker job; a test endpoint sends on demand.
   - The one secret per channel is AES-256-GCM sealed (`services/secret_box.rs`) with the channel ID and kind as associated data, and is write-only in the API. Stored errors drop request URLs (Slack/Discord/Telegram carry the secret there) and are redacted against the secret.
