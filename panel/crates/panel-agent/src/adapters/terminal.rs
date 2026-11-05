@@ -23,6 +23,16 @@ use panel_core::adapters::{
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::validate;
 use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+
+fn open_pty_master() -> rustix::io::Result<rustix::fd::OwnedFd> {
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY;
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+    let flags = flags | OpenptFlags::CLOEXEC;
+    let master = openpt(flags)?;
+    // Darwin's posix_openpt does not accept O_CLOEXEC.
+    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
+    Ok(master)
+}
 use rustix::termios::{tcsetwinsize, Winsize};
 use std::collections::HashMap;
 use std::io::Read;
@@ -139,8 +149,7 @@ impl Terminals {
         }
         let container = resolve_container(&params.project_slug, &params.service_name).await?;
 
-        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
-            .map_err(|e| CoreError::Io(format!("opening pty: {e}")))?;
+        let master = open_pty_master().map_err(|e| CoreError::Io(format!("opening pty: {e}")))?;
         grantpt(&master).map_err(|e| CoreError::Io(format!("grantpt: {e}")))?;
         unlockpt(&master).map_err(|e| CoreError::Io(format!("unlockpt: {e}")))?;
         let slave_path =
@@ -346,8 +355,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_process_on_the_pty_slave_reaches_the_master_and_resizes() {
-        let master =
-            openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).unwrap();
+        let master = open_pty_master().unwrap();
+        assert!(rustix::io::fcntl_getfd(&master)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC));
         grantpt(&master).unwrap();
         unlockpt(&master).unwrap();
         let name = ptsname(&master, Vec::new()).unwrap();

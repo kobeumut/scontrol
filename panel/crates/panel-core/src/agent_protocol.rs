@@ -45,7 +45,7 @@ pub enum AgentRequest {
     StopComposeProject(ComposeProjectActionParams),
     RestartComposeProject(ComposeProjectActionParams),
     SetDatabaseExposure(SetDatabaseExposureParams),
-    RemoveComposeProject(ComposeProjectActionParams),
+    RemoveComposeProject(RemoveComposeProjectParams),
     ListComposeProjectServices(ComposeProjectActionParams),
     ComposeProjectLogs(ComposeProjectLogsParams),
     FollowComposeLogs(FollowComposeLogsParams),

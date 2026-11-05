@@ -203,6 +203,7 @@ export type Server = {
 export type Permission =
   | 'projects:read' | 'projects:create' | 'projects:update' | 'projects:delete'
   | 'services:read' | 'services:create' | 'services:update' | 'services:delete' | 'services:deploy'
+  | 'services:terminal' | 'templates:install'
   | 'variables:read' | 'variables:update' | 'servers:read' | 'servers:manage'
   | 'access:manage' | 'system:admin';
 

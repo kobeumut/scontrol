@@ -114,6 +114,18 @@ pub async fn replace(
     Ok(())
 }
 
+/// Initialize a layer atomically with its new service and placement.
+pub async fn replace_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    secrets: &SecretBox,
+    scope: EnvScope,
+    pairs: &[(String, String)],
+) -> ApiResult<()> {
+    validate_pairs(pairs)?;
+    db::projects::replace_layer_in(tx, scope, &seal(secrets, scope, pairs)).await?;
+    Ok(())
+}
+
 /// Replaces a layer with `inputs`, keeping the stored value wherever an
 /// input omits it. Keys absent from `inputs` are removed. Returns the keys.
 pub async fn update(

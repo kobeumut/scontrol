@@ -67,6 +67,7 @@ async fn apply(
     loopback_port: u16,
     desired: Option<&DatabaseExposure>,
 ) -> CoreResult<()> {
+    let _guard = super::nginx::CONFIG_LOCK.lock().await;
     let previous = read_state(root).await;
     let path = stream_file(cfg, slug);
     let backup = tokio::fs::read_to_string(&path).await.ok();

@@ -24,6 +24,8 @@ pub enum Permission {
     ServicesUpdate,
     ServicesDelete,
     ServicesDeploy,
+    ServicesTerminal,
+    TemplatesInstall,
     VariablesRead,
     VariablesUpdate,
     ServersRead,
@@ -33,7 +35,7 @@ pub enum Permission {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 15] = [
+    pub const ALL: [Permission; 17] = [
         Permission::ProjectsRead,
         Permission::ProjectsCreate,
         Permission::ProjectsUpdate,
@@ -43,6 +45,8 @@ impl Permission {
         Permission::ServicesUpdate,
         Permission::ServicesDelete,
         Permission::ServicesDeploy,
+        Permission::ServicesTerminal,
+        Permission::TemplatesInstall,
         Permission::VariablesRead,
         Permission::VariablesUpdate,
         Permission::ServersRead,
@@ -62,6 +66,8 @@ impl Permission {
             Permission::ServicesUpdate => "services:update",
             Permission::ServicesDelete => "services:delete",
             Permission::ServicesDeploy => "services:deploy",
+            Permission::ServicesTerminal => "services:terminal",
+            Permission::TemplatesInstall => "templates:install",
             Permission::VariablesRead => "variables:read",
             Permission::VariablesUpdate => "variables:update",
             Permission::ServersRead => "servers:read",
@@ -84,6 +90,8 @@ impl Permission {
             Permission::ServicesUpdate => "Change domains, Git access, registries, and webhooks",
             Permission::ServicesDelete => "Delete services",
             Permission::ServicesDeploy => "Deploy, stop, cancel, and roll back services",
+            Permission::ServicesTerminal => "Open an interactive shell inside a service container",
+            Permission::TemplatesInstall => "Install vetted templates in an environment",
             Permission::VariablesRead => "See variable names (values are never returned)",
             Permission::VariablesUpdate => "Write service variables",
             Permission::ServersRead => "See servers and their status",
@@ -107,6 +115,8 @@ impl Permission {
                 | Permission::ServicesUpdate
                 | Permission::ServicesDelete
                 | Permission::ServicesDeploy
+                | Permission::ServicesTerminal
+                | Permission::TemplatesInstall
                 | Permission::VariablesRead
                 | Permission::VariablesUpdate
         )
@@ -306,6 +316,8 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
         name: "project-admin",
         description: "Full control of the projects, environments, and services in scope",
         permissions: &[
+            Permission::ServicesTerminal,
+            Permission::TemplatesInstall,
             Permission::ProjectsRead,
             Permission::ProjectsUpdate,
             Permission::ProjectsDelete,

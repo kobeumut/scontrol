@@ -26,7 +26,8 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use panel_core::adapters::{
     CancelDeploymentParams, ComposeProjectActionParams, ComposeProjectLogsParams,
-    DeploymentLogParams, FollowComposeLogsParams, GitHttpCredentials, WriteGitCredentialsParams,
+    DeploymentLogParams, FollowComposeLogsParams, GitHttpCredentials, RemoveComposeProjectParams,
+    WriteGitCredentialsParams,
 };
 use panel_core::rbac::{Permission, Target};
 use panel_core::types::validate::GitTransport;
@@ -286,11 +287,11 @@ async fn create(
             .agents
             .for_server_id(&state.db, project.server_id)
             .await?
-            .remove_compose_project(ComposeProjectActionParams {
+            .remove_compose_project(RemoveComposeProjectParams {
                 project_slug: project.slug.clone(),
+                expected_project_id: Some(project.id),
             })
-            .await
-            .ok();
+            .await?;
         db::compose_projects::delete(&state.db, project.id)
             .await
             .ok();
@@ -604,7 +605,7 @@ async fn remove(
     // it, but their containers, volumes and vhosts would not.
     let pending = crate::services::previews::close_all(
         &state.db,
-        state.agent.as_ref(),
+        &state.agents,
         &state.previews,
         id,
         "removed",
@@ -619,8 +620,9 @@ async fn remove(
         .agents
         .for_server_id(&state.db, project.server_id)
         .await?
-        .remove_compose_project(ComposeProjectActionParams {
+        .remove_compose_project(RemoveComposeProjectParams {
             project_slug: project.slug.clone(),
+            expected_project_id: Some(project.id),
         })
         .await
     {

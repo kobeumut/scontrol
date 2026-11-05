@@ -8,7 +8,7 @@
 //! Nginx validation (`nginx -t`) and rollback happen in the agent during the
 //! redeploy this endpoint queues.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, ServiceAccess};
 use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use panel_core::adapters::WriteVhostSecretsParams;
+use panel_core::rbac::Permission;
 use panel_core::types::{ComposeSource, DeploymentInfo};
 use panel_core::vhost::{
     validate_basic_auth_users, validate_certificate, BasicAuthUser, CustomCertificate,
@@ -30,7 +31,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn show(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path((id, domain_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<VhostOptions>> {
@@ -103,11 +104,20 @@ pub fn validate_update(previous: &VhostOptions, body: &UpdateOptionsBody) -> Res
 }
 
 async fn update(
-    AdminUser(user): AdminUser,
+    access: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path((id, domain_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<UpdateOptionsBody>,
+    Json(mut body): Json<UpdateOptionsBody>,
 ) -> ApiResult<(StatusCode, Json<Updated>)> {
+    let user = &access.principal;
+    if body.redeploy {
+        user.require(Permission::ServicesDeploy, access.service.target())?;
+    }
+    let touches_secrets = !matches!(body.basic_auth, SecretChange::Keep)
+        || !matches!(body.certificate, SecretChange::Keep);
+    if touches_secrets {
+        user.require(Permission::VariablesUpdate, access.service.target())?;
+    }
     let project = db::compose_projects::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Compose project not found".into()))?;
@@ -116,6 +126,8 @@ async fn update(
         .into_iter()
         .find(|d| d.id == domain_id)
         .ok_or_else(|| ApiError::NotFound("domain binding not found".into()))?;
+    // Never allow a caller to select another generation, even on a Keep update.
+    body.options.secret_revision = domain.options.secret_revision;
     validate_update(&domain.options, &body).map_err(ApiError::BadRequest)?;
     if body.options.custom_cert && !domain.https {
         return Err(ApiError::BadRequest(
@@ -127,24 +139,39 @@ async fn update(
             "a path prefix is only available for container services".into(),
         ));
     }
-    let touches_secrets = !matches!(body.basic_auth, SecretChange::Keep)
-        || !matches!(body.certificate, SecretChange::Keep);
     if touches_secrets {
+        body.options.secret_revision = Some(Uuid::new_v4());
         state
-            .agent
+            .agents
+            .for_service(&state.db, id)
+            .await?
             .write_vhost_secrets(WriteVhostSecretsParams {
                 project_slug: project.slug.clone(),
                 domain: domain.domain.clone(),
+                revision: body.options.secret_revision.expect("assigned above"),
+                previous_revision: domain.options.secret_revision,
                 basic_auth: body.basic_auth,
                 certificate: body.certificate,
             })
             .await?;
     }
-    db::compose_projects::set_domain_options(&state.db, id, domain_id, &body.options).await?;
+    if !db::compose_projects::set_domain_options(
+        &state.db,
+        id,
+        domain_id,
+        &domain.options,
+        &body.options,
+    )
+    .await?
+    {
+        return Err(ApiError::Conflict(
+            "domain options changed; reload before retrying".into(),
+        ));
+    }
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "update_domain_options",
         Some(&domain.domain),
         serde_json::json!({

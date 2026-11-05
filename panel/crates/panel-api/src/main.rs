@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     );
     state
         .previews
-        .start_sweeper(state.db.clone(), state.agent.clone());
+        .start_sweeper(state.db.clone(), state.agents.clone());
     tracing::info!(
         workers = config.deploy_workers,
         "deployment workers started"

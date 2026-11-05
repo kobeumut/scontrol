@@ -322,8 +322,17 @@ pub async fn replace_layer(
     scope: EnvScope,
     variables: &[SealedVariable],
 ) -> sqlx::Result<()> {
-    let (project, environment, service) = scope.columns();
     let mut tx = pool.begin().await?;
+    replace_layer_in(&mut tx, scope, variables).await?;
+    tx.commit().await
+}
+
+pub async fn replace_layer_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: EnvScope,
+    variables: &[SealedVariable],
+) -> sqlx::Result<()> {
+    let (project, environment, service) = scope.columns();
     sqlx::query!(
         r#"DELETE FROM env_variables
            WHERE ($1::uuid IS NOT NULL AND project_id = $1)
@@ -333,7 +342,7 @@ pub async fn replace_layer(
         environment,
         service,
     )
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     for variable in variables {
         sqlx::query!(
@@ -347,7 +356,7 @@ pub async fn replace_layer(
             variable.key,
             variable.value_sealed,
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
     if let Some(service) = service {
@@ -355,8 +364,8 @@ pub async fn replace_layer(
             "UPDATE compose_projects SET env_layered = TRUE, updated_at = now() WHERE id = $1",
             service
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
-    tx.commit().await
+    Ok(())
 }
