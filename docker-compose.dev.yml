@@ -1,0 +1,73 @@
+# Standalone development stack, not an override of docker-compose.yml.
+name: scontrol-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: scontrol
+      POSTGRES_PASSWORD: scontrol
+      POSTGRES_DB: scontrol
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scontrol -d scontrol"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: api
+    init: true
+    environment:
+      DATABASE_URL: postgres://scontrol:scontrol@postgres:5432/scontrol
+      PANEL_API_BIND: 0.0.0.0:8080
+      PANEL_AGENT_SOCKET: /run/scontrol/agent.sock
+      PANEL_COOKIE_KEY: ${SCONTROL_DEV_COOKIE_KEY:?Generate docker-dev.env as described in README.md}
+      PANEL_SECRET_KEY: ${SCONTROL_DEV_SECRET_KEY:?Generate docker-dev.env as described in README.md}
+      SQLX_OFFLINE: "true"
+      # Keep development builds small; override locally if debugger symbols are needed.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    command:
+      - /bin/sh
+      - -ec
+      - cargo build --locked -p panel-api -p panel-cli && exec target/debug/panel-api
+    ports:
+      - "127.0.0.1:${SCONTROL_DEV_API_PORT:-8080}:8080"
+    volumes:
+      - ./panel:/workspace/panel:ro
+      - cargo_cache:/home/scontrol/.cargo
+      - cargo_target:/workspace/panel/target
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: frontend
+    init: true
+    environment:
+      SCONTROL_API: http://api:8080
+    command:
+      - /bin/sh
+      - -ec
+      - npm ci && exec npm run dev -- --host 0.0.0.0 --port 5173 --strictPort
+    ports:
+      - "127.0.0.1:${SCONTROL_DEV_WEB_PORT:-5173}:5173"
+    volumes:
+      - ./panel/frontend:/app:ro
+      - node_modules:/app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  cargo_cache:
+  cargo_target:
+  node_modules:

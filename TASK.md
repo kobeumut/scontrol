@@ -150,6 +150,7 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 - [x] systemd API/agent units and non-secret managed-config PR watcher.
 - [x] Auto-commit/PR script only stages allow-listed agent config snapshots and rejects secret-looking keys.
 - [x] Wire frontend build and Nginx static/API reverse proxy into installer.
+- [x] Add standalone `docker-compose.dev.yml` and unprivileged `Dockerfile.dev` targets for frontend/API/PostgreSQL, with isolated dependency caches, persistent external keys, loopback-only ports, and README setup/cleanup/agent limitations. Keep the existing database-only Compose workflow unchanged.
 - [ ] Clean-VM Ubuntu 24.04 installer E2E test.
 
 ## Web frontend
@@ -162,6 +163,12 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 - [ ] Hosted sites screens (create/delete site, TLS) are still read-only.
 
 ## Validation
+
+Development Compose validation, 2026-11-05:
+
+- [x] Compose config validation; both development toolchain images built; PostgreSQL became healthy and Vite served on its container port. Host release workspace build, clippy, fmt check, frontend build, and 42 workspace tests against a disposable fresh PostgreSQL database passed.
+- [ ] Full containerized API/bootstrap/proxy smoke: first Rust build was interrupted by host disk exhaustion and Docker stopping. Removed only the test project's containers/volumes/images and restarted Docker; disabled development debug symbols/incremental compilation to reduce future disk usage. Retry with sufficient free disk space. The first host test run used an existing newer database and failed (`migration 8 was previously applied but is missing in the resolved migrations`); fresh isolated database passed without touching existing data.
+- [ ] Review existing frontend dependency vulnerabilities: container `npm ci` reported two high-severity advisories; no dependency updates included in this change.
 
 Latest run, 2026-11-03, D2 private Git plus the mail and legacy-container argv fixes:
 
