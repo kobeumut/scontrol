@@ -17,7 +17,7 @@ use panel_core::schedule::{JobRunInfo, ScheduledJob};
 use panel_core::types::{validate, DeploymentStatus};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::Sha256;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -35,6 +35,94 @@ pub const EVENTS: &[&str] = &[
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_LEN: usize = 300;
+
+/// Appended when a message is cut to fit a channel's size limit.
+const TRUNCATION_MARKER: &str = "\n... (log truncated)";
+/// Longest title any channel is sent, so the body always keeps some room.
+const MAX_TITLE_CHARS: usize = 256;
+/// Error text kept in a chat-style body, and in the webhook's structured data.
+const MAX_BODY_ERROR_CHARS: usize = 500;
+const MAX_DATA_ERROR_CHARS: usize = 4000;
+/// Telegram rejects `text` above 4096 characters (counted in UTF-16 code
+/// units) with "400 Bad Request: message is too long".
+const TELEGRAM_MAX_UTF16: usize = 4000;
+/// Discord rejects `content` above 2000 characters.
+const DISCORD_MAX_CHARS: usize = 2000;
+/// Slack limits section text to 3000 characters and truncates or rejects
+/// long `text` payloads.
+const SLACK_MAX_CHARS: usize = 3000;
+/// ntfy turns a message above 4096 bytes into an attachment, which fails on
+/// servers with attachments disabled.
+const NTFY_MAX_BYTES: usize = 4000;
+const NTFY_MAX_JSON_BYTES: usize = 8192;
+/// Gotify, the webhook `message`, and email have no hard limit; this keeps a
+/// runaway body bounded.
+const GENERIC_MAX_CHARS: usize = 10_000;
+
+/// The unit a channel measures message length in.
+#[derive(Debug, Clone, Copy)]
+enum Measure {
+    Chars,
+    Utf16,
+    Bytes,
+}
+
+impl Measure {
+    fn of_char(self, c: char) -> usize {
+        match self {
+            Self::Chars => 1,
+            Self::Utf16 => c.len_utf16(),
+            Self::Bytes => c.len_utf8(),
+        }
+    }
+
+    fn of(self, s: &str) -> usize {
+        s.chars().map(|c| self.of_char(c)).sum()
+    }
+}
+
+/// Cuts `text` to at most `max` units of `measure`, appending
+/// [`TRUNCATION_MARKER`] when anything was dropped. Cuts fall on `char`
+/// boundaries, so a multi-byte character or a UTF-16 surrogate pair is never
+/// split.
+fn truncate(text: &str, max: usize, measure: Measure) -> String {
+    if measure.of(text) <= max {
+        return text.to_string();
+    }
+    let marker = measure.of(TRUNCATION_MARKER);
+    let (budget, marker) = if max > marker {
+        (max - marker, TRUNCATION_MARKER)
+    } else {
+        (max, "")
+    };
+    let mut used = 0;
+    let mut end = 0;
+    for (index, c) in text.char_indices() {
+        used += measure.of_char(c);
+        if used > budget {
+            break;
+        }
+        end = index + c.len_utf8();
+    }
+    format!("{}{marker}", &text[..end])
+}
+
+/// Bounds a notification title and keeps it on one line.
+fn short_title(title: &str) -> String {
+    truncate(title, MAX_TITLE_CHARS, Measure::Chars).replace(['\r', '\n'], " ")
+}
+
+/// The message text for a chat channel: `head` (the formatted, already
+/// bounded title), a newline, and the body, fitted into `max`. The cut lands
+/// in the body, where long error logs live.
+fn chat_text(head: &str, body: &str, max: usize, measure: Measure) -> String {
+    truncate(&format!("{head}\n{body}"), max, measure)
+}
+
+/// An error message as carried in the webhook's structured data.
+fn data_error(error: &str) -> String {
+    truncate(error, MAX_DATA_ERROR_CHARS, Measure::Chars)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -284,7 +372,7 @@ impl Notification {
             body.push_str(&format!("\nDuration: {seconds}s"));
         }
         if let Some(error) = &deployment.error_message {
-            let error: String = error.chars().take(500).collect();
+            let error: String = error.chars().take(MAX_BODY_ERROR_CHARS).collect();
             body.push_str(&format!("\nError: {error}"));
         }
         Some(Self {
@@ -307,7 +395,7 @@ impl Notification {
                     "trigger": deployment.trigger,
                     "commit_sha": deployment.commit_sha,
                     "rollback_of": deployment.rollback_of,
-                    "error_message": deployment.error_message,
+                    "error_message": deployment.error_message.as_deref().map(data_error),
                     "queued_at": deployment.queued_at,
                     "started_at": deployment.started_at,
                     "finished_at": deployment.finished_at,
@@ -345,7 +433,7 @@ impl Notification {
             body.push_str(&format!("\nDuration: {seconds}s"));
         }
         if let Some(error) = &run.error_message {
-            let error: String = error.chars().take(500).collect();
+            let error: String = error.chars().take(MAX_BODY_ERROR_CHARS).collect();
             body.push_str(&format!("\nError: {error}"));
         }
         Self {
@@ -366,7 +454,7 @@ impl Notification {
                     "status": run.status,
                     "trigger": run.trigger,
                     "exit_code": run.exit_code,
-                    "error_message": run.error_message,
+                    "error_message": run.error_message.as_deref().map(data_error),
                     "started_at": run.started_at,
                     "finished_at": run.finished_at,
                     "duration_seconds": seconds,
@@ -551,34 +639,32 @@ async fn send(
     secret: Option<&str>,
     n: &Notification,
 ) -> Result<(), String> {
-    let text = format!("{}\n{}", n.title, n.body);
+    let title = short_title(&n.title);
     let request = match config {
-        ChannelConfig::Slack {} => http
-            .post(secret.unwrap_or_default())
-            .json(&json!({ "text": format!("*{}*\n{}", n.title, n.body) })),
-        ChannelConfig::Discord {} => {
-            let content: String = format!("**{}**\n{}", n.title, n.body)
-                .chars()
-                .take(2000)
-                .collect();
-            http.post(secret.unwrap_or_default())
-                .json(&json!({ "content": content }))
-        }
+        ChannelConfig::Slack {} => http.post(secret.unwrap_or_default()).json(&json!({
+            "text": chat_text(&format!("*{title}*"), &n.body, SLACK_MAX_CHARS, Measure::Chars),
+        })),
+        ChannelConfig::Discord {} => http.post(secret.unwrap_or_default()).json(&json!({
+            "content": chat_text(&format!("**{title}**"), &n.body, DISCORD_MAX_CHARS, Measure::Chars),
+        })),
+        // No `parse_mode`: the text is plain, so error output needs no
+        // HTML or Markdown escaping and cannot break entity parsing.
         ChannelConfig::Telegram { chat_id } => http
             .post(format!(
                 "https://api.telegram.org/bot{}/sendMessage",
                 secret.unwrap_or_default()
             ))
-            .json(&json!({ "chat_id": chat_id, "text": text, "disable_web_page_preview": true })),
+            .json(&json!({
+                "chat_id": chat_id,
+                "text": telegram_text(&title, &n.body),
+                "disable_web_page_preview": true,
+            })),
         ChannelConfig::Ntfy { server_url, topic } => {
             // JSON publishing to the server root keeps non-ASCII titles out
             // of HTTP headers.
-            let request = http.post(server_url.trim_end_matches('/')).json(&json!({
-                "topic": topic,
-                "title": n.title,
-                "message": n.body,
-                "priority": if n.urgent { 4 } else { 3 },
-            }));
+            let request = http
+                .post(server_url.trim_end_matches('/'))
+                .json(&ntfy_payload(topic, &title, &n.body, n.urgent));
             match secret {
                 Some(token) => request.bearer_auth(token),
                 None => request,
@@ -588,15 +674,15 @@ async fn send(
             .post(format!("{}/message", server_url.trim_end_matches('/')))
             .header("x-gotify-key", secret.unwrap_or_default())
             .json(&json!({
-                "title": n.title,
-                "message": n.body,
+                "title": title,
+                "message": truncate(&n.body, GENERIC_MAX_CHARS, Measure::Chars),
                 "priority": if n.urgent { 8 } else { 5 },
             })),
         ChannelConfig::Webhook { url } => {
             let mut payload = n.data.clone();
             payload["event"] = json!(n.event);
-            payload["title"] = json!(n.title);
-            payload["message"] = json!(n.body);
+            payload["title"] = json!(title);
+            payload["message"] = json!(truncate(&n.body, GENERIC_MAX_CHARS, Measure::Chars));
             let body = payload.to_string();
             let mut request = http
                 .post(url)
@@ -619,6 +705,28 @@ async fn send(
     }
     let body = response.text().await.unwrap_or_default();
     Err(format!("HTTP {status}: {}", body.trim()))
+}
+
+fn ntfy_payload(topic: &str, title: &str, body: &str, urgent: bool) -> Value {
+    let mut budget = NTFY_MAX_BYTES;
+    let mut payload = json!({
+        "topic": topic,
+        "title": title,
+        "message": truncate(body, budget, Measure::Bytes),
+        "priority": if urgent { 4 } else { 3 },
+    });
+    // ntfy limits the entire JSON request to twice its 4096-byte message limit.
+    // ponytail: halve only oversized escaped bodies; at most 12 bounded retries.
+    while payload.to_string().len() > NTFY_MAX_JSON_BYTES && budget > 0 {
+        budget /= 2;
+        payload["message"] = json!(truncate(body, budget, Measure::Bytes));
+    }
+    payload
+}
+
+/// The Telegram `text`: always within the API's 4096-character limit.
+fn telegram_text(title: &str, body: &str) -> String {
+    chat_text(title, body, TELEGRAM_MAX_UTF16, Measure::Utf16)
 }
 
 /// `sha256=<hex HMAC of the body>`, the same scheme GitHub uses.
@@ -650,13 +758,13 @@ async fn send_email(
     };
     let mut message = Message::builder()
         .from(from.parse().map_err(|_| "invalid sender address")?)
-        .subject(&n.title)
+        .subject(short_title(&n.title))
         .header(ContentType::TEXT_PLAIN);
     for address in to {
         message = message.to(address.parse().map_err(|_| "invalid recipient address")?);
     }
     let message = message
-        .body(n.body.clone())
+        .body(truncate(&n.body, GENERIC_MAX_CHARS, Measure::Chars))
         .map_err(|e| format!("building email: {e}"))?;
 
     let builder = match security {
@@ -802,6 +910,108 @@ mod tests {
         let clean = sanitize(&error, Some(secret));
         assert!(!clean.contains("very-secret"));
         assert!(clean.chars().count() <= MAX_ERROR_LEN);
+    }
+
+    fn failed_deployment(error: String) -> Notification {
+        Notification {
+            event: "deploy_failed",
+            title: "Deployment failed: shop".into(),
+            body: format!("Project: shop (shop)\nError: {error}"),
+            data: json!({}),
+            urgent: true,
+        }
+    }
+
+    #[test]
+    fn short_text_is_left_alone() {
+        assert_eq!(truncate("hello", 5, Measure::Chars), "hello");
+        assert_eq!(telegram_text("Title", "body"), "Title\nbody");
+    }
+
+    #[test]
+    fn telegram_text_fits_the_api_limit_and_marks_the_cut() {
+        let n = failed_deployment("x".repeat(20_000));
+        let text = telegram_text(&short_title(&n.title), &n.body);
+        assert!(text.encode_utf16().count() <= TELEGRAM_MAX_UTF16);
+        assert!(text.encode_utf16().count() < 4096);
+        assert!(text.starts_with("Deployment failed: shop\nProject: shop"));
+        assert!(text.ends_with("... (log truncated)"));
+    }
+
+    #[test]
+    fn truncation_never_splits_multi_byte_characters() {
+        // 2-byte, 3-byte, and 4-byte (a UTF-16 surrogate pair) characters.
+        for unit in ["ş", "日", "🚀"] {
+            let n = failed_deployment(unit.repeat(5_000));
+            let text = telegram_text(&n.title, &n.body);
+            assert!(text.encode_utf16().count() <= TELEGRAM_MAX_UTF16, "{unit}");
+            assert!(text.ends_with(TRUNCATION_MARKER), "{unit}");
+            let kept = text.trim_end_matches(TRUNCATION_MARKER);
+            assert!(kept.ends_with(unit), "{unit}");
+
+            let ntfy = truncate(&n.body, NTFY_MAX_BYTES, Measure::Bytes);
+            assert!(ntfy.len() <= NTFY_MAX_BYTES, "{unit}");
+            assert!(ntfy.ends_with(TRUNCATION_MARKER), "{unit}");
+        }
+        // Exactly at the limit is not cut; one unit over is.
+        let exact = "🚀".repeat(2_000);
+        assert_eq!(truncate(&exact, 4000, Measure::Utf16), exact);
+        let over = format!("{exact}a");
+        assert!(truncate(&over, 4000, Measure::Utf16).ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn every_chat_limit_is_respected() {
+        let body = "line of build output\n".repeat(2_000);
+        let head = format!("*{}*", short_title(&"T".repeat(1_000)));
+        assert!(head.chars().count() <= MAX_TITLE_CHARS + 2);
+        for (max, measure) in [
+            (SLACK_MAX_CHARS, Measure::Chars),
+            (DISCORD_MAX_CHARS, Measure::Chars),
+            (GENERIC_MAX_CHARS, Measure::Chars),
+        ] {
+            let text = chat_text(&head, &body, max, measure);
+            assert!(measure.of(&text) <= max);
+            assert!(text.ends_with(TRUNCATION_MARKER));
+        }
+        // A limit smaller than the marker still yields a bounded text.
+        assert_eq!(truncate("abcdef", 3, Measure::Chars), "abc");
+    }
+
+    #[test]
+    fn titles_are_bounded_and_single_line() {
+        let title = short_title("Deployment failed:\nshop\r");
+        assert_eq!(title, "Deployment failed: shop ");
+        let long = short_title(&"ğ".repeat(1_000));
+        assert!(long.chars().count() <= MAX_TITLE_CHARS);
+        assert!(!long.contains('\n'));
+    }
+
+    #[test]
+    fn ntfy_limits_the_serialized_request_too() {
+        for body in ["\u{0001}".repeat(4000), "\"\\\n🚀".repeat(2000)] {
+            let payload = ntfy_payload(
+                &"t".repeat(64),
+                &short_title(&"🚀".repeat(256)),
+                &body,
+                true,
+            );
+            let encoded = payload.to_string();
+            assert!(encoded.len() <= NTFY_MAX_JSON_BYTES);
+            assert!(payload["message"].as_str().unwrap().len() <= NTFY_MAX_BYTES);
+            assert!(payload["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(TRUNCATION_MARKER));
+            assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn webhook_error_data_is_bounded() {
+        let error = data_error(&"e".repeat(50_000));
+        assert!(error.chars().count() <= MAX_DATA_ERROR_CHARS);
+        assert!(error.ends_with(TRUNCATION_MARKER));
     }
 
     #[test]
