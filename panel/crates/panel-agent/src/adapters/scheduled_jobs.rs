@@ -732,7 +732,9 @@ async fn run_command(
 ) -> CoreResult<RunOutput> {
     let root = compose::project_root(cfg, &job.project_slug);
     // Every environment value of the project is masked, like deployments.
-    let secrets = compose::environment_secrets(&root).await?;
+    let paths = compose::existing_project_paths(cfg, &job.project_slug)?;
+    let secrets =
+        compose::resolved_environment_secrets(&root, &job.project_slug, &paths, &[]).await?;
     let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
     let mut log = DeployLog::create(runs_dir, run_id, JOB_LOG_MAX_BYTES, secrets, cancel).await?;
     // systemd runs one helper at a time, but a run whose helper was killed
@@ -800,7 +802,10 @@ async fn run_command(
             Some(code),
             Some(format!("the command exited with code {code}")),
         ),
-        Err(error) => (None, Some(error.message().to_string())),
+        Err(error) => (
+            None,
+            Some(deploy_log::redact(error.message(), log.secrets())),
+        ),
     };
     let summary = match (&exit_code, &error) {
         (Some(0), _) => "finished successfully".to_string(),
