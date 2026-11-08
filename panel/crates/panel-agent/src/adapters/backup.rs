@@ -599,6 +599,11 @@ async fn preflight_download(client: &S3Client, key: &str, secrets: &[&str]) -> C
         .await
         .map_err(|e| preflight_error(&e, secrets))?;
     if listing.iter().any(|object| object.key == key) {
+        // Opening a real GET checks GetObject, not merely ListBucket permission.
+        client
+            .open_download(key)
+            .await
+            .map_err(|e| preflight_error(&e, secrets))?;
         Ok(())
     } else {
         Err(CoreError::NotFound(format!(
@@ -682,6 +687,7 @@ impl ServiceControl for ComposeService {
 #[cfg(feature = "docker")]
 struct RestartGuard<S: ServiceControl> {
     service: Option<std::sync::Arc<S>>,
+    stop: Option<tokio::task::JoinHandle<CoreResult<()>>>,
 }
 
 #[cfg(feature = "docker")]
@@ -697,11 +703,16 @@ impl<S: ServiceControl> Drop for RestartGuard<S> {
         let Some(service) = self.service.take() else {
             return;
         };
+        let stop = self.stop.take();
         let name = service.name().to_string();
         tracing::warn!(service = %name, "volume backup/restore interrupted; starting the service again");
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move {
+                    // A cancelled caller must not restart ahead of an in-flight stop.
+                    if let Some(stop) = stop {
+                        let _ = stop.await;
+                    }
                     if let Err(error) = service.start().await {
                         tracing::error!(service = %service.name(), %error, "starting the service again failed");
                     }
@@ -736,10 +747,19 @@ async fn with_service_stopped<S: ServiceControl, T>(
     let service = std::sync::Arc::new(service);
     // Armed before `stop`: a stop that fails half-way may still have
     // stopped the container.
-    let guard = RestartGuard {
+    let stopping = service.clone();
+    let mut guard = RestartGuard {
         service: Some(service.clone()),
+        stop: Some(tokio::spawn(async move { stopping.stop().await })),
     };
-    let result = match service.stop().await {
+    let stopped = guard
+        .stop
+        .as_mut()
+        .unwrap()
+        .await
+        .unwrap_or_else(|e| Err(CoreError::External(format!("stopping service failed: {e}"))));
+    guard.stop.take();
+    let result = match stopped {
         Ok(()) => work.await,
         Err(error) => Err(error),
     };
@@ -1252,6 +1272,54 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn cancellation_during_stop_waits_before_restarting() {
+            #[derive(Clone)]
+            struct DelayedStop {
+                running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+                stopping: std::sync::Arc<tokio::sync::Notify>,
+            }
+            #[async_trait::async_trait]
+            impl ServiceControl for DelayedStop {
+                fn name(&self) -> &str {
+                    "web"
+                }
+                async fn stop(&self) -> CoreResult<()> {
+                    let running = self.running.clone();
+                    let stopped = tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        running.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    self.stopping.notify_one();
+                    stopped.await.unwrap();
+                    Ok(())
+                }
+                async fn start(&self) -> CoreResult<()> {
+                    self.running
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+            let service = DelayedStop {
+                running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stopping: std::sync::Arc::new(tokio::sync::Notify::new()),
+            };
+            let task = tokio::spawn(with_service_stopped(
+                Some(service.clone()),
+                "volume backup",
+                ok(),
+                std::future::pending::<CoreResult<()>>(),
+            ));
+            service.stopping.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                service.running.load(std::sync::atomic::Ordering::SeqCst),
+                "restart raced ahead of the external stop"
+            );
+        }
+
+        #[tokio::test]
         async fn panicking_operation_starts_the_service_again() {
             let service = FakeService::default();
             let task = tokio::spawn(with_service_stopped(
@@ -1301,7 +1369,9 @@ mod tests {
             let client = S3Client::new(&target(&endpoint)).unwrap();
             preflight_upload(&client, "pfx", &[]).await.unwrap();
             assert!(mock.objects.lock().unwrap().is_empty(), "probe deleted");
-            assert!(prune(&client, "pfx", "volume-app-data", 1).await.is_ok());
+            assert!(prune(&client, "pfx", "volume-app-data", "tar.gz", 1)
+                .await
+                .is_ok());
         }
 
         #[tokio::test]
@@ -1317,6 +1387,27 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, CoreError::NotFound(_)));
             assert!(err.message().contains("service was not stopped"));
+        }
+
+        #[tokio::test]
+        async fn get_denied_does_not_stop_a_service_even_when_listing_succeeds() {
+            let (endpoint, mock) = start_mock_s3().await;
+            let client = S3Client::new(&target(&endpoint)).unwrap();
+            let key = "pfx/backup.tar.gz";
+            client.put_object(key, b"x".to_vec()).await.unwrap();
+            *mock.deny_get.lock().unwrap() = true;
+            let service = FakeService::default();
+            let err = with_service_stopped(
+                Some(service.clone()),
+                "volume restore",
+                preflight_download(&client, key, &[]),
+                async { panic!("restore must not run without read permission") as CoreResult<()> },
+            )
+            .await
+            .unwrap_err();
+            assert!(err.message().contains("403"));
+            assert!(err.message().contains("service was not stopped"));
+            assert!(service.calls().is_empty());
         }
 
         #[tokio::test]
