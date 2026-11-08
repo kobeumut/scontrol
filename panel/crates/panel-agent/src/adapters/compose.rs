@@ -43,7 +43,7 @@
 use super::db_exposure;
 use super::deploy_log::{self, maskable_secrets, redact, DeployLog};
 use super::docker_config;
-use super::exec::{follow_lines, run, run_allow_nonzero, run_streamed};
+use super::exec::{follow_lines, run, run_allow_nonzero, run_allow_nonzero_within, run_streamed};
 use super::git_auth;
 use super::nginx::{self, VhostTarget};
 use super::releases;
@@ -683,6 +683,12 @@ fn parse_ps_json(output: &str) -> CoreResult<Vec<ComposeServiceInfo>> {
         .collect())
 }
 
+/// Hard limit for a one-shot `docker compose logs` read. A deleted or wedged
+/// container, or a dockerd that stopped answering, must not leave the
+/// process (and its plugin child) running: the exec layer stops the whole
+/// process group when this elapses.
+const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn logs(cfg: &AgentConfig, params: ComposeProjectLogsParams) -> CoreResult<String> {
     if validate::is_valid_project_slug(&params.project_slug)
         && static_release(cfg, &params.project_slug).is_some()
@@ -698,7 +704,7 @@ pub async fn logs(cfg: &AgentConfig, params: ComposeProjectLogsParams) -> CoreRe
     let mut args = compose_args(&params.project_slug, &paths);
     args.extend(["logs".into(), "--no-color".into(), "--tail".into(), tail]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
+    let (code, stdout, stderr) = run_allow_nonzero_within("docker", &refs, LOGS_TIMEOUT).await?;
     if code != 0 {
         return Err(CoreError::External(format!(
             "docker compose logs failed: {stderr}"
@@ -722,9 +728,24 @@ const FOLLOW_LIMIT: Duration = Duration::from_secs(60 * 60);
 static LOG_FOLLOWERS: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_LOG_FOLLOWERS)));
 
+/// With a search, history is looked for in up to this many recent lines per
+/// container, not only in the requested tail, so an older match is found.
+const SEARCH_SCAN_LINES: u32 = 20_000;
+/// The history scan of a search is stopped (process group included) after
+/// this long; whatever matched until then is still sent.
+const SEARCH_SCAN_LIMIT: Duration = Duration::from_secs(30);
+
 /// Follows container output with `docker compose logs --follow`. Each line
 /// is redacted with the project's environment values first and filtered by
 /// `search` second, so searching cannot reveal a masked value.
+///
+/// Without a search, `tail_lines` is handed to Docker as `--tail`. With a
+/// search, `tail_lines` counts *matching* lines: Docker would otherwise cut
+/// the history to the last N lines before the filter runs and an older match
+/// would never be shown. So the history up to a fixed instant `T` is scanned
+/// first (`--until T`, up to [`SEARCH_SCAN_LINES`] lines per container) and
+/// the last `tail_lines` matches per container are sent, then the live
+/// follower starts at `--since T`, which neither repeats nor skips a line.
 pub async fn follow_logs(
     cfg: &AgentConfig,
     params: FollowComposeLogsParams,
@@ -744,13 +765,7 @@ pub async fn follow_logs(
             )));
         }
     }
-    let needle = match params.search.as_deref().map(str::trim) {
-        Some(s) if s.len() > 200 || s.chars().any(char::is_control) => {
-            return Err(CoreError::Validation("invalid log search".into()));
-        }
-        Some(s) if !s.is_empty() => Some(s.to_lowercase()),
-        _ => None,
-    };
+    let needle = log_search_needle(params.search.as_deref())?;
     let permit = LOG_FOLLOWERS.clone().try_acquire_owned().map_err(|_| {
         CoreError::External("too many live log viewers are open; close one and retry".into())
     })?;
@@ -759,37 +774,202 @@ pub async fn follow_logs(
         .map(maskable_secrets)
         .unwrap_or_default();
 
-    let mut args = compose_args(&params.project_slug, &paths);
-    args.extend([
-        "logs".into(),
-        "--follow".into(),
-        "--no-color".into(),
-        "--tail".into(),
-        params.tail_lines.min(2_000).to_string(),
-    ]);
+    let base = compose_args(&params.project_slug, &paths);
+    let mut options = vec!["--no-color".to_string()];
     if params.timestamps {
-        args.push("--timestamps".into());
+        options.push("--timestamps".into());
     }
-    if let Some(service) = params.service {
-        args.extend(["--".into(), service]);
-    }
+    let selector: Vec<String> = match params.service {
+        Some(service) => vec!["--".into(), service],
+        None => Vec::new(),
+    };
+    let tail_lines = usize::from(params.tail_lines.min(2_000));
+    let logs_args = |mode: &[String]| -> Vec<String> {
+        let mut args = base.clone();
+        args.push("logs".into());
+        args.extend(options.iter().cloned());
+        args.extend(mode.iter().cloned());
+        args.extend(selector.iter().cloned());
+        args
+    };
+    let (history_args, follow_args) = match &needle {
+        None => (
+            None,
+            logs_args(&["--follow".into(), "--tail".into(), tail_lines.to_string()]),
+        ),
+        Some(_) => {
+            let instant = docker_timestamp(std::time::SystemTime::now());
+            let history = (tail_lines > 0).then(|| {
+                logs_args(&[
+                    "--tail".into(),
+                    SEARCH_SCAN_LINES.to_string(),
+                    "--until".into(),
+                    instant.clone(),
+                ])
+            });
+            (
+                history,
+                logs_args(&["--follow".into(), "--since".into(), instant]),
+            )
+        }
+    };
 
     let (tx, rx) = tokio::sync::mpsc::channel(LOG_LINES_CAPACITY);
     tokio::spawn(async move {
         let _permit = permit;
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let filter = |line: &str| {
-            let line = redact(line, &secrets);
-            match &needle {
-                Some(n) if !line.to_lowercase().contains(n) => None,
-                _ => Some(line),
+        let filter = |line: &str| filter_log_line(line, &secrets, needle.as_deref());
+        if let Some(args) = history_args {
+            match last_matches_per_container(&args, tail_lines, &tx, filter).await {
+                Ok(Some(lines)) => {
+                    for line in lines {
+                        if tx.send(Ok(line)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                // The client left during the scan.
+                Ok(None) => return,
+                Err(error) => {
+                    tx.send(Err(error)).await.ok();
+                    return;
+                }
             }
-        };
+        }
+        let refs: Vec<&str> = follow_args.iter().map(String::as_str).collect();
         if let Err(error) = follow_lines("docker", &refs, &tx, FOLLOW_LIMIT, filter).await {
             tx.send(Err(error)).await.ok();
         }
     });
     Ok(rx)
+}
+
+/// The normalized (trimmed, lower-cased) search, or `None` for no search.
+fn log_search_needle(search: Option<&str>) -> CoreResult<Option<String>> {
+    match search.map(str::trim) {
+        Some(s) if s.len() > 200 || s.chars().any(char::is_control) => {
+            Err(CoreError::Validation("invalid log search".into()))
+        }
+        Some(s) if !s.is_empty() => Ok(Some(s.to_lowercase())),
+        _ => Ok(None),
+    }
+}
+
+/// Redacts first, then filters, so a search can never probe for a secret.
+fn filter_log_line(line: &str, secrets: &[String], needle: Option<&str>) -> Option<String> {
+    let line = redact(line, secrets);
+    match needle {
+        Some(n) if !line.to_lowercase().contains(n) => None,
+        _ => Some(line),
+    }
+}
+
+/// A time Docker's `--since`/`--until` accept: Unix seconds with nanoseconds.
+fn docker_timestamp(at: std::time::SystemTime) -> String {
+    let since_epoch = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!(
+        "{}.{:09}",
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos()
+    )
+}
+
+/// Runs a bounded, non-following `docker compose logs` and keeps the last
+/// `keep` lines that pass `filter` for each container, in log order. Returns
+/// `Ok(None)` when `client` closed meanwhile; the scan's process group is
+/// stopped in every case before this returns.
+async fn last_matches_per_container(
+    args: &[String],
+    keep: usize,
+    client: &tokio::sync::mpsc::Sender<CoreResult<String>>,
+    filter: impl FnMut(&str) -> Option<String>,
+) -> CoreResult<Option<Vec<String>>> {
+    let (scan_tx, mut scan_rx) = tokio::sync::mpsc::channel(LOG_LINES_CAPACITY);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let scan = async move {
+        let result = follow_lines("docker", &refs, &scan_tx, SEARCH_SCAN_LIMIT, filter).await;
+        drop(scan_tx);
+        result
+    };
+    let collect = async move {
+        let mut kept = LastMatches::new(keep);
+        loop {
+            tokio::select! {
+                item = scan_rx.recv() => match item {
+                    Some(Ok(line)) => kept.push(line),
+                    Some(Err(error)) => return Err(error),
+                    None => return Ok(Some(kept.into_lines())),
+                },
+                // Dropping `scan_rx` (by returning) makes the scan stop its
+                // process group.
+                _ = client.closed() => return Ok(None),
+            }
+        }
+    };
+    let (scanned, collected) = tokio::join!(scan, collect);
+    scanned?;
+    collected
+}
+
+/// The last `keep` lines per container prefix (`name  | `), so a match in a
+/// quiet service is not pushed out by a noisy one, mirroring Docker's
+/// per-container `--tail`.
+struct LastMatches {
+    keep: usize,
+    bytes: usize,
+    per_container: Vec<(String, std::collections::VecDeque<String>)>,
+}
+
+impl LastMatches {
+    /// Distinct prefixes tracked; anything beyond shares one bucket.
+    const MAX_CONTAINERS: usize = 256;
+    // With at most 16 viewers, retained history consumes at most 32 MiB.
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+
+    fn new(keep: usize) -> Self {
+        Self {
+            keep,
+            bytes: 0,
+            per_container: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        if self.keep == 0 {
+            return;
+        }
+        let prefix = line
+            .split_once(" | ")
+            .map_or("", |(name, _)| name.trim_end());
+        let index = match self.per_container.iter().position(|(p, _)| p == prefix) {
+            Some(index) => index,
+            None if self.per_container.len() < Self::MAX_CONTAINERS => {
+                self.per_container
+                    .push((prefix.to_string(), std::collections::VecDeque::new()));
+                self.per_container.len() - 1
+            }
+            None => self.per_container.len() - 1,
+        };
+        let lines = &mut self.per_container[index].1;
+        if lines.len() == self.keep {
+            self.bytes -= lines.pop_front().unwrap().len();
+        }
+        self.bytes += line.len();
+        lines.push_back(line);
+        // ponytail: history beyond the byte budget is best-effort; evict by bucket.
+        for (_, lines) in &mut self.per_container {
+            while self.bytes > Self::MAX_BYTES {
+                let Some(old) = lines.pop_front() else { break };
+                self.bytes -= old.len();
+            }
+        }
+    }
+
+    fn into_lines(self) -> Vec<String> {
+        self.per_container
+            .into_iter()
+            .flat_map(|(_, lines)| lines)
+            .collect()
+    }
 }
 
 pub async fn read_deployment_log(
@@ -2872,6 +3052,77 @@ async fn write_action_log(root: &Path, stdout: &str, stderr: &str) -> CoreResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_search_keeps_the_last_matches_of_each_container() {
+        let mut kept = LastMatches::new(2);
+        for line in [
+            "web-1  | GET /a",
+            "db-1  | ready",
+            "web-1  | GET /b",
+            "web-1  | GET /c",
+            "no prefix",
+        ] {
+            kept.push(line.to_string());
+        }
+        // `db-1`'s single match survives three newer `web-1` matches.
+        assert_eq!(
+            kept.into_lines(),
+            [
+                "web-1  | GET /b",
+                "web-1  | GET /c",
+                "db-1  | ready",
+                "no prefix"
+            ]
+        );
+
+        let mut none = LastMatches::new(0);
+        none.push("web-1  | GET /a".into());
+        assert!(none.into_lines().is_empty());
+    }
+
+    #[test]
+    fn log_search_history_has_a_total_byte_budget() {
+        let mut kept = LastMatches::new(2000);
+        for container in 0..256 {
+            for _ in 0..4 {
+                kept.push(format!("web-{container} | {}", "x".repeat(16 * 1024)));
+                assert!(kept.bytes <= LastMatches::MAX_BYTES);
+            }
+        }
+        let lines = kept.into_lines();
+        assert!(lines.iter().map(String::len).sum::<usize>() <= LastMatches::MAX_BYTES);
+        assert!(lines.iter().any(|line| line.starts_with("web-255 | ")));
+    }
+
+    #[test]
+    fn log_search_redacts_before_matching() {
+        let secrets = vec!["hunter2-secret".to_string()];
+        assert_eq!(
+            filter_log_line("token=hunter2-secret", &secrets, Some("hunter2")),
+            None
+        );
+        assert_eq!(
+            filter_log_line("ERROR token=hunter2-secret", &secrets, Some("error")).as_deref(),
+            Some("ERROR token=********")
+        );
+        assert_eq!(filter_log_line("x", &secrets, None).as_deref(), Some("x"));
+
+        assert_eq!(
+            log_search_needle(Some("  GET ")).unwrap().as_deref(),
+            Some("get")
+        );
+        assert_eq!(log_search_needle(Some("   ")).unwrap(), None);
+        assert_eq!(log_search_needle(None).unwrap(), None);
+        assert!(log_search_needle(Some("a\nb")).is_err());
+        assert!(log_search_needle(Some(&"x".repeat(201))).is_err());
+    }
+
+    #[test]
+    fn docker_timestamps_carry_nanoseconds() {
+        let at = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 42);
+        assert_eq!(docker_timestamp(at), "1700000000.000000042");
+    }
 
     #[test]
     fn rejects_privileged_or_host_compose_features() {

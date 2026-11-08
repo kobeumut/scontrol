@@ -7,6 +7,7 @@
 //! injection surface, regardless of what bytes are in an argument value.
 
 use panel_core::error::{CoreError, CoreResult};
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Every program the agent may spawn, by bare name (resolved through the
@@ -63,17 +64,23 @@ fn check_program(program: &str) -> CoreResult<()> {
     }
 }
 
+/// Upper bound for a one-shot command whose caller does not pass its own.
+/// Generous enough for `docker compose down` on a large project or a
+/// `certbot` challenge; anything that legitimately runs longer streams
+/// through [`run_streamed`] or passes an explicit limit.
+pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Time a timed-out one-shot command's process group gets between SIGTERM
+/// and SIGKILL.
+const TIMEOUT_GRACE: Duration = Duration::from_secs(5);
+
 /// Runs `program` with `args`, returning stdout (as UTF-8, lossily decoded)
 /// on success. A non-zero exit status becomes a `CoreError::External` that
-/// includes stderr for diagnostics.
+/// includes stderr for diagnostics. Bounded by [`DEFAULT_EXEC_TIMEOUT`].
 pub async fn run(program: &str, args: &[&str]) -> CoreResult<String> {
     check_program(program)?;
     tracing::debug!(program, ?args, "exec");
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))?;
+    let output = output_within(program, args, &[], None, DEFAULT_EXEC_TIMEOUT).await?;
     checked_stdout(program, output)
 }
 
@@ -81,33 +88,14 @@ pub async fn run(program: &str, args: &[&str]) -> CoreResult<String> {
 /// that must not be visible in the process table (`ps` shows argv to every
 /// local user), such as SQL that carries a password.
 pub async fn run_with_stdin(program: &str, args: &[&str], stdin: &[u8]) -> CoreResult<String> {
-    use std::process::Stdio;
-    use tokio::io::AsyncWriteExt;
-
     check_program(program)?;
     tracing::debug!(program, ?args, "exec (stdin)");
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))?;
-    let mut pipe = child.stdin.take().expect("piped stdin");
-    pipe.write_all(stdin)
-        .await
-        .map_err(|e| CoreError::Io(format!("writing {program} stdin: {e}")))?;
-    drop(pipe);
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| CoreError::Io(format!("waiting for {program}: {e}")))?;
+    let output = output_within(program, args, &[], Some(stdin), DEFAULT_EXEC_TIMEOUT).await?;
     checked_stdout(program, output)
 }
 
 /// Same as [`run_with_stdin`], with extra environment variables for the
-/// child (e.g. `DOCKER_CONFIG`).
+/// child (e.g. `DOCKER_CONFIG`), and a one-minute limit.
 #[cfg(feature = "docker")]
 pub async fn run_with_stdin_env(
     program: &str,
@@ -115,30 +103,112 @@ pub async fn run_with_stdin_env(
     envs: &[(&str, &str)],
     stdin: &[u8],
 ) -> CoreResult<String> {
-    use std::process::Stdio;
-    use tokio::io::AsyncWriteExt;
-
     check_program(program)?;
     tracing::debug!(program, ?args, "exec (stdin, env)");
+    let output = output_within(program, args, envs, Some(stdin), Duration::from_secs(60)).await?;
+    checked_stdout(program, output)
+}
+
+/// Runs an already-checked `program` to completion in its own process
+/// group and collects its output, with a hard `timeout`.
+///
+/// Stdout and stderr are drained concurrently with the stdin write, so a
+/// chatty child cannot deadlock on a full pipe. When `timeout` elapses
+/// (or the future is dropped) the whole group — not only the direct child,
+/// which for `docker` is just the CLI in front of a plugin — is stopped:
+/// SIGTERM, then SIGKILL after [`TIMEOUT_GRACE`]. That is what keeps a hung
+/// `docker compose logs` from piling up as orphaned processes.
+async fn output_within(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+) -> CoreResult<std::process::Output> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let mut child = Command::new(program)
         .args(args)
         .envs(envs.iter().copied())
-        .stdin(Stdio::piped())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))?;
-    let mut pipe = child.stdin.take().expect("piped stdin");
-    pipe.write_all(stdin)
-        .await
-        .map_err(|e| CoreError::Io(format!("writing {program} stdin: {e}")))?;
-    drop(pipe);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
-        .await
-        .map_err(|_| CoreError::External(format!("{program} timed out")))?
-        .map_err(|e| CoreError::Io(format!("waiting for {program}: {e}")))?;
-    checked_stdout(program, output)
+    let mut guard = GroupGuard::new(child.id());
+    let stdin_pipe = child.stdin.take();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    let finished = tokio::time::timeout(timeout, async {
+        let write = async {
+            if let (Some(mut pipe), Some(data)) = (stdin_pipe, stdin) {
+                match pipe.write_all(data).await {
+                    // A child that exits without reading its input is
+                    // judged by its exit status, not by our write.
+                    Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+                        return Err(CoreError::Io(format!("writing {program} stdin: {e}")));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (written, read_out, read_err) = tokio::join!(
+            write,
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err)
+        );
+        written?;
+        read_out.map_err(|e| CoreError::Io(format!("reading {program} stdout: {e}")))?;
+        read_err.map_err(|e| CoreError::Io(format!("reading {program} stderr: {e}")))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| CoreError::Io(format!("waiting for {program}: {e}")))?;
+        Ok(std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    })
+    .await;
+
+    match finished {
+        Ok(result) => {
+            // Only a reaped leader means the command is over; on an I/O
+            // error the guard stops the group as `child` drops.
+            if result.is_ok() {
+                guard.disarm();
+            }
+            result
+        }
+        Err(_) => {
+            if let Some(pgid) = guard.0 {
+                stop_group(pgid, &mut child, "-TERM", TIMEOUT_GRACE).await;
+                guard.disarm();
+            } else {
+                child.kill().await.ok();
+            }
+            tracing::warn!(
+                program,
+                secs = timeout.as_secs(),
+                "exec timed out; process group stopped"
+            );
+            Err(CoreError::External(format!(
+                "{program} timed out after {}s and was stopped",
+                timeout.as_secs()
+            )))
+        }
+    }
 }
 
 /// Starts `program` for a streaming pipeline (backups and restores): the
@@ -201,15 +271,31 @@ pub fn exec_replace(program: &str, args: &[String]) -> CoreError {
 
 /// Same as [`run`] but tolerates non-zero exit (some tools, e.g. `clamscan`,
 /// use exit code 1 to mean "infected files found", which is not a failure of
-/// the command itself).
+/// the command itself). Bounded by [`DEFAULT_EXEC_TIMEOUT`].
 pub async fn run_allow_nonzero(program: &str, args: &[&str]) -> CoreResult<(i32, String, String)> {
+    allow_nonzero(program, args, DEFAULT_EXEC_TIMEOUT).await
+}
+
+/// [`run_allow_nonzero`] with an explicit limit. When `timeout` elapses the
+/// command's whole process group is stopped and a `CoreError::External`
+/// is returned.
+#[cfg(any(feature = "docker", feature = "antivirus", test))]
+pub async fn run_allow_nonzero_within(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> CoreResult<(i32, String, String)> {
+    allow_nonzero(program, args, timeout).await
+}
+
+async fn allow_nonzero(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> CoreResult<(i32, String, String)> {
     check_program(program)?;
-    tracing::debug!(program, ?args, "exec (allow non-zero)");
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))?;
+    tracing::debug!(program, ?args, ?timeout, "exec (allow non-zero)");
+    let output = output_within(program, args, &[], None, timeout).await?;
     Ok((
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -397,20 +483,72 @@ pub const MAX_FOLLOW_LINE: usize = 16 * 1024;
 
 /// Time a cancelled process group gets to exit after SIGINT.
 #[cfg(feature = "docker")]
-const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+const KILL_GRACE: Duration = Duration::from_secs(10);
 
 /// SIGINT the whole process group (so `docker compose` can stop its build
-/// cleanly), then SIGKILL it if it is still alive after [`KILL_GRACE`].
+/// cleanly), then SIGKILL it after [`KILL_GRACE`].
 #[cfg(feature = "docker")]
 async fn terminate_group(pgid: u32, child: &mut tokio::process::Child) {
-    let group = format!("-{pgid}");
-    let _ = run_allow_nonzero("kill", &["-INT", "--", &group]).await;
-    if tokio::time::timeout(KILL_GRACE, child.wait())
-        .await
-        .is_err()
-    {
-        let _ = run_allow_nonzero("kill", &["-KILL", "--", &group]).await;
+    stop_group(pgid, child, "-INT", KILL_GRACE).await;
+}
+
+/// Sends `first` to the process group `pgid`, gives the leader `grace` to
+/// exit, then SIGKILLs the group regardless: a member that ignored the first
+/// signal, or one the leader left behind, must not outlive the command. The
+/// leader is reaped before returning, so it cannot linger as a zombie.
+async fn stop_group(pgid: u32, child: &mut tokio::process::Child, first: &str, grace: Duration) {
+    signal_group(first, pgid).await;
+    let exited = tokio::time::timeout(grace, child.wait()).await.is_ok();
+    signal_group("-KILL", pgid).await;
+    if !exited {
         let _ = child.wait().await;
+    }
+}
+
+/// `kill <signal> -- -<pgid>`. Spawned directly rather than through
+/// [`run_allow_nonzero`] so stopping a group never recurses into another
+/// bounded run; `kill` itself returns at once.
+async fn signal_group(signal: &str, pgid: u32) {
+    let group = format!("-{pgid}");
+    let status = Command::new("kill")
+        .args([signal, "--", &group])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    let _ = tokio::time::timeout(Duration::from_secs(5), status).await;
+}
+
+/// SIGKILLs a one-shot command's process group if the future running it is
+/// dropped before the command finished (the RPC caller went away, an outer
+/// timeout fired). `kill_on_drop` alone only reaches the direct child.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    fn new(pgid: Option<u32>) -> Self {
+        Self(pgid)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        let Some(pgid) = self.0.take() else { return };
+        // Dropped outside a runtime only at shutdown, when there is nothing
+        // left to protect. Tokio reaps the dropped `kill` child itself.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let group = format!("-{pgid}");
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &group])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
     }
 }
 
@@ -442,6 +580,126 @@ mod tests {
             run_with_stdin("sleep", &["0"], b"secret").await.unwrap(),
             ""
         );
+    }
+
+    #[tokio::test]
+    async fn a_command_past_its_limit_is_stopped_and_reported() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let error = run_allow_nonzero_within("sleep", &["30"], Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::External(_)), "{error}");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        // SIGTERM ends `sleep` at once; no wait for the SIGKILL grace.
+        assert!(started.elapsed() < TIMEOUT_GRACE, "{:?}", started.elapsed());
+
+        // Within the limit, output and exit status come back as before.
+        let (code, stdout, _) =
+            run_allow_nonzero_within("printf", &["a\\nb"], Duration::from_secs(10))
+                .await
+                .unwrap();
+        assert_eq!((code, stdout.as_str()), (0, "a\nb"));
+    }
+
+    /// Spawns `sleep 30` as a group leader and a second `sleep 30` inside
+    /// the same group, standing in for the plugin process `docker` starts.
+    fn leader_and_member() -> (tokio::process::Child, tokio::process::Child, u32) {
+        let leader = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id().unwrap();
+        let member = Command::new("sleep")
+            .arg("30")
+            .process_group(pgid as i32)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        (leader, member, pgid)
+    }
+
+    async fn exits_soon(child: &mut tokio::process::Child) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn stopping_a_group_reaches_every_member_not_only_the_leader() {
+        let (mut leader, mut member, pgid) = leader_and_member();
+        stop_group(pgid, &mut leader, "-TERM", TIMEOUT_GRACE).await;
+        assert!(leader.try_wait().unwrap().is_some(), "leader still running");
+        assert!(exits_soon(&mut member).await, "group member left behind");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_timeout_grace_still_kills_the_group() {
+        let dir = std::env::temp_dir().join(format!("panel-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let script = format!(
+            "echo $$ > {}; trap '' TERM; exec sleep 30",
+            pid_file.display()
+        );
+        let task = tokio::spawn(async move {
+            output_within(
+                "sh",
+                &["-c", &script],
+                &[],
+                None,
+                Duration::from_millis(500),
+            )
+            .await
+        });
+        let pgid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut member = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .process_group(pgid as i32)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(member.try_wait().unwrap().is_none());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            exits_soon(&mut member).await,
+            "timeout cancellation orphaned a group member"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unfinished_run_kills_its_group() {
+        let (mut leader, mut member, pgid) = leader_and_member();
+        drop(GroupGuard::new(Some(pgid)));
+        assert!(exits_soon(&mut member).await, "group member left behind");
+        assert!(exits_soon(&mut leader).await, "leader left behind");
+
+        // A disarmed guard (the command finished) signals nothing.
+        let (mut leader, mut member, pgid) = leader_and_member();
+        let mut guard = GroupGuard::new(Some(pgid));
+        guard.disarm();
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(member.try_wait().unwrap().is_none());
+        stop_group(pgid, &mut leader, "-KILL", TIMEOUT_GRACE).await;
+        assert!(exits_soon(&mut member).await);
     }
 
     #[cfg(feature = "docker")]
@@ -509,11 +767,11 @@ mod tests {
     #[test]
     fn every_spawn_goes_through_exec_with_a_literal_allowed_program() {
         let call = regex::Regex::new(
-            r"\b(run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|spawn_piped|follow_lines|exec_replace)\(",
+            r"\b(run|run_allow_nonzero|run_allow_nonzero_within|run_streamed|run_with_stdin|run_with_stdin_env|spawn_piped|follow_lines|exec_replace)\(",
         )
         .unwrap();
         let literal = regex::Regex::new(
-            r#"^\b(?:run|run_allow_nonzero|run_streamed|run_with_stdin|run_with_stdin_env|spawn_piped|follow_lines|exec_replace)\(\s*"([^"]+)""#,
+            r#"^\b(?:run|run_allow_nonzero|run_allow_nonzero_within|run_streamed|run_with_stdin|run_with_stdin_env|spawn_piped|follow_lines|exec_replace)\(\s*"([^"]+)""#,
         )
         .unwrap();
         let mut files = Vec::new();

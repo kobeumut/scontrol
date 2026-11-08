@@ -1,7 +1,11 @@
 //! On-demand ClamAV scanning (only compiled in when the `antivirus` cargo
 //! feature is enabled).
 
-use super::exec::run_allow_nonzero;
+use super::exec::run_allow_nonzero_within;
+use std::time::Duration;
+
+/// A recursive scan of a large tree is slow; it still must not run forever.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::ScanResult;
 
@@ -12,8 +16,12 @@ pub async fn scan_path(path: &str) -> CoreResult<ScanResult> {
     let started_at = chrono::Utc::now();
 
     // clamscan exits 0 (clean), 1 (infected files found), or 2 (error).
-    let (code, stdout, stderr) =
-        run_allow_nonzero("clamscan", &["-r", "--infected", "--no-summary", path]).await?;
+    let (code, stdout, stderr) = run_allow_nonzero_within(
+        "clamscan",
+        &["-r", "--infected", "--no-summary", path],
+        SCAN_TIMEOUT,
+    )
+    .await?;
     if code == 2 {
         return Err(CoreError::External(format!("clamscan error: {stderr}")));
     }
