@@ -564,7 +564,7 @@ impl std::fmt::Debug for DatabaseConnection {
 }
 
 /// Streams a database dump (gzip) straight into a multipart S3 upload,
-/// then prunes backups of the same database beyond `retention_count`
+/// then prunes backups of the same series beyond `retention_count`
 /// (0 keeps everything).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BackupDatabaseParams {
@@ -572,6 +572,75 @@ pub struct BackupDatabaseParams {
     pub prefix: String,
     pub connection: DatabaseConnection,
     pub retention_count: u32,
+    /// Whose database this is ([`service_backup_namespace`] or
+    /// [`host_backup_namespace`]). Two services with a database of the same
+    /// name must never share a series, or retention of one deletes the
+    /// other's backups. `None` (a panel from before namespacing) falls back
+    /// to the connection's host and port.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+impl BackupDatabaseParams {
+    /// The backup series `<engine>-<namespace>-<database>`, or `None` when
+    /// the namespace is not a safe key segment.
+    pub fn series_name(&self) -> Option<String> {
+        let c = &self.connection;
+        let namespace = match &self.namespace {
+            Some(namespace) => namespace.clone(),
+            None => host_backup_namespace(None, &c.host, c.port),
+        };
+        if namespace.contains('/') || !validate::is_valid_backup_path(&namespace) {
+            return None;
+        }
+        Some(format!("{}-{namespace}-{}", c.engine.as_str(), c.database))
+    }
+}
+
+/// Series namespace of a database that belongs to a Compose service
+/// (slugs are unique panel-wide).
+pub fn service_backup_namespace(slug: &str) -> String {
+    format!("svc-{slug}")
+}
+
+/// Series namespace of a database known only by its address, as seen from
+/// the agent of `server_id` (`None` = this host). The `svc-`, `host-` and
+/// `srv-` markers keep the three forms from ever producing the same name.
+pub fn host_backup_namespace(server_id: Option<Uuid>, host: &str, port: u16) -> String {
+    // `_` is not a valid host character, so mapping IPv6 `:` to it is
+    // one-to-one.
+    let host = host.to_ascii_lowercase().replace(':', "_");
+    match server_id {
+        Some(id) => format!("srv-{}-host-{host}-{port}", id.simple()),
+        None => format!("host-{host}-{port}"),
+    }
+}
+
+/// Whether `key` is `<prefix>/<name>-<UTC timestamp>.<extension>` exactly,
+/// the shape [`BackupDatabaseParams`] and volume backups write. Retention
+/// counts only these, so the series `app` never sees `app-staging-…`.
+pub fn is_backup_of_series(key: &str, prefix: &str, name: &str, extension: &str) -> bool {
+    let Some(rest) = key
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix('/'))
+        .and_then(|r| r.strip_prefix(name))
+        .and_then(|r| r.strip_prefix('-'))
+    else {
+        return false;
+    };
+    let Some(stamp) = rest
+        .strip_suffix(extension)
+        .and_then(|r| r.strip_suffix('.'))
+    else {
+        return false;
+    };
+    // YYYYMMDDTHHMMSSZ
+    let b = stamp.as_bytes();
+    b.len() == 16
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'Z'
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -804,6 +873,8 @@ pub mod mock {
         pub prunes: Mutex<Vec<PruneDockerParams>>,
         /// What `metrics_snapshot` returns, so tests can drive the collector.
         pub metrics: Mutex<Option<crate::metrics::MetricsSnapshot>>,
+        /// Every `backup_database` request received.
+        pub database_backups: Mutex<Vec<BackupDatabaseParams>>,
     }
 
     impl MockAdapter {
@@ -1175,8 +1246,14 @@ pub mod mock {
 
         async fn backup_database(&self, params: BackupDatabaseParams) -> CoreResult<BackupOutcome> {
             self.record("backup_database")?;
+            let key = format!(
+                "{}/{}-mock.sql.gz",
+                params.prefix,
+                params.series_name().unwrap_or_default()
+            );
+            self.database_backups.lock().unwrap().push(params);
             Ok(BackupOutcome {
-                key: format!("{}/mock.sql.gz", params.prefix),
+                key,
                 size_bytes: 0,
                 pruned: 0,
             })
@@ -1271,5 +1348,115 @@ pub mod mock {
         async fn close_terminal(&self, _params: TerminalCloseParams) -> CoreResult<()> {
             self.record("close_terminal")
         }
+    }
+}
+
+#[cfg(test)]
+mod backup_series_tests {
+    use super::*;
+
+    fn params(namespace: Option<&str>, host: &str, database: &str) -> BackupDatabaseParams {
+        BackupDatabaseParams {
+            target: S3Target {
+                endpoint: "https://s3.example.com".into(),
+                region: "auto".into(),
+                bucket: "b".into(),
+                access_key: "a".into(),
+                secret_key: "s".into(),
+            },
+            prefix: "pfx".into(),
+            connection: DatabaseConnection {
+                engine: BackupEngine::Postgres,
+                host: host.into(),
+                port: 5432,
+                database: database.into(),
+                username: "u".into(),
+                password: "p".into(),
+            },
+            retention_count: 3,
+            namespace: namespace.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn same_database_in_two_services_gets_two_series() {
+        let a = params(Some(&service_backup_namespace("shop")), "127.0.0.1", "app");
+        let b = params(Some(&service_backup_namespace("blog")), "127.0.0.1", "app");
+        assert_eq!(a.series_name().unwrap(), "postgres-svc-shop-app");
+        assert_eq!(b.series_name().unwrap(), "postgres-svc-blog-app");
+
+        // Without a namespace (older panel), the address separates them.
+        let legacy = params(None, "DB.internal", "app");
+        assert_eq!(
+            legacy.series_name().unwrap(),
+            "postgres-host-db.internal-5432-app"
+        );
+        let v6 = params(None, "::1", "app");
+        assert_eq!(v6.series_name().unwrap(), "postgres-host-__1-5432-app");
+
+        // The same address on two servers is two series.
+        let s1 = host_backup_namespace(Some(Uuid::from_u128(1)), "127.0.0.1", 5432);
+        let s2 = host_backup_namespace(Some(Uuid::from_u128(2)), "127.0.0.1", 5432);
+        assert_ne!(s1, s2);
+        assert!(s1.starts_with("srv-") && s1.ends_with("-host-127.0.0.1-5432"));
+    }
+
+    #[test]
+    fn unsafe_namespaces_are_refused() {
+        for bad in ["a/b", "../x", "-x", "", "a b"] {
+            assert!(
+                params(Some(bad), "db", "app").series_name().is_none(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn series_match_is_exact() {
+        let ok = "pfx/postgres-svc-shop-app-20260101T000000Z.sql.gz";
+        assert!(is_backup_of_series(
+            ok,
+            "pfx",
+            "postgres-svc-shop-app",
+            "sql.gz"
+        ));
+        // A longer series sharing the name as a prefix is not this one.
+        assert!(!is_backup_of_series(
+            "pfx/postgres-svc-shop-app-main-20260101T000000Z.sql.gz",
+            "pfx",
+            "postgres-svc-shop",
+            "sql.gz"
+        ));
+        assert!(!is_backup_of_series(
+            "pfx/postgres-svc-shop-app-20260101T000000Z.sql.gz",
+            "pfx",
+            "postgres-svc-shop",
+            "sql.gz"
+        ));
+        // Other extension, other prefix, malformed stamp.
+        assert!(!is_backup_of_series(
+            ok,
+            "pfx",
+            "postgres-svc-shop-app",
+            "archive.gz"
+        ));
+        assert!(!is_backup_of_series(
+            ok,
+            "pf",
+            "postgres-svc-shop-app",
+            "sql.gz"
+        ));
+        assert!(!is_backup_of_series(
+            "pfx/postgres-svc-shop-app-2026010T000000Z.sql.gz",
+            "pfx",
+            "postgres-svc-shop-app",
+            "sql.gz"
+        ));
+        assert!(!is_backup_of_series(
+            "pfx/postgres-svc-shop-app-20260101T000000Z-copy.sql.gz",
+            "pfx",
+            "postgres-svc-shop-app",
+            "sql.gz"
+        ));
     }
 }
