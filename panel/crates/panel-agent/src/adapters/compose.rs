@@ -13,6 +13,9 @@
 //! code/                     checked-out Git source or raw Compose file
 //! env                       0600 merged environment file (`--env-file`)
 //! env.masked                0600 overridden inherited values, masked in logs
+//! env.run                   static builds only: 0600 copy of `env` in the
+//!                           unquoted `docker run --env-file` format, removed
+//!                           when the build ends
 //! scontrol.override.yml     generated loopback port publishing for domains
 //!                           and resource limits of ephemeral projects
 //! .scontrol-ephemeral       marker: a pull request preview, whose named
@@ -75,6 +78,9 @@ const APPLICATION_COMPOSE_FILE: &str = ".scontrol-app.yml";
 const ENV_FILE: &str = "env";
 /// Overridden inherited values (0600), read only to mask them in logs.
 const MASKED_VALUES_FILE: &str = "env.masked";
+/// The environment for `docker run --env-file` (static builds), which takes
+/// every value literally and so must not see Compose quoting.
+const RUN_ENV_FILE: &str = "env.run";
 const OVERRIDE_FILE: &str = "scontrol.override.yml";
 /// Generated credentials of a database service (0600), the last `env_file`.
 const DATABASE_ENV_FILE: &str = "db.env";
@@ -1757,13 +1763,38 @@ async fn run_static_build(
     build: &panel_core::types::StaticBuild,
     log: &mut DeployLog,
 ) -> CoreResult<()> {
+    let run_env = root.join(RUN_ENV_FILE);
+    let environment = read_environment(&root.join(ENV_FILE)).await?;
+    write_private_file(&run_env, &docker_run_env_body(&environment)).await?;
+    let result = run_static_build_steps(cfg, slug, &run_env, code_dir, build, log).await;
+    tokio::fs::remove_file(&run_env).await.ok();
+    result
+}
+
+/// `docker run --env-file` reads `KEY=value` with no quoting, comments, or
+/// interpolation, so values go in as they are (newlines are rejected).
+fn docker_run_env_body(environment: &[(String, String)]) -> String {
+    environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect()
+}
+
+async fn run_static_build_steps(
+    cfg: &AgentConfig,
+    slug: &str,
+    run_env: &Path,
+    code_dir: &Path,
+    build: &panel_core::types::StaticBuild,
+    log: &mut DeployLog,
+) -> CoreResult<()> {
     let name = format!("scontrol-static-build-{slug}");
     // A container left behind by a killed deployment would block the name.
     let _ = run_allow_nonzero("docker", &["rm", "-f", &name]).await;
     let timeout = Duration::from_secs(cfg.deploy_timeout_secs.max(60));
     let (code, env) = (
         code_dir.to_string_lossy().into_owned(),
-        root.join(ENV_FILE).to_string_lossy().into_owned(),
+        run_env.to_string_lossy().into_owned(),
     );
     let total = build.commands.len();
     for (index, command) in build.commands.iter().enumerate() {
@@ -2529,13 +2560,113 @@ async fn write_environment(path: &Path, environment: &[(String, String)]) -> Cor
     let mut body = String::new();
     for (key, value) in environment {
         // Newlines are rejected in validation, so one key/value occupies one
-        // line. The Compose `.env` parser receives literal values as supplied.
+        // line.
         body.push_str(key);
         body.push('=');
-        body.push_str(value);
+        body.push_str(&encode_env_value(value));
         body.push('\n');
     }
     write_private_file(path, &body).await
+}
+
+/// Encodes one value for the Compose `.env` parser (compose-go `dotenv`),
+/// which reads both `--env-file` and the services' `env_file`.
+///
+/// Values made only of plain characters are written as they are, so files
+/// stay readable. Anything else is double-quoted:
+/// - unquoted, ` #` starts an inline comment (`p #ss` would become `p`),
+///   trailing whitespace is trimmed, and leading quotes start a quoted value;
+/// - inside double quotes, `\` and `"` are escaped, so backslash sequences
+///   such as `\n` in a Windows path or JSON reach the container literally.
+///
+/// `$` is literal (`$$`), except a braced reference `${NAME}` or
+/// `${NAME:-default}` (also `-`, `:?`, `?`, `:+`, `+`), which Compose still
+/// interpolates on purpose, including a self-reference like
+/// `PATH=${PATH}:/opt/bin`. A password such as `pa$word` or `a$$b` thus
+/// arrives unchanged, instead of having `$word` replaced by an empty string.
+/// Single quotes are not used because they turn off those references.
+fn encode_env_value(value: &str) -> String {
+    if value.chars().all(is_plain_env_char) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    let mut rest = value;
+    while let Some(c) = rest.chars().next() {
+        if c == '$' {
+            if let Some(len) = env_reference_len(rest) {
+                out.push_str(&rest[..len]);
+                rest = &rest[len..];
+                continue;
+            }
+            out.push_str("$$");
+        } else {
+            if c == '\\' || c == '"' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    out.push('"');
+    out
+}
+
+/// Characters Compose reads literally in an unquoted value anywhere in it.
+fn is_plain_env_char(c: char) -> bool {
+    !(c.is_whitespace() || c.is_control() || matches!(c, '#' | '"' | '\'' | '\\' | '$' | '`'))
+}
+
+/// Length of a braced variable reference at the start of `s` (which starts
+/// with `$`): `${NAME}` or `${NAME<op>default}` with `op` one of `:-`, `-`,
+/// `:?`, `?`, `:+`, `+`, and a default without `$`, `{`, `}`, `"` or `\`
+/// (nested references are treated as literal text).
+fn env_reference_len(s: &str) -> Option<usize> {
+    let body = s.strip_prefix("${")?;
+    let end = body.find('}')?;
+    let inner = &body[..end];
+    let name_len = inner
+        .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+        .unwrap_or(inner.len());
+    if !inner.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let modifier = &inner[name_len..];
+    let default = if modifier.is_empty() {
+        ""
+    } else {
+        [":-", ":?", ":+", "-", "?", "+"]
+            .iter()
+            .find_map(|op| modifier.strip_prefix(op))?
+    };
+    if default.contains(['$', '{', '"', '\\']) {
+        return None;
+    }
+    Some("${".len() + end + 1)
+}
+
+/// Reverses [`encode_env_value`] (for log masking). Unquoted lines, as
+/// written before values were quoted, are returned as they are.
+fn decode_env_value(raw: &str) -> String {
+    let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return raw.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next().unwrap_or('\\')),
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                out.push('$');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Replaces `path` with `body`, readable by root only (0600).
@@ -2565,7 +2696,7 @@ pub(crate) async fn read_environment(path: &Path) -> CoreResult<Vec<(String, Str
         Ok(body) => Ok(body
             .lines()
             .filter_map(|line| line.split_once('='))
-            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .map(|(key, value)| (key.to_string(), decode_env_value(value)))
             .collect()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             write_environment(path, &[]).await?;
@@ -4041,6 +4172,178 @@ mod tests {
         assert_eq!(read_environment(&path).await.unwrap(), env);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    /// What compose-go's `dotenv` parser yields for one encoded value: the
+    /// unquoted path cuts ` #` comments and trims trailing space; the
+    /// double-quoted one unescapes `\X` (`\$` and `$$` are a literal `$`).
+    /// Braced references resolve from `vars`, like `--env-file` lookups.
+    fn compose_dotenv_value(raw: &str, vars: &[(&str, &str)]) -> String {
+        let (text, quoted) = match raw.strip_prefix('"') {
+            Some(rest) => (rest.strip_suffix('"').expect("terminated"), true),
+            None => (raw.split(" #").next().unwrap().trim_end(), false),
+        };
+        let mut unescaped = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if quoted && c == '\\' {
+                match chars.next().expect("escape at the end") {
+                    'n' => unescaped.push('\n'),
+                    't' => unescaped.push('\t'),
+                    '$' => unescaped.push_str("$$"),
+                    other => unescaped.push(other),
+                }
+            } else {
+                assert!(!(quoted && c == '"'), "unescaped quote in {raw}");
+                unescaped.push(c);
+            }
+        }
+        let mut out = String::new();
+        let mut rest = unescaped.as_str();
+        while let Some(c) = rest.chars().next() {
+            if let Some(after) = rest.strip_prefix("$$") {
+                out.push('$');
+                rest = after;
+            } else if let Some(body) = rest.strip_prefix("${") {
+                let end = body.find('}').expect("closed reference");
+                let inner = &body[..end];
+                let name = inner.split([':', '-', '?', '+']).next().unwrap();
+                let fallback = inner[name.len()..].trim_start_matches(':');
+                let found = vars.iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
+                match (found, fallback.chars().next()) {
+                    (Some(_), Some('+')) => out.push_str(&fallback[1..]),
+                    (Some(v), _) => out.push_str(v),
+                    (None, Some('-')) => out.push_str(&fallback[1..]),
+                    (None, _) => {}
+                }
+                rest = &body[end + 1..];
+            } else if c == '$' {
+                // A lone `$NAME` would be interpolated: never written bare.
+                assert!(
+                    !rest[1..].starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()),
+                    "unescaped $ in {raw}"
+                );
+                out.push('$');
+                rest = &rest[1..];
+            } else {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn plain_environment_values_stay_unquoted() {
+        for value in [
+            "",
+            "abc123",
+            "postgres://u:p@db:5432/app?ssl=true",
+            "a=b",
+            "x,y;z!",
+        ] {
+            assert_eq!(encode_env_value(value), value);
+        }
+    }
+
+    #[test]
+    fn special_environment_values_reach_the_container_literally() {
+        let cases = [
+            ("p#ssword!123", r#""p#ssword!123""#),
+            ("p #ssword", r#""p #ssword""#),
+            ("#leading", r##""#leading""##),
+            ("two words", r#""two words""#),
+            ("tab\there", "\"tab\there\""),
+            (" padded ", r#"" padded ""#),
+            (r#"say "hi""#, r#""say \"hi\"""#),
+            (
+                r#"{"a":[1,"b c"],"n":"x\ny"}"#,
+                r#""{\"a\":[1,\"b c\"],\"n\":\"x\\ny\"}""#,
+            ),
+            (r"C:\new\table", r#""C:\\new\\table""#),
+            (r"ends\", r#""ends\\""#),
+            ("it's", r#""it's""#),
+            ("'quoted'", r#""'quoted'""#),
+            ("pa$word", r#""pa$$word""#),
+            ("a$$b", r#""a$$$$b""#),
+            ("cost$", r#""cost$$""#),
+            ("$(whoami)`id`", r#""$$(whoami)`id`""#),
+            ("${1X}", r#""$${1X}""#),
+            ("${}", r#""$${}""#),
+            ("${A:-$B}", r#""$${A:-$$B}""#),
+            ("ünïcode ✓", r#""ünïcode ✓""#),
+        ];
+        for (value, encoded) in cases {
+            assert_eq!(encode_env_value(value), encoded, "encoding {value}");
+            assert_eq!(compose_dotenv_value(encoded, &[("A", "set")]), value);
+            assert_eq!(decode_env_value(encoded), value, "decoding {encoded}");
+        }
+    }
+
+    #[test]
+    fn braced_environment_references_still_interpolate() {
+        let vars = [("PATH", "/usr/bin"), ("DB_HOST", "db"), ("_X1", "x")];
+        let cases = [
+            (
+                "${PATH}:/opt/bin",
+                r#""${PATH}:/opt/bin""#,
+                "/usr/bin:/opt/bin",
+            ),
+            ("${_X1}", r#""${_X1}""#, "x"),
+            ("host ${DB_HOST}", r#""host ${DB_HOST}""#, "host db"),
+            (
+                "${MISSING:-local host}",
+                r#""${MISSING:-local host}""#,
+                "local host",
+            ),
+            ("${DB_HOST:-other}#1", r#""${DB_HOST:-other}#1""#, "db#1"),
+            ("$5 ${PATH-x}$", r#""$$5 ${PATH-x}$$""#, "$5 /usr/bin$"),
+            ("${DB_HOST:+on}", r#""${DB_HOST:+on}""#, "on"),
+        ];
+        for (value, encoded, delivered) in cases {
+            assert_eq!(encode_env_value(value), encoded, "encoding {value}");
+            assert_eq!(compose_dotenv_value(encoded, &vars), delivered);
+            assert_eq!(decode_env_value(encoded), value, "decoding {encoded}");
+        }
+    }
+
+    #[test]
+    fn static_builds_get_the_values_unquoted() {
+        let env = [
+            ("A".to_string(), "p #ss \"x\" $y".to_string()),
+            ("B".to_string(), String::new()),
+        ];
+        assert_eq!(docker_run_env_body(&env), "A=p #ss \"x\" $y\nB=\n");
+    }
+
+    #[tokio::test]
+    async fn special_environment_values_round_trip_through_the_file() {
+        let base = std::env::temp_dir().join(format!("scontrol-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join(ENV_FILE);
+        let env: Vec<(String, String)> = [
+            ("DB_PASSWORD", "p#ssword!123"),
+            ("JSON", r#"{"k": "v\n", "list": [1, 2]}"#),
+            ("SECRET", r#"a$b"c'd\e f"#),
+            ("URL", "${BASE}/api"),
+            ("PLAIN", "value"),
+            ("EMPTY", ""),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        write_environment(&path, &env).await.unwrap();
+        assert_eq!(read_environment(&path).await.unwrap(), env);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("DB_PASSWORD=\"p#ssword!123\"\n"), "{body}");
+        assert!(body.contains("PLAIN=value\n"), "{body}");
+        // Files written before values were quoted are still read as is.
+        std::fs::write(&path, "OLD=raw value#1\n").unwrap();
+        assert_eq!(
+            read_environment(&path).await.unwrap(),
+            vec![("OLD".to_string(), "raw value#1".to_string())]
+        );
         std::fs::remove_dir_all(base).ok();
     }
 
