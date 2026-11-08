@@ -638,8 +638,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_during_timeout_grace_still_kills_the_group() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
+        let dir = std::env::temp_dir().join(format!("panel-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let pid_file = dir.join("pid");
         let script = format!(
             "echo $$ > {}; trap '' TERM; exec sleep 30",
             pid_file.display()
@@ -680,6 +681,7 @@ mod tests {
             exits_soon(&mut member).await,
             "timeout cancellation orphaned a group member"
         );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
