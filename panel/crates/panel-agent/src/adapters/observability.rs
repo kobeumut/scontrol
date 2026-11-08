@@ -135,9 +135,9 @@ const INSPECT_CHUNK: usize = 100;
 ///    rollbacks to older releases.
 /// 3. `docker builder prune -a -f --filter until=<n>h`.
 ///
-/// panel-api runs no deployment on this server while a cleanup runs, so no
-/// pull, build, or lease is in flight. Every command is killed at its
-/// timeout and the whole cleanup is bounded by [`PRUNE_BUDGET`].
+/// The agent dispatcher excludes managed pulls/builds for this entire
+/// operation, even after an API disconnect. External Docker users are not
+/// coordinated. Every command and the complete cleanup have time limits.
 #[cfg(feature = "docker")]
 pub async fn prune_docker(
     params: panel_core::adapters::PruneDockerParams,
@@ -147,53 +147,61 @@ pub async fn prune_docker(
     use panel_core::observability::{
         parse_df_images_bytes, parse_reclaimed_bytes, prune_until_filter,
     };
-    let filter = prune_until_filter(params.older_than_hours).map_err(CoreError::Validation)?;
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(i64::from(params.older_than_hours));
-    let deadline = tokio::time::Instant::now() + PRUNE_BUDGET;
+    let work = async {
+        let filter = prune_until_filter(params.older_than_hours).map_err(CoreError::Validation)?;
+        let cutoff =
+            chrono::Utc::now() - chrono::Duration::hours(i64::from(params.older_than_hours));
+        let deadline = tokio::time::Instant::now() + PRUNE_BUDGET;
 
-    let dangling = run_with_timeout(
-        "docker",
-        &["image", "prune", "-f", "--filter", &filter],
-        PRUNE_STEP,
-    )
-    .await?;
-    let images_total = || async {
-        run_with_timeout(
+        let dangling = run_with_timeout(
             "docker",
-            &["system", "df", "--format", "{{.Type}}\t{{.Size}}"],
-            QUERY_STEP,
+            &["image", "prune", "-f", "--filter", &filter],
+            PRUNE_STEP,
         )
+        .await?;
+        let images_total = || async {
+            run_with_timeout(
+                "docker",
+                &["system", "df", "--format", "{{.Type}}\t{{.Size}}"],
+                QUERY_STEP,
+            )
+            .await
+            .ok()
+            .and_then(|out| parse_df_images_bytes(&out))
+        };
+        let before = images_total().await;
+        let removed = remove_unused_images(cutoff, deadline).await;
+        let after = if removed > 0 {
+            images_total().await
+        } else {
+            before
+        };
+        let removed_bytes = match (before, after) {
+            (Some(b), Some(a)) => b.saturating_sub(a),
+            _ => 0,
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(CoreError::External(
+                "docker cleanup ran out of time before the build cache prune".into(),
+            ));
+        }
+        let builder = run_with_timeout(
+            "docker",
+            &["builder", "prune", "-a", "-f", "--filter", &filter],
+            remaining.min(PRUNE_STEP),
+        )
+        .await?;
+        Ok(DockerPruneOutcome {
+            images_freed_bytes: parse_reclaimed_bytes(&dangling) + removed_bytes,
+            builder_freed_bytes: parse_reclaimed_bytes(&builder),
+        })
+    };
+    // Includes *all* image/container inspection batches. On expiry the
+    // exec drop guard kills the active command's process group.
+    tokio::time::timeout(PRUNE_BUDGET, work)
         .await
-        .ok()
-        .and_then(|out| parse_df_images_bytes(&out))
-    };
-    let before = images_total().await;
-    let removed = remove_unused_images(cutoff, deadline).await;
-    let after = if removed > 0 {
-        images_total().await
-    } else {
-        before
-    };
-    let removed_bytes = match (before, after) {
-        (Some(b), Some(a)) => b.saturating_sub(a),
-        _ => 0,
-    };
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(CoreError::External(
-            "docker cleanup ran out of time before the build cache prune".into(),
-        ));
-    }
-    let builder = run_with_timeout(
-        "docker",
-        &["builder", "prune", "-a", "-f", "--filter", &filter],
-        remaining.min(PRUNE_STEP),
-    )
-    .await?;
-    Ok(DockerPruneOutcome {
-        images_freed_bytes: parse_reclaimed_bytes(&dangling) + removed_bytes,
-        builder_freed_bytes: parse_reclaimed_bytes(&builder),
-    })
+        .map_err(|_| CoreError::External("docker cleanup exceeded its total time budget".into()))?
 }
 
 /// Step 2 of [`prune_docker`]. Returns how many references were removed.

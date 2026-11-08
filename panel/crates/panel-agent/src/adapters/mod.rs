@@ -48,6 +48,9 @@ use panel_core::types::*;
 /// agent's RPC dispatcher.
 pub struct LocalAdapter {
     pub config: AgentConfig,
+    /// Agent-owned exclusion: API disconnects/restarts cannot release it
+    /// while a Docker operation still runs on this host.
+    pub docker_operations: tokio::sync::RwLock<()>,
     /// Cancellation senders of deployments currently running in this agent.
     running_deployments:
         std::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio::sync::watch::Sender<bool>>>,
@@ -67,6 +70,7 @@ impl LocalAdapter {
             #[cfg(feature = "docker")]
             terminals: terminal::Terminals::new(),
             config,
+            docker_operations: Default::default(),
             running_deployments: Default::default(),
         }
     }

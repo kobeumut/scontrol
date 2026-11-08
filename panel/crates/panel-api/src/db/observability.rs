@@ -366,11 +366,13 @@ pub async fn last_scheduled_start(
     .await
 }
 
-/// Keeps the newest 100 cleanup runs.
+/// Keeps the newest 100 completed cleanup runs, never deleting a live
+/// run's coordination record.
 pub async fn trim_runs(pool: &PgPool) -> sqlx::Result<()> {
     sqlx::query(
         "DELETE FROM docker_cleanup_runs WHERE id IN
-         (SELECT id FROM docker_cleanup_runs ORDER BY started_at DESC OFFSET 100)",
+         (SELECT id FROM docker_cleanup_runs WHERE status != 'running'
+          ORDER BY started_at DESC OFFSET 100)",
     )
     .execute(pool)
     .await?;

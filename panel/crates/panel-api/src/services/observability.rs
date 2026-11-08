@@ -314,6 +314,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn trimming_cleanup_history_never_deletes_an_active_run() {
+        let _guard = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let server = server(&pool).await;
+        let active = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO docker_cleanup_runs (id, server_id, trigger, status, older_than_hours, started_at)
+             VALUES ($1, $2, 'manual', 'running', 168, now() - interval '2 hours')",
+        ).bind(active).bind(server).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO docker_cleanup_runs (id, server_id, trigger, status, older_than_hours)
+             SELECT gen_random_uuid(), $1, 'manual', 'succeeded', 168 FROM generate_series(1, 101)",
+        )
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+        db::observability::trim_runs(&pool).await.unwrap();
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM docker_cleanup_runs WHERE id = $1 AND status = 'running')",
+        )
+        .bind(active)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists);
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM docker_cleanup_runs WHERE status != 'running'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(completed, 100);
+        db::observability::finish_run(&pool, active, Ok((0, 0)))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn cleanup_due_follows_the_interval() {
         let now = Utc::now();

@@ -84,8 +84,8 @@ pub async fn run(program: &str, args: &[&str]) -> CoreResult<String> {
     checked_stdout(program, output)
 }
 
-/// Same as [`run`], bounded by `timeout`. When it elapses the child is
-/// killed (not left running on the host) and the call fails.
+/// Same as [`run`], with an explicit limit and the same process-group
+/// cleanup on timeout or cancellation.
 #[cfg(feature = "docker")]
 pub async fn run_with_timeout(
     program: &str,
@@ -94,13 +94,7 @@ pub async fn run_with_timeout(
 ) -> CoreResult<String> {
     check_program(program)?;
     tracing::debug!(program, ?args, "exec (timeout)");
-    let output = Command::new(program).args(args).kill_on_drop(true).output();
-    let output = tokio::time::timeout(timeout, output)
-        .await
-        .map_err(|_| {
-            CoreError::External(format!("{program} timed out after {} s", timeout.as_secs()))
-        })?
-        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))?;
+    let output = output_within(program, args, &[], None, timeout).await?;
     checked_stdout(program, output)
 }
 
