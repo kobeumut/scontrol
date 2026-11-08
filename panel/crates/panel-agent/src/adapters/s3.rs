@@ -447,13 +447,9 @@ impl S3Client {
         self.ok_text(r, "delete").await.map(|_| ())
     }
 
-    /// Streams the object into `writer` chunk by chunk.
-    pub async fn download_to<W: AsyncWrite + Unpin>(
-        &self,
-        key: &str,
-        writer: &mut W,
-    ) -> CoreResult<u64> {
-        let mut r = self.request(reqwest::Method::GET, key, &[], vec![]).await?;
+    /// Authenticates a GET and checks its status without collecting the body.
+    pub async fn open_download(&self, key: &str) -> CoreResult<reqwest::Response> {
+        let r = self.request(reqwest::Method::GET, key, &[], vec![]).await?;
         if !r.status().is_success() {
             let status = r.status();
             let text = r.text().await.unwrap_or_default();
@@ -465,6 +461,16 @@ impl S3Client {
                 &self.secrets(),
             )));
         }
+        Ok(r)
+    }
+
+    /// Streams the object into `writer` chunk by chunk.
+    pub async fn download_to<W: AsyncWrite + Unpin>(
+        &self,
+        key: &str,
+        writer: &mut W,
+    ) -> CoreResult<u64> {
+        let mut r = self.open_download(key).await?;
         let mut total = 0u64;
         while let Some(chunk) = r.chunk().await.map_err(|e| {
             CoreError::External(redact(&format!("S3 download: {e}"), &self.secrets()))
@@ -566,6 +572,7 @@ pub mod tests {
         uploads: Mutex<HashMap<String, Vec<Part>>>,
         pub auth_headers: Mutex<Vec<String>>,
         pub multipart_completed: Mutex<u32>,
+        pub deny_get: Mutex<bool>,
     }
 
     pub async fn start_mock_s3() -> (String, Arc<MockS3>) {
@@ -683,6 +690,9 @@ pub mod tests {
                     }
                     xml.push_str("</ListBucketResult>");
                     (200, String::new(), xml.into_bytes())
+                }
+                "GET" if *st.deny_get.lock().unwrap() => {
+                    (403, String::new(), b"AccessDenied".to_vec())
                 }
                 "GET" => match st.objects.lock().unwrap().get(&key) {
                     Some(v) => (200, String::new(), v.clone()),
