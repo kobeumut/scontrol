@@ -17,7 +17,7 @@ use panel_core::schedule::{JobRunInfo, ScheduledJob};
 use panel_core::types::{validate, DeploymentStatus};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::Sha256;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -54,6 +54,7 @@ const SLACK_MAX_CHARS: usize = 3000;
 /// ntfy turns a message above 4096 bytes into an attachment, which fails on
 /// servers with attachments disabled.
 const NTFY_MAX_BYTES: usize = 4000;
+const NTFY_MAX_JSON_BYTES: usize = 8192;
 /// Gotify, the webhook `message`, and email have no hard limit; this keeps a
 /// runaway body bounded.
 const GENERIC_MAX_CHARS: usize = 10_000;
@@ -661,12 +662,9 @@ async fn send(
         ChannelConfig::Ntfy { server_url, topic } => {
             // JSON publishing to the server root keeps non-ASCII titles out
             // of HTTP headers.
-            let request = http.post(server_url.trim_end_matches('/')).json(&json!({
-                "topic": topic,
-                "title": title,
-                "message": truncate(&n.body, NTFY_MAX_BYTES, Measure::Bytes),
-                "priority": if n.urgent { 4 } else { 3 },
-            }));
+            let request = http
+                .post(server_url.trim_end_matches('/'))
+                .json(&ntfy_payload(topic, &title, &n.body, n.urgent));
             match secret {
                 Some(token) => request.bearer_auth(token),
                 None => request,
@@ -707,6 +705,23 @@ async fn send(
     }
     let body = response.text().await.unwrap_or_default();
     Err(format!("HTTP {status}: {}", body.trim()))
+}
+
+fn ntfy_payload(topic: &str, title: &str, body: &str, urgent: bool) -> Value {
+    let mut budget = NTFY_MAX_BYTES;
+    let mut payload = json!({
+        "topic": topic,
+        "title": title,
+        "message": truncate(body, budget, Measure::Bytes),
+        "priority": if urgent { 4 } else { 3 },
+    });
+    // ntfy limits the entire JSON request to twice its 4096-byte message limit.
+    // ponytail: halve only oversized escaped bodies; at most 12 bounded retries.
+    while payload.to_string().len() > NTFY_MAX_JSON_BYTES && budget > 0 {
+        budget /= 2;
+        payload["message"] = json!(truncate(body, budget, Measure::Bytes));
+    }
+    payload
 }
 
 /// The Telegram `text`: always within the API's 4096-character limit.
@@ -970,6 +985,26 @@ mod tests {
         let long = short_title(&"ğ".repeat(1_000));
         assert!(long.chars().count() <= MAX_TITLE_CHARS);
         assert!(!long.contains('\n'));
+    }
+
+    #[test]
+    fn ntfy_limits_the_serialized_request_too() {
+        for body in ["\u{0001}".repeat(4000), "\"\\\n🚀".repeat(2000)] {
+            let payload = ntfy_payload(
+                &"t".repeat(64),
+                &short_title(&"🚀".repeat(256)),
+                &body,
+                true,
+            );
+            let encoded = payload.to_string();
+            assert!(encoded.len() <= NTFY_MAX_JSON_BYTES);
+            assert!(payload["message"].as_str().unwrap().len() <= NTFY_MAX_BYTES);
+            assert!(payload["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(TRUNCATION_MARKER));
+            assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), payload);
+        }
     }
 
     #[test]
