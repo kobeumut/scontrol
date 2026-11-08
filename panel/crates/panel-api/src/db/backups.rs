@@ -199,3 +199,29 @@ pub async fn find_run(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<RunRow>> {
     .fetch_optional(pool)
     .await
 }
+
+/// The server a Compose service runs on, by slug.
+pub async fn service_server(pool: &PgPool, slug: &str) -> sqlx::Result<Option<Uuid>> {
+    sqlx::query_scalar("SELECT server_id FROM compose_projects WHERE slug = $1")
+        .bind(slug)
+        .fetch_optional(pool)
+        .await
+}
+
+/// The slug of the managed database service published on `loopback_port`
+/// of `server_id`, if any (loopback ports are unique panel-wide).
+pub async fn database_service_on_port(
+    pool: &PgPool,
+    server_id: Uuid,
+    loopback_port: i32,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT p.slug FROM database_services d
+         JOIN compose_projects p ON p.id = d.project_id
+         WHERE d.loopback_port = $1 AND p.server_id = $2",
+    )
+    .bind(loopback_port)
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await
+}
