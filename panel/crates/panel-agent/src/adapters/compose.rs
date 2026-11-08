@@ -915,16 +915,20 @@ async fn last_matches_per_container(
 /// per-container `--tail`.
 struct LastMatches {
     keep: usize,
+    bytes: usize,
     per_container: Vec<(String, std::collections::VecDeque<String>)>,
 }
 
 impl LastMatches {
     /// Distinct prefixes tracked; anything beyond shares one bucket.
     const MAX_CONTAINERS: usize = 256;
+    // With at most 16 viewers, retained history consumes at most 32 MiB.
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
 
     fn new(keep: usize) -> Self {
         Self {
             keep,
+            bytes: 0,
             per_container: Vec::new(),
         }
     }
@@ -947,9 +951,17 @@ impl LastMatches {
         };
         let lines = &mut self.per_container[index].1;
         if lines.len() == self.keep {
-            lines.pop_front();
+            self.bytes -= lines.pop_front().unwrap().len();
         }
+        self.bytes += line.len();
         lines.push_back(line);
+        // ponytail: history beyond the byte budget is best-effort; evict by bucket.
+        for (_, lines) in &mut self.per_container {
+            while self.bytes > Self::MAX_BYTES {
+                let Some(old) = lines.pop_front() else { break };
+                self.bytes -= old.len();
+            }
+        }
     }
 
     fn into_lines(self) -> Vec<String> {
@@ -3067,6 +3079,20 @@ mod tests {
         let mut none = LastMatches::new(0);
         none.push("web-1  | GET /a".into());
         assert!(none.into_lines().is_empty());
+    }
+
+    #[test]
+    fn log_search_history_has_a_total_byte_budget() {
+        let mut kept = LastMatches::new(2000);
+        for container in 0..256 {
+            for _ in 0..4 {
+                kept.push(format!("web-{container} | {}", "x".repeat(16 * 1024)));
+                assert!(kept.bytes <= LastMatches::MAX_BYTES);
+            }
+        }
+        let lines = kept.into_lines();
+        assert!(lines.iter().map(String::len).sum::<usize>() <= LastMatches::MAX_BYTES);
+        assert!(lines.iter().any(|line| line.starts_with("web-255 | ")));
     }
 
     #[test]

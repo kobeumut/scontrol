@@ -192,8 +192,9 @@ async fn output_within(
             result
         }
         Err(_) => {
-            if let Some(pgid) = guard.take() {
+            if let Some(pgid) = guard.0 {
                 stop_group(pgid, &mut child, "-TERM", TIMEOUT_GRACE).await;
+                guard.disarm();
             } else {
                 child.kill().await.ok();
             }
@@ -532,10 +533,6 @@ impl GroupGuard {
     fn disarm(&mut self) {
         self.0 = None;
     }
-
-    fn take(&mut self) -> Option<u32> {
-        self.0.take()
-    }
 }
 
 impl Drop for GroupGuard {
@@ -637,6 +634,52 @@ mod tests {
         stop_group(pgid, &mut leader, "-TERM", TIMEOUT_GRACE).await;
         assert!(leader.try_wait().unwrap().is_some(), "leader still running");
         assert!(exits_soon(&mut member).await, "group member left behind");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_timeout_grace_still_kills_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > {}; trap '' TERM; exec sleep 30",
+            pid_file.display()
+        );
+        let task = tokio::spawn(async move {
+            output_within(
+                "sh",
+                &["-c", &script],
+                &[],
+                None,
+                Duration::from_millis(500),
+            )
+            .await
+        });
+        let pgid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut member = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .process_group(pgid as i32)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(member.try_wait().unwrap().is_none());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            exits_soon(&mut member).await,
+            "timeout cancellation orphaned a group member"
+        );
     }
 
     #[tokio::test]
