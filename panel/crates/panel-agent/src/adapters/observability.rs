@@ -109,33 +109,188 @@ pub fn read_stats_blocking(
     })
 }
 
-/// Fixed argv, run in order. Only the `until=` value varies, and it is built
-/// from a number that was range-checked.
+/// Longest a whole cleanup may take on the agent. panel-api waits a little
+/// longer (`services::observability::CLEANUP_TIMEOUT`).
+#[cfg(feature = "docker")]
+const PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_secs(25 * 60);
+/// Longest one prune command may take, and one listing or removal.
+#[cfg(feature = "docker")]
+const PRUNE_STEP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+#[cfg(feature = "docker")]
+const QUERY_STEP: std::time::Duration = std::time::Duration::from_secs(60);
+/// IDs per `docker ... inspect` call.
+#[cfg(feature = "docker")]
+const INSPECT_CHUNK: usize = 100;
+
+/// Fixed argv only; the `until=` value and the age cutoff come from a
+/// range-checked number, and every image reference passed back to Docker
+/// comes from Docker's own listing and is validated again.
+///
+/// 1. `docker image prune -f --filter until=<n>h`: dangling images only.
+/// 2. Tagged images older than the cutoff that no container (running or
+///    stopped) uses and that carry no rollback release pin are removed one
+///    reference at a time with `docker image rm` (never `-f`, so Docker
+///    still refuses an image a container started using meanwhile). This
+///    replaces `image prune -a`, which deleted release pins and so broke
+///    rollbacks to older releases.
+/// 3. `docker builder prune -a -f --filter until=<n>h`.
+///
+/// panel-api runs no deployment on this server while a cleanup runs, so no
+/// pull, build, or lease is in flight. Every command is killed at its
+/// timeout and the whole cleanup is bounded by [`PRUNE_BUDGET`].
 #[cfg(feature = "docker")]
 pub async fn prune_docker(
     params: panel_core::adapters::PruneDockerParams,
 ) -> CoreResult<panel_core::adapters::DockerPruneOutcome> {
-    use super::exec::run;
+    use super::exec::run_with_timeout;
     use panel_core::adapters::DockerPruneOutcome;
-    use panel_core::observability::{parse_reclaimed_bytes, prune_until_filter};
-    let filter = prune_until_filter(params.older_than_hours).map_err(CoreError::Validation)?;
-    let timeout = std::time::Duration::from_secs(15 * 60);
-    let step = |args: Vec<&'static str>, filter: String| async move {
-        let mut argv = args;
-        argv.push("--filter");
-        let owned = filter;
-        let mut refs: Vec<&str> = argv.clone();
-        refs.push(&owned);
-        tokio::time::timeout(timeout, run("docker", &refs))
-            .await
-            .map_err(|_| CoreError::External("docker prune timed out".into()))?
+    use panel_core::observability::{
+        parse_df_images_bytes, parse_reclaimed_bytes, prune_until_filter,
     };
-    let images = step(vec!["image", "prune", "-a", "-f"], filter.clone()).await?;
-    let builder = step(vec!["builder", "prune", "-a", "-f"], filter).await?;
+    let filter = prune_until_filter(params.older_than_hours).map_err(CoreError::Validation)?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(i64::from(params.older_than_hours));
+    let deadline = tokio::time::Instant::now() + PRUNE_BUDGET;
+
+    let dangling = run_with_timeout(
+        "docker",
+        &["image", "prune", "-f", "--filter", &filter],
+        PRUNE_STEP,
+    )
+    .await?;
+    let images_total = || async {
+        run_with_timeout(
+            "docker",
+            &["system", "df", "--format", "{{.Type}}\t{{.Size}}"],
+            QUERY_STEP,
+        )
+        .await
+        .ok()
+        .and_then(|out| parse_df_images_bytes(&out))
+    };
+    let before = images_total().await;
+    let removed = remove_unused_images(cutoff, deadline).await;
+    let after = if removed > 0 {
+        images_total().await
+    } else {
+        before
+    };
+    let removed_bytes = match (before, after) {
+        (Some(b), Some(a)) => b.saturating_sub(a),
+        _ => 0,
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(CoreError::External(
+            "docker cleanup ran out of time before the build cache prune".into(),
+        ));
+    }
+    let builder = run_with_timeout(
+        "docker",
+        &["builder", "prune", "-a", "-f", "--filter", &filter],
+        remaining.min(PRUNE_STEP),
+    )
+    .await?;
     Ok(DockerPruneOutcome {
-        images_freed_bytes: parse_reclaimed_bytes(&images),
+        images_freed_bytes: parse_reclaimed_bytes(&dangling) + removed_bytes,
         builder_freed_bytes: parse_reclaimed_bytes(&builder),
     })
+}
+
+/// Step 2 of [`prune_docker`]. Returns how many references were removed.
+/// When what containers use cannot be read, nothing is removed: keeping an
+/// image is always the safe side.
+#[cfg(feature = "docker")]
+async fn remove_unused_images(
+    cutoff: chrono::DateTime<chrono::Utc>,
+    deadline: tokio::time::Instant,
+) -> usize {
+    use super::exec::run_with_timeout;
+    use panel_core::observability::{
+        images_created_before, parse_image_list, removable_images, ImagesInUse,
+    };
+    use panel_core::types::validate;
+
+    let listing = async {
+        let images = run_with_timeout(
+            "docker",
+            &[
+                "image",
+                "ls",
+                "--no-trunc",
+                "--format",
+                "{{.ID}}\t{{.Repository}}:{{.Tag}}",
+            ],
+            QUERY_STEP,
+        )
+        .await?;
+        let containers = run_with_timeout(
+            "docker",
+            &["container", "ls", "-a", "-q", "--no-trunc"],
+            QUERY_STEP,
+        )
+        .await?;
+        let ids: Vec<&str> = containers.split_whitespace().collect();
+        let mut in_use = ImagesInUse::default();
+        for chunk in ids.chunks(INSPECT_CHUNK) {
+            let mut args = vec![
+                "container",
+                "inspect",
+                "--format",
+                "{{.Image}}\t{{.Config.Image}}",
+                "--",
+            ];
+            args.extend_from_slice(chunk);
+            // A container removed since the listing fails the call; then
+            // usage is unknown and nothing is removed.
+            in_use.add_inspect_output(&run_with_timeout("docker", &args, QUERY_STEP).await?);
+        }
+        let candidates = removable_images(&parse_image_list(&images), &in_use);
+        let mut old = std::collections::HashSet::new();
+        let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+        for chunk in ids.chunks(INSPECT_CHUNK) {
+            let mut args = vec![
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}\t{{.Created}}",
+                "--",
+            ];
+            args.extend_from_slice(chunk);
+            old.extend(images_created_before(
+                &run_with_timeout("docker", &args, QUERY_STEP).await?,
+                cutoff,
+            ));
+        }
+        CoreResult::Ok(
+            candidates
+                .into_iter()
+                .filter(|c| old.contains(&c.id))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let candidates = match listing.await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%error, "listing unused Docker images failed; none removed");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for reference in candidates.iter().flat_map(|c| &c.references) {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!("docker cleanup budget used up; remaining images kept");
+            break;
+        }
+        if !validate::is_valid_image_reference(reference) {
+            continue;
+        }
+        // A failure (in use since the listing, already gone) keeps it.
+        match run_with_timeout("docker", &["image", "rm", "--", reference], QUERY_STEP).await {
+            Ok(_) => removed += 1,
+            Err(error) => tracing::debug!(%reference, %error, "image kept"),
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

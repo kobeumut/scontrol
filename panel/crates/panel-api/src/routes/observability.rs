@@ -168,7 +168,7 @@ async fn run_now(
     };
     let server = body.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID);
     let agent = state.agents.for_server_id(&state.db, server).await?;
-    let run = service::run_cleanup(&state.db, agent.as_ref(), server, "manual", age).await?;
+    let run = service::run_cleanup(&state.db, agent, server, "manual", age).await?;
     db::audit::record(
         &state.db,
         Some(user.id),
@@ -301,6 +301,41 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{saved}");
         assert_eq!(saved["interval_hours"], 12);
+
+        // A queued deployment on this host holds the cleanup back.
+        let (service, _) = test_support::compose_project(&pool).await;
+        crate::db::compose_projects::enqueue_deployment(
+            &pool,
+            uuid::Uuid::new_v4(),
+            service,
+            "agent://t",
+            false,
+            "manual",
+            None,
+        )
+        .await
+        .unwrap();
+        let (status, body) = call(
+            &router,
+            &admin_cookie,
+            Method::POST,
+            "/api/observability/docker-cleanup/run",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(adapter.prunes.lock().unwrap().is_empty());
+        // Ours and leftovers of other tests sharing the database.
+        sqlx::query(
+            "UPDATE compose_deployments SET status = 'failed', finished_at = now()
+             WHERE status IN ('queued', 'running')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::db::compose_projects::delete(&pool, service)
+            .await
+            .unwrap();
 
         let (status, run) = call(
             &router,

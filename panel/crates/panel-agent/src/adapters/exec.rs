@@ -84,6 +84,26 @@ pub async fn run(program: &str, args: &[&str]) -> CoreResult<String> {
     checked_stdout(program, output)
 }
 
+/// Same as [`run`], bounded by `timeout`. When it elapses the child is
+/// killed (not left running on the host) and the call fails.
+#[cfg(feature = "docker")]
+pub async fn run_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> CoreResult<String> {
+    check_program(program)?;
+    tracing::debug!(program, ?args, "exec (timeout)");
+    let output = Command::new(program).args(args).kill_on_drop(true).output();
+    let output = tokio::time::timeout(timeout, output)
+        .await
+        .map_err(|_| {
+            CoreError::External(format!("{program} timed out after {} s", timeout.as_secs()))
+        })?
+        .map_err(|e| CoreError::Io(format!("failed to spawn {program}: {e}")))?;
+    checked_stdout(program, output)
+}
+
 /// Same as [`run`], with `stdin` written to the child. Use it for any input
 /// that must not be visible in the process table (`ps` shows argv to every
 /// local user), such as SQL that carries a password.
