@@ -15,7 +15,7 @@
 
 use chrono::{DateTime, DurationRound, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Longest hostname kept (a DNS name is at most 253 characters).
 pub const MAX_HOST_LEN: usize = 253;
@@ -188,6 +188,127 @@ pub fn parse_reclaimed_bytes(output: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The image total from `docker system df --format '{{.Type}}\t{{.Size}}'`
+/// (`Images\t1.234GB`), or `None` when the row is missing.
+pub fn parse_df_images_bytes(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let (kind, size) = line.trim().split_once('\t')?;
+        (kind.trim() == "Images").then(|| parse_size(size.trim()))?
+    })
+}
+
+/// Whether `reference` is a rollback release pin
+/// (`<slug>/<service>:deploy-<deployment>`, see
+/// [`crate::types::deployment_image_tag`]). A cleanup never removes an image
+/// that carries one: it is often the only reference to an older release.
+pub fn is_release_pin(reference: &str) -> bool {
+    let Some((repository, tag)) = reference.rsplit_once(':') else {
+        return false;
+    };
+    repository.contains('/')
+        && tag
+            .strip_prefix("deploy-")
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// A reference as `docker image ls` prints it: Docker Hub prefixes dropped
+/// and `:latest` added when there is no tag or digest.
+pub fn normalize_image_reference(reference: &str) -> String {
+    let name = reference
+        .strip_prefix("docker.io/library/")
+        .or_else(|| reference.strip_prefix("docker.io/"))
+        .unwrap_or(reference);
+    let last = name.rsplit('/').next().unwrap_or(name);
+    if last.contains(':') || last.contains('@') {
+        name.to_string()
+    } else {
+        format!("{name}:latest")
+    }
+}
+
+/// `(image ID, reference)` rows from
+/// `docker image ls --no-trunc --format '{{.ID}}\t{{.Repository}}:{{.Tag}}'`.
+/// Untagged rows are skipped: the dangling prune handles them.
+pub fn parse_image_list(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, reference) = line.trim().split_once('\t')?;
+            let (id, reference) = (id.trim(), reference.trim());
+            (!id.is_empty() && !reference.is_empty() && !reference.contains("<none>"))
+                .then(|| (id.to_string(), reference.to_string()))
+        })
+        .collect()
+}
+
+/// What containers (running or stopped) use, from
+/// `docker container inspect --format '{{.Image}}\t{{.Config.Image}}'`:
+/// image IDs and the normalized references they were created from.
+#[derive(Debug, Default)]
+pub struct ImagesInUse {
+    pub ids: HashSet<String>,
+    pub references: HashSet<String>,
+}
+
+impl ImagesInUse {
+    pub fn add_inspect_output(&mut self, output: &str) {
+        for line in output.lines() {
+            let mut fields = line.trim().splitn(2, '\t');
+            if let Some(id) = fields.next().map(str::trim).filter(|s| !s.is_empty()) {
+                self.ids.insert(id.to_string());
+            }
+            if let Some(reference) = fields.next().map(str::trim).filter(|s| !s.is_empty()) {
+                self.references.insert(normalize_image_reference(reference));
+            }
+        }
+    }
+}
+
+/// An image a cleanup may remove, with every reference it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemovableImage {
+    pub id: String,
+    pub references: Vec<String>,
+}
+
+/// Tagged images that no container uses and that carry no release pin.
+/// An image counts as used when a container runs its ID or was created
+/// from one of its references, stopped containers included, so the images
+/// of stopped services are kept.
+pub fn removable_images(listing: &[(String, String)], in_use: &ImagesInUse) -> Vec<RemovableImage> {
+    let mut by_id: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, reference) in listing {
+        by_id.entry(id).or_default().push(reference);
+    }
+    by_id
+        .into_iter()
+        .filter(|(id, references)| {
+            !in_use.ids.contains(*id)
+                && !references.iter().any(|r| {
+                    is_release_pin(r) || in_use.references.contains(&normalize_image_reference(r))
+                })
+        })
+        .map(|(id, references)| RemovableImage {
+            id: id.to_string(),
+            references: references.into_iter().map(str::to_string).collect(),
+        })
+        .collect()
+}
+
+/// IDs of the images created before `cutoff`, from
+/// `docker image inspect --format '{{.Id}}\t{{.Created}}'`. Rows with an
+/// unreadable time are left out (kept).
+pub fn images_created_before(output: &str, cutoff: DateTime<Utc>) -> HashSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, created) = line.trim().split_once('\t')?;
+            let created = DateTime::parse_from_rfc3339(created.trim()).ok()?;
+            (created.with_timezone(&Utc) < cutoff).then(|| id.trim().to_string())
+        })
+        .collect()
+}
+
 fn parse_size(text: &str) -> Option<u64> {
     let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
     let (number, unit) = text.split_at(split);
@@ -312,6 +433,106 @@ mod tests {
         assert_eq!(prune_until_filter(168).unwrap(), "until=168h");
         assert!(prune_until_filter(0).is_err());
         assert!(prune_until_filter(MAX_PRUNE_AGE_HOURS + 1).is_err());
+    }
+
+    fn listing(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(id, r)| (id.to_string(), r.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn release_pins_are_recognised() {
+        assert!(is_release_pin(
+            "shop/web:deploy-0b7c3f1e-8a51-4d0c-9b8e-2f4a6c1d9e70"
+        ));
+        assert!(!is_release_pin("shop/web:deploy-latest"));
+        assert!(!is_release_pin(
+            "web:deploy-0b7c3f1e-8a51-4d0c-9b8e-2f4a6c1d9e70"
+        ));
+        assert!(!is_release_pin("nginx:1.27"));
+        assert!(!is_release_pin("nginx"));
+    }
+
+    #[test]
+    fn references_are_normalized_like_image_ls() {
+        assert_eq!(normalize_image_reference("nginx"), "nginx:latest");
+        assert_eq!(
+            normalize_image_reference("docker.io/library/nginx:1"),
+            "nginx:1"
+        );
+        assert_eq!(
+            normalize_image_reference("docker.io/me/app"),
+            "me/app:latest"
+        );
+        assert_eq!(
+            normalize_image_reference("registry:5000/team/app"),
+            "registry:5000/team/app:latest"
+        );
+        assert_eq!(
+            normalize_image_reference("ghcr.io/o/app@sha256:ab"),
+            "ghcr.io/o/app@sha256:ab"
+        );
+    }
+
+    #[test]
+    fn image_list_skips_untagged_rows() {
+        let out = "sha256:a\tnginx:1.27\nsha256:b\t<none>:<none>\nsha256:c\tapp:<none>\n\nbroken\n";
+        assert_eq!(
+            parse_image_list(out),
+            listing(&[("sha256:a", "nginx:1.27")])
+        );
+    }
+
+    #[test]
+    fn removable_images_keep_used_pinned_and_stopped_service_images() {
+        let pin = "shop/web:deploy-0b7c3f1e-8a51-4d0c-9b8e-2f4a6c1d9e70";
+        let images = listing(&[
+            ("sha256:running", "nginx:1.27"),
+            ("sha256:stopped-db", "postgres:16"),
+            ("sha256:by-name", "redis:latest"),
+            ("sha256:old-release", pin),
+            ("sha256:old-release", "scontrol-app/shop:previous"),
+            ("sha256:unused", "node:18"),
+            ("sha256:unused", "node:18-old"),
+            ("sha256:gone", "scontrol-app/deleted:latest"),
+        ]);
+        let mut in_use = ImagesInUse::default();
+        // A running and a stopped container by ID; one created by name only.
+        in_use.add_inspect_output(
+            "sha256:running\tnginx:1.27\nsha256:stopped-db\tpostgres:16\nsha256:other\tredis\n",
+        );
+        let removable = removable_images(&images, &in_use);
+        assert_eq!(
+            removable,
+            vec![
+                RemovableImage {
+                    id: "sha256:gone".into(),
+                    references: vec!["scontrol-app/deleted:latest".into()],
+                },
+                RemovableImage {
+                    id: "sha256:unused".into(),
+                    references: vec!["node:18".into(), "node:18-old".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn image_age_uses_the_creation_time() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let out = "sha256:old\t2026-10-01T10:00:00.123456789Z\nsha256:new\t2026-11-04T10:00:00Z\nsha256:odd\tyesterday\n";
+        let old = images_created_before(out, cutoff);
+        assert_eq!(old, HashSet::from(["sha256:old".to_string()]));
+    }
+
+    #[test]
+    fn parses_the_image_total_from_system_df() {
+        let out = "Images\t1.5GB\nContainers\t20MB\nLocal Volumes\t0B\nBuild Cache\t3GB\n";
+        assert_eq!(parse_df_images_bytes(out), Some(1_500_000_000));
+        assert_eq!(parse_df_images_bytes("Containers\t1MB"), None);
     }
 
     #[test]

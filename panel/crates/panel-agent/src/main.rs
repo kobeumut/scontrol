@@ -293,6 +293,22 @@ where
 }
 
 async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentResponse {
+    // Keep exclusion for the actual agent work, not the API's shorter RPC
+    // lifetime. A disconnected caller does not cancel this dispatch.
+    let _prune = if matches!(&request, AgentRequest::PruneDocker(_)) {
+        Some(adapter.docker_operations.write().await)
+    } else {
+        None
+    };
+    let _pull_or_build = if matches!(
+        &request,
+        AgentRequest::DeployComposeProject(_) | AgentRequest::CreateContainer(_)
+    ) {
+        Some(adapter.docker_operations.read().await)
+    } else {
+        None
+    };
+    // Cancellation and log requests must not wait behind a queued writer.
     match request {
         AgentRequest::Capabilities => AgentResponse::from_core_result(adapter.capabilities().await),
         AgentRequest::CreateSite(p) => {
@@ -459,6 +475,76 @@ async fn dispatch(adapter: &LocalAdapter, request: AgentRequest) -> AgentRespons
         }
         AgentRequest::CloseTerminal(p) => {
             AgentResponse::from_core_result(adapter.close_terminal(p).await)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use panel_core::adapters::{CreateContainerParams, PruneDockerParams};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn docker_exclusion_survives_rpc_disconnect_in_both_directions() {
+        for pruning in [true, false] {
+            // No Docker commands are run by this test.
+            let config = toml::from_str("[runtime_features]\ndocker = false\n").unwrap();
+            let adapter = Arc::new(LocalAdapter::new(config));
+            let request = if pruning {
+                AgentRequest::PruneDocker(PruneDockerParams {
+                    older_than_hours: 168,
+                })
+            } else {
+                AgentRequest::CreateContainer(CreateContainerParams {
+                    name: "test".into(),
+                    image: "test:latest".into(),
+                    ports: vec![],
+                    env: vec![],
+                })
+            };
+            let busy_build = if pruning {
+                Some(adapter.docker_operations.read().await)
+            } else {
+                None
+            };
+            let busy_prune = if pruning {
+                None
+            } else {
+                Some(adapter.docker_operations.write().await)
+            };
+            let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (read, write) = server.into_split();
+            client
+                .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            let mut serving = Box::pin(handle_connection(read, write, adapter.clone(), None));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut serving)
+                    .await
+                    .is_err()
+            );
+            drop(client); // The API went away; work must still respect the host gate.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut serving)
+                    .await
+                    .is_err()
+            );
+            // Cancellation requests remain usable even with a writer queued.
+            let cancel =
+                AgentRequest::CancelDeployment(panel_core::adapters::CancelDeploymentParams {
+                    deployment_id: uuid::Uuid::new_v4(),
+                });
+            tokio::time::timeout(Duration::from_secs(1), dispatch(&adapter, cancel))
+                .await
+                .unwrap();
+            drop((busy_build, busy_prune));
+            tokio::time::timeout(Duration::from_secs(1), serving)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(adapter.docker_operations.try_write().is_ok());
         }
     }
 }

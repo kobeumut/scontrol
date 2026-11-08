@@ -871,6 +871,9 @@ pub mod mock {
         pub terminals: Mutex<Vec<OpenTerminalParams>>,
         pub prune_outcome: Mutex<Option<DockerPruneOutcome>>,
         pub prunes: Mutex<Vec<PruneDockerParams>>,
+        /// How long `prune_docker` takes, so tests can overlap or time out a
+        /// cleanup.
+        pub prune_delay: Mutex<Option<std::time::Duration>>,
         /// What `metrics_snapshot` returns, so tests can drive the collector.
         pub metrics: Mutex<Option<crate::metrics::MetricsSnapshot>>,
         /// Every `backup_database` request received.
@@ -1299,6 +1302,10 @@ pub mod mock {
         async fn prune_docker(&self, params: PruneDockerParams) -> CoreResult<DockerPruneOutcome> {
             self.record("prune_docker")?;
             self.prunes.lock().unwrap().push(params);
+            let delay = *self.prune_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(self
                 .prune_outcome
                 .lock()

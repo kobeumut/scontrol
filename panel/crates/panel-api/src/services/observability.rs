@@ -3,9 +3,18 @@
 //!
 //! Costs when idle: one agent call a minute (a stat of the log file when
 //! nothing is new) and one settings query every five minutes.
+//!
+//! A cleanup never overlaps a deployment on the same server: it does not
+//! start while one is queued or running there, and the deployment queue
+//! claims nothing on a server while its cleanup runs (both checks hold the
+//! claim lock, see `db::observability::start_run`). Docker 29's containerd
+//! image store loses in-flight pull leases to a concurrent prune
+//! (moby/moby#53321), and a builder prune can pull the cache from under a
+//! running build. A scheduled cleanup that finds the server busy is simply
+//! retried at the next check.
 
 use crate::db;
-use crate::db::observability::{CleanupRun, CleanupSettings};
+use crate::db::observability::{CleanupRun, CleanupSettings, StartRun};
 use crate::error::{ApiError, ApiResult};
 use crate::services::agent_pool::AgentPool;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -27,6 +36,10 @@ pub const STATS_RETENTION_DAYS: i32 = 30;
 
 /// Longest one server's statistics read or cleanup check may take.
 const SERVER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Longest panel-api waits for the agent's cleanup (the agent bounds its own
+/// work at 25 minutes); the run is then recorded as failed. Below
+/// `db::observability::CLEANUP_STALE_SECS`.
+pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Every server: the panel host and each remote server.
 async fn server_ids(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
@@ -113,7 +126,7 @@ pub fn start(db: PgPool, agents: AgentPool) {
                 "scheduled docker cleanup check",
                 |server, agent| {
                     let db = &db;
-                    async move { scheduled_cleanup_tick(db, agent.as_ref(), server).await }
+                    async move { scheduled_cleanup_tick(db, agent, server).await }
                 },
             )
             .await;
@@ -160,39 +173,81 @@ pub async fn collect_stats(db: &PgPool, agent: &dyn AdapterPort, server: Uuid) -
     Ok(total)
 }
 
-/// Runs one cleanup and records it. `Conflict` while one is running.
+/// Runs one cleanup and records it. `Conflict` while another cleanup runs
+/// or deployments are queued or running on the server.
 pub async fn run_cleanup(
     db: &PgPool,
-    agent: &dyn AdapterPort,
+    agent: Arc<dyn AdapterPort>,
     server: Uuid,
     trigger: &str,
     older_than_hours: u32,
 ) -> ApiResult<CleanupRun> {
+    let (_, task) = start_cleanup(
+        db,
+        agent,
+        server,
+        trigger,
+        older_than_hours,
+        CLEANUP_TIMEOUT,
+    )
+    .await?;
+    task.await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("docker cleanup task failed: {e}")))?
+}
+
+/// Records a `running` cleanup and spawns the task that runs it on the
+/// agent and finishes the row. The task owns both, so a caller that goes
+/// away (a closed HTTP request, the scheduler's per-server timeout) never
+/// leaves the row `running`, which would hold back every deployment on the
+/// server. An agent that gives no result within `timeout` fails the run.
+async fn start_cleanup(
+    db: &PgPool,
+    agent: Arc<dyn AdapterPort>,
+    server: Uuid,
+    trigger: &str,
+    older_than_hours: u32,
+    timeout: Duration,
+) -> ApiResult<(CleanupRun, tokio::task::JoinHandle<ApiResult<CleanupRun>>)> {
     panel_core::observability::prune_until_filter(older_than_hours)
         .map_err(|m| ApiError::Core(CoreError::Validation(m)))?;
-    let run = db::observability::start_run(db, server, trigger, older_than_hours as i32)
-        .await?
-        .ok_or_else(|| ApiError::Conflict("a Docker cleanup is already running".into()))?;
-    let result = agent
-        .prune_docker(PruneDockerParams { older_than_hours })
-        .await;
-    let finished = match &result {
-        Ok(o) => {
-            db::observability::finish_run(
-                db,
-                run.id,
-                Ok((o.images_freed_bytes, o.builder_freed_bytes)),
-            )
-            .await?
-        }
-        Err(error) => {
+    let run =
+        match db::observability::start_run(db, server, trigger, older_than_hours as i32).await? {
+            StartRun::Started(run) => run,
+            StartRun::CleanupRunning => {
+                return Err(ApiError::Conflict(
+                    "a Docker cleanup is already running".into(),
+                ))
+            }
+            StartRun::DeploymentsActive(n) => {
+                return Err(ApiError::Conflict(format!(
+                    "{n} deployment(s) are queued or running on this server; \
+                 Docker cleanup waits until they finish"
+                )))
+            }
+        };
+    let (db, id) = (db.clone(), run.id);
+    let task = tokio::spawn(async move {
+        let prune = agent.prune_docker(PruneDockerParams { older_than_hours });
+        let result = match tokio::time::timeout(timeout, prune).await {
+            Ok(Ok(o)) => Ok((o.images_freed_bytes, o.builder_freed_bytes)),
             // The agent's message can carry Docker's stderr: keep it short.
-            let message: String = error.to_string().chars().take(500).collect();
-            db::observability::finish_run(db, run.id, Err(&message)).await?
-        }
-    };
-    let _ = db::observability::trim_runs(db).await;
-    Ok(finished)
+            Ok(Err(error)) => Err(error.to_string().chars().take(500).collect::<String>()),
+            Err(_) => Err(format!(
+                "the agent gave no result within {} s",
+                timeout.as_secs_f64()
+            )),
+        };
+        let finished = db::observability::finish_run(
+            &db,
+            id,
+            result.as_ref().copied().map_err(String::as_str),
+        )
+        .await?;
+        let _ = db::observability::trim_runs(&db).await;
+        tracing::info!(run_id = %id, status = %finished.status, "docker cleanup finished");
+        Ok(finished)
+    });
+    Ok((run, task))
 }
 
 /// Whether an automatic cleanup is due. The first one runs a full interval
@@ -208,25 +263,33 @@ pub fn cleanup_due(
         })
 }
 
+/// Starts a due cleanup and returns without waiting for it: the run can
+/// take longer than [`SERVER_TIMEOUT`], and its task records the result.
+/// A busy server (cleanup or deployments) is tried again at the next check.
 async fn scheduled_cleanup_tick(
     db: &PgPool,
-    agent: &dyn AdapterPort,
+    agent: Arc<dyn AdapterPort>,
     server: Uuid,
 ) -> ApiResult<()> {
     let settings = db::observability::cleanup_settings(db).await?;
     let last = db::observability::last_scheduled_start(db, server).await?;
     if cleanup_due(&settings, last, Utc::now()) {
-        match run_cleanup(
+        match start_cleanup(
             db,
             agent,
             server,
             "schedule",
             settings.older_than_hours as u32,
+            CLEANUP_TIMEOUT,
         )
         .await
         {
-            Ok(run) => tracing::info!(status = %run.status, "scheduled docker cleanup finished"),
-            Err(ApiError::Conflict(_)) => {}
+            Ok((run, _)) => {
+                tracing::info!(%server, run_id = %run.id, "scheduled docker cleanup started")
+            }
+            Err(ApiError::Conflict(reason)) => {
+                tracing::info!(%server, %reason, "scheduled docker cleanup deferred")
+            }
             Err(error) => return Err(error),
         }
     }
@@ -249,6 +312,45 @@ mod tests {
             interval_hours: hours,
             older_than_hours: 168,
         }
+    }
+
+    #[tokio::test]
+    async fn trimming_cleanup_history_never_deletes_an_active_run() {
+        let _guard = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let server = server(&pool).await;
+        let active = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO docker_cleanup_runs (id, server_id, trigger, status, older_than_hours, started_at)
+             VALUES ($1, $2, 'manual', 'running', 168, now() - interval '2 hours')",
+        ).bind(active).bind(server).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO docker_cleanup_runs (id, server_id, trigger, status, older_than_hours)
+             SELECT gen_random_uuid(), $1, 'manual', 'succeeded', 168 FROM generate_series(1, 101)",
+        )
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+        db::observability::trim_runs(&pool).await.unwrap();
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM docker_cleanup_runs WHERE id = $1 AND status = 'running')",
+        )
+        .bind(active)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists);
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM docker_cleanup_runs WHERE status != 'running'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(completed, 100);
+        db::observability::finish_run(&pool, active, Ok((0, 0)))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -327,20 +429,95 @@ mod tests {
         assert_eq!(series[0].requests, 5);
     }
 
+    /// A fresh remote server, so leftovers of other tests on this host
+    /// (queued deployments, cleanup rows) cannot interfere.
+    async fn server(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        db::servers::insert(
+            pool,
+            db::servers::NewServer {
+                id,
+                name: &format!("c-{}", &id.simple().to_string()[..8]),
+                transport: db::servers::Transport::SshSocket,
+                address: "/run/scontrol/remote/c.sock",
+                max_services: None,
+            },
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn service_on(pool: &PgPool, server: Uuid) -> Uuid {
+        let (id, _) = crate::test_support::compose_project(pool).await;
+        sqlx::query("UPDATE compose_projects SET server_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(server)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn enqueue(pool: &PgPool, project: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        db::compose_projects::enqueue_deployment(
+            pool,
+            id,
+            project,
+            "agent://t",
+            false,
+            "manual",
+            None,
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn finish(pool: &PgPool, deployment: Uuid) {
+        db::compose_projects::finish_deployment(
+            pool,
+            deployment,
+            panel_core::types::DeploymentStatus::Succeeded,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn latest_run(pool: &PgPool, server: Uuid) -> (String, Option<String>) {
+        sqlx::query_as(
+            "SELECT status, error_message FROM docker_cleanup_runs
+             WHERE server_id = $1 ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(server)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn remove(pool: &PgPool, services: &[Uuid], servers: &[Uuid]) {
+        for id in services {
+            db::compose_projects::delete(pool, *id).await.unwrap();
+        }
+        for id in servers {
+            db::servers::delete(pool, *id).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn cleanup_records_freed_space_failures_and_overlap() {
         let _guard = QUEUE_TESTS.lock().await;
         let pool = test_pool().await;
-        sqlx::query("DELETE FROM docker_cleanup_runs")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let adapter = MockAdapter::new();
+        let server = server(&pool).await;
+        let adapter = Arc::new(MockAdapter::new());
         *adapter.prune_outcome.lock().unwrap() = Some(DockerPruneOutcome {
             images_freed_bytes: 1000,
             builder_freed_bytes: 234,
         });
-        let run = run_cleanup(&pool, &adapter, LOCAL, "manual", 168)
+        let run = run_cleanup(&pool, adapter.clone(), server, "manual", 168)
             .await
             .unwrap();
         assert_eq!(run.status, "succeeded");
@@ -351,30 +528,181 @@ mod tests {
         assert_eq!(adapter.prunes.lock().unwrap()[0].older_than_hours, 168);
 
         adapter.fail_next_call("prune_docker");
-        let failed = run_cleanup(&pool, &adapter, LOCAL, "schedule", 24)
+        let failed = run_cleanup(&pool, adapter.clone(), server, "schedule", 24)
             .await
             .unwrap();
         assert_eq!(failed.status, "failed");
         assert!(failed.error_message.is_some());
 
         // Out-of-range ages never reach the agent.
-        assert!(run_cleanup(&pool, &adapter, LOCAL, "manual", 0)
+        assert!(run_cleanup(&pool, adapter.clone(), server, "manual", 0)
             .await
             .is_err());
         assert_eq!(adapter.prunes.lock().unwrap().len(), 1);
 
         // A running row blocks another run.
-        let running = db::observability::start_run(&pool, LOCAL, "manual", 1)
+        let StartRun::Started(running) = db::observability::start_run(&pool, server, "manual", 1)
             .await
             .unwrap()
-            .unwrap();
+        else {
+            panic!("expected a started run");
+        };
         assert!(matches!(
-            run_cleanup(&pool, &adapter, LOCAL, "manual", 168).await,
+            run_cleanup(&pool, adapter.clone(), server, "manual", 168).await,
             Err(ApiError::Conflict(_))
         ));
         db::observability::finish_run(&pool, running.id, Ok((0, 0)))
             .await
             .unwrap();
+        remove(&pool, &[], &[server]).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_and_deployments_on_one_server_exclude_each_other() {
+        let _guard = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let (busy, other) = (server(&pool).await, server(&pool).await);
+        let (web, api) = (
+            service_on(&pool, busy).await,
+            service_on(&pool, other).await,
+        );
+        let adapter = Arc::new(MockAdapter::new());
+
+        // A queued deployment holds back a cleanup of its server only.
+        let queued = enqueue(&pool, web).await;
+        match run_cleanup(&pool, adapter.clone(), busy, "manual", 168).await {
+            Err(ApiError::Conflict(message)) => assert!(message.contains("deployment")),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert!(adapter.prunes.lock().unwrap().is_empty());
+        let elsewhere = run_cleanup(&pool, adapter.clone(), other, "manual", 168)
+            .await
+            .unwrap();
+        assert_eq!(elsewhere.status, "succeeded");
+
+        // So does a running one.
+        let job = db::compose_projects::claim_next_deployment_of(&pool, Some(web))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, queued);
+        assert!(matches!(
+            run_cleanup(&pool, adapter.clone(), busy, "schedule", 168).await,
+            Err(ApiError::Conflict(_))
+        ));
+        assert_eq!(adapter.prunes.lock().unwrap().len(), 1);
+        finish(&pool, job.id).await;
+
+        // While the cleanup runs, nothing is claimed on its server; other
+        // servers keep deploying.
+        *adapter.prune_delay.lock().unwrap() = Some(Duration::from_millis(400));
+        let (run, task) =
+            start_cleanup(&pool, adapter.clone(), busy, "manual", 168, CLEANUP_TIMEOUT)
+                .await
+                .unwrap();
+        assert_eq!(run.status, "running");
+        let blocked = enqueue(&pool, web).await;
+        let free = enqueue(&pool, api).await;
+        assert!(
+            db::compose_projects::claim_next_deployment_of(&pool, Some(web))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let claimed = db::compose_projects::claim_next_deployment_of(&pool, Some(api))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, free);
+        finish(&pool, free).await;
+
+        // Once it finished, the held-back deployment is claimed.
+        assert_eq!(task.await.unwrap().unwrap().status, "succeeded");
+        let claimed = db::compose_projects::claim_next_deployment_of(&pool, Some(web))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, blocked);
+        finish(&pool, blocked).await;
+        remove(&pool, &[web, api], &[busy, other]).await;
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_always_finishes_its_row() {
+        let _guard = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let server = server(&pool).await;
+        let adapter = Arc::new(MockAdapter::new());
+
+        // The caller goes away (closed request, scheduler timeout): the run
+        // still finishes and stops holding back deployments.
+        *adapter.prune_delay.lock().unwrap() = Some(Duration::from_millis(200));
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(20),
+            run_cleanup(&pool, adapter.clone(), server, "manual", 168),
+        )
+        .await;
+        assert!(dropped.is_err());
+        assert_eq!(latest_run(&pool, server).await.0, "running");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(latest_run(&pool, server).await.0, "succeeded");
+
+        // An agent that never answers fails the run at the time limit.
+        *adapter.prune_delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let (_, task) = start_cleanup(
+            &pool,
+            adapter.clone(),
+            server,
+            "schedule",
+            168,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        let failed = task.await.unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(failed.error_message.unwrap().contains("no result"));
+        remove(&pool, &[], &[server]).await;
+    }
+
+    #[tokio::test]
+    async fn a_lost_cleanup_does_not_hold_deployments_forever() {
+        let _guard = QUEUE_TESTS.lock().await;
+        let pool = test_pool().await;
+        let server = server(&pool).await;
+        let web = service_on(&pool, server).await;
+        // A run left `running` by a panel-api that died long ago.
+        sqlx::query(
+            "INSERT INTO docker_cleanup_runs (id, trigger, status, older_than_hours, server_id, started_at)
+             VALUES ($1, 'schedule', 'running', 168, $2, now() - interval '2 hours')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(server)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let queued = enqueue(&pool, web).await;
+        let claimed = db::compose_projects::claim_next_deployment_of(&pool, Some(web))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, queued);
+        finish(&pool, queued).await;
+
+        // The next start fails it and runs.
+        let run = run_cleanup(&pool, Arc::new(MockAdapter::new()), server, "manual", 168)
+            .await
+            .unwrap();
+        assert_eq!(run.status, "succeeded");
+        let failed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM docker_cleanup_runs WHERE server_id = $1 AND status = 'failed'",
+        )
+        .bind(server)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(failed, 1);
+        remove(&pool, &[web], &[server]).await;
     }
 
     #[tokio::test]
@@ -416,14 +744,18 @@ mod tests {
         assert_eq!(local_after.file_id, local_before.file_id);
 
         // Cleanups run one at a time per server, not across servers.
-        let a = db::observability::start_run(&pool, id, "manual", 1)
+        let StartRun::Started(a) = db::observability::start_run(&pool, id, "manual", 1)
             .await
             .unwrap()
-            .unwrap();
-        assert!(db::observability::start_run(&pool, id, "manual", 1)
-            .await
-            .unwrap()
-            .is_none());
+        else {
+            panic!("expected a started run");
+        };
+        assert!(matches!(
+            db::observability::start_run(&pool, id, "manual", 1)
+                .await
+                .unwrap(),
+            StartRun::CleanupRunning
+        ));
         db::observability::finish_run(&pool, a.id, Ok((0, 0)))
             .await
             .unwrap();

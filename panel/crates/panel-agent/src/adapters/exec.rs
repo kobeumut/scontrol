@@ -84,6 +84,20 @@ pub async fn run(program: &str, args: &[&str]) -> CoreResult<String> {
     checked_stdout(program, output)
 }
 
+/// Same as [`run`], with an explicit limit and the same process-group
+/// cleanup on timeout or cancellation.
+#[cfg(feature = "docker")]
+pub async fn run_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> CoreResult<String> {
+    check_program(program)?;
+    tracing::debug!(program, ?args, "exec (timeout)");
+    let output = output_within(program, args, &[], None, timeout).await?;
+    checked_stdout(program, output)
+}
+
 /// Same as [`run`], with `stdin` written to the child. Use it for any input
 /// that must not be visible in the process table (`ps` shows argv to every
 /// local user), such as SQL that carries a password.
