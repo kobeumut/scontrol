@@ -55,7 +55,7 @@ async fn compose_push(
         Delivery::PullRequest(event) => {
             let outcome = previews::handle_event(
                 &state.db,
-                state.agent.clone(),
+                state.agents.clone(),
                 &state.deploy_queue,
                 &state.previews,
                 &project,

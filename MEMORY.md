@@ -1,8 +1,13 @@
 # MEMORY.md
 
-Durable project context that is not obvious from the code. Read it together with `AGENTS.md`. Status and checklists live in `TASK.md`; this file records decisions and why they were made. Last reviewed: 2026-11-03.
+Durable project context that is not obvious from the code. Read it together with `AGENTS.md`. Status and checklists live in `TASK.md`; this file records decisions and why they were made. Last reviewed: 2026-11-05.
 
 ## Decisions
+
+- **Vhost secrets are immutable generations (GENE-82, 2026-11-05).** Nginx configuration points at a UUID generation, and failed validation/reload restores the previous config without changing its certificate/key. A host-wide lock serializes all Nginx config/reload paths. Keep old generations until safe reference-aware GC exists; never unlink an old key merely because a newer API update committed.
+- **Preview removal is fenced across RPC lifetimes (GENE-82).** Panel-side locks cannot stop an abandoned remote call. Agent deploy/remove therefore share a slug lock, project-ID marker and persistent removed-ID tombstones; a repeated removal cannot adopt a recreated but still-undeployed directory. Parent deletion intent is durable (0021) and disable cleanup never re-disables settings after re-enable. Upgrade agents before panel-api; mixed old agents lack these guarantees.
+- **Terminal/template capabilities are explicit, scoped grants (GENE-82).** `services:terminal` is not implied by deploying a service; `templates:install` alone cannot create, write variables or deploy. Remote terminal requests return 409 rather than using the local host. Agent pool routing applies to secret writes and all preview lifecycle callbacks.
+- **YAML merge expansion precedes security policy (GENE-82).** Validate the expanded values, including volume/network names/external fields, driver options and service privilege settings. Raw mapping checks miss inherited fields.
 
 - **Docker is a Dokploy-style deployment workflow, not a container dashboard.** Per the plan's research summary, HestiaCP and CloudPanel both lack Docker support. A Portainer-style dashboard was rejected in favour of application and Compose deployments (`TASK.md`, Docker section).
   - How to apply: do not add `docker run` or raw container CRUD endpoints. Model work as projects and Compose deployments.

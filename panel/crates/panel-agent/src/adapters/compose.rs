@@ -51,8 +51,8 @@ use super::vhost_secrets;
 use crate::config::AgentConfig;
 use panel_core::adapters::{
     ComposeProjectActionParams, ComposeProjectLogsParams, DeployComposeProjectParams,
-    DeploymentLogParams, FollowComposeLogsParams, LogLines, WriteComposeEnvironmentParams,
-    LOG_LINES_CAPACITY,
+    DeploymentLogParams, FollowComposeLogsParams, LogLines, RemoveComposeProjectParams,
+    WriteComposeEnvironmentParams, LOG_LINES_CAPACITY,
 };
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::previews::{ResourceLimits, PREVIEW_PIDS_LIMIT};
@@ -96,6 +96,101 @@ const STATIC_RELEASES_RETAINED: usize = 3;
 const MAX_DOMAIN_BINDINGS: usize = 32;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CERTBOT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const PROJECT_ID_FILE: &str = ".scontrol-project-id";
+
+// Weak entries avoid retaining a lock for every project ever seen. The slug
+// lock fences separate RPC connections, including abandoned timed-out requests.
+type ProjectLocks = std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>;
+static PROJECT_LOCKS: once_cell::sync::Lazy<tokio::sync::Mutex<ProjectLocks>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(ProjectLocks::new()));
+
+async fn project_guard(root: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let mut locks = PROJECT_LOCKS.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = locks
+        .get(root)
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap_or_else(|| {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(root.to_path_buf(), Arc::downgrade(&lock));
+            lock
+        });
+    drop(locks);
+    lock.lock_owned().await
+}
+
+async fn project_owner(root: &Path) -> CoreResult<Option<uuid::Uuid>> {
+    match tokio::fs::read_to_string(root.join(PROJECT_ID_FILE)).await {
+        Ok(id) => uuid::Uuid::parse_str(id.trim())
+            .map(Some)
+            .map_err(|_| CoreError::Validation("invalid project incarnation marker".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CoreError::Io(format!("reading project incarnation: {e}"))),
+    }
+}
+
+async fn prepare_incarnation(cfg: &AgentConfig, root: &Path, id: uuid::Uuid) -> CoreResult<()> {
+    match tokio::fs::metadata(
+        cfg.docker_projects_root
+            .join(".removed")
+            .join(id.to_string()),
+    )
+    .await
+    {
+        Ok(_) => {
+            return Err(CoreError::Cancelled(
+                "project incarnation was removed".into(),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CoreError::Io(e.to_string())),
+    }
+    if project_owner(root).await?.is_some_and(|owner| owner != id) {
+        return Err(CoreError::Validation(
+            "project slug belongs to another incarnation".into(),
+        ));
+    }
+    create_private_dir(root).await?;
+    tokio::fs::write(root.join(PROJECT_ID_FILE), id.to_string())
+        .await
+        .map_err(|e| CoreError::Io(format!("recording project incarnation: {e}")))
+}
+
+/// Called only with the slug lock. A stale removal is an idempotent no-op.
+async fn fence_removal(
+    cfg: &AgentConfig,
+    root: &Path,
+    expected: Option<uuid::Uuid>,
+) -> CoreResult<bool> {
+    let Some(expected) = expected else {
+        return Ok(true);
+    };
+    let owner = project_owner(root).await?;
+    if owner.is_none() {
+        // A first removal may adopt a pre-upgrade/pre-deployment directory.
+        // A repeated old removal must NOT adopt a new, not-yet-deployed slug.
+        match tokio::fs::metadata(
+            cfg.docker_projects_root
+                .join(".removed")
+                .join(expected.to_string()),
+        )
+        .await
+        {
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Io(e.to_string())),
+        }
+        if root.exists() {
+            prepare_incarnation(cfg, root, expected).await?;
+        }
+    }
+    let tombstones = cfg.docker_projects_root.join(".removed");
+    create_private_dir(&tombstones).await?;
+    tokio::fs::write(tombstones.join(expected.to_string()), b"")
+        .await
+        .map_err(|e| CoreError::Io(format!("fencing removed project: {e}")))?;
+    Ok(owner.is_none_or(|owner| owner == expected))
+}
 
 pub async fn deploy(
     cfg: &AgentConfig,
@@ -104,7 +199,8 @@ pub async fn deploy(
 ) -> CoreResult<ComposeDeployOutcome> {
     validate_project_params(&params)?;
     let root = project_root(cfg, &params.project_slug);
-    create_private_dir(&root).await?;
+    let _lifecycle = project_guard(&root).await;
+    prepare_incarnation(cfg, &root, params.project_id).await?;
 
     let env_path = root.join(ENV_FILE);
     adopt_legacy_env_file(&root, &env_path).await;
@@ -491,17 +587,21 @@ pub async fn service_action(
     Ok(())
 }
 
-pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> CoreResult<()> {
+pub async fn remove(cfg: &AgentConfig, params: RemoveComposeProjectParams) -> CoreResult<()> {
     if !validate::is_valid_project_slug(&params.project_slug) {
         return Err(CoreError::Validation(format!(
             "invalid project slug: {}",
             params.project_slug
         )));
     }
+    let root = project_root(cfg, &params.project_slug);
+    let _lifecycle = project_guard(&root).await;
+    if !fence_removal(cfg, &root, params.expected_project_id).await? {
+        return Ok(());
+    }
     // Timers of the project's scheduled jobs go first: they would otherwise
     // keep firing into a project that no longer exists.
     super::scheduled_jobs::remove_project_jobs(cfg, &params.project_slug).await?;
-    let root = project_root(cfg, &params.project_slug);
     // A database service may be reachable from outside through a stream
     // proxy and firewall rule; close that first.
     db_exposure::clear(cfg, &root, &params.project_slug).await?;
@@ -509,12 +609,7 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
     if root.join(STATIC_MARKER).exists() || static_dir.exists() {
         // A static site: no containers, only vhosts and release files.
         let owned = read_owned_domains(&root).await;
-        for domain in &owned {
-            nginx::remove_compose_vhost(cfg, domain).await?;
-        }
-        if !owned.is_empty() {
-            nginx::test_and_reload().await?;
-        }
+        remove_domains(cfg, &owned).await?;
         for dir in [&static_dir, &root] {
             if dir.exists() {
                 tokio::fs::remove_dir_all(dir)
@@ -557,12 +652,7 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
         remove_owned_volumes(&params.project_slug).await?;
     }
     let owned = read_owned_domains(&root).await;
-    for domain in &owned {
-        nginx::remove_compose_vhost(cfg, domain).await?;
-    }
-    if !owned.is_empty() {
-        nginx::test_and_reload().await?;
-    }
+    remove_domains(cfg, &owned).await?;
     // The containers are gone, so the release tags can go with them.
     releases::remove_all(&root, &params.project_slug).await;
     tokio::fs::remove_dir_all(&root)
@@ -1404,6 +1494,7 @@ fn effective_publications_are_managed(
 /// network names, `external` resources, `volumes_from`, `external_links`,
 /// and namespace sharing with containers are refused.
 fn ephemeral_policy(yaml: &Yaml) -> CoreResult<()> {
+    let yaml = expand_merges(yaml.clone())?;
     for section in ["volumes", "networks"] {
         if let Some(entries) = yaml.get(section).and_then(Yaml::as_mapping) {
             for (name, entry) in entries {
@@ -1498,6 +1589,68 @@ fn owned_volume_names<'a>(slug: &str, listing: &'a str) -> Vec<&'a str> {
 /// not a failed deployment, and the domain keeps serving plain HTTP.
 /// `static_site` is the release directory (and SPA flag) of a static site;
 /// otherwise each binding proxies to its loopback port.
+async fn remove_domains(cfg: &AgentConfig, domains: &[String]) -> CoreResult<()> {
+    if domains.is_empty() {
+        return Ok(());
+    }
+    let _guard = nginx::CONFIG_LOCK.lock().await;
+    let changes: Vec<_> = domains.iter().map(|d| (d.clone(), None)).collect();
+    apply_vhost_changes(cfg, &changes, nginx::test_and_reload_unlocked).await
+}
+
+async fn apply_vhost_changes<F, Fut>(
+    cfg: &AgentConfig,
+    changes: &[(String, Option<String>)],
+    mut reload: F,
+) -> CoreResult<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = CoreResult<()>>,
+{
+    let mut backups = Vec::new();
+    // A read failure is not an absent vhost: never replace what we cannot back up.
+    for (domain, _) in changes {
+        let path = cfg
+            .nginx_sites_available
+            .join(format!("scontrol-compose-{domain}.conf"));
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(content) => Some(content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(CoreError::Io(format!("backing up vhost: {e}"))),
+        };
+        backups.push((domain.clone(), content));
+    }
+    let result = async {
+        for (domain, content) in changes {
+            match content {
+                Some(content) => nginx::write_compose_vhost(cfg, domain, content).await?,
+                None => nginx::remove_compose_vhost(cfg, domain).await?,
+            }
+        }
+        reload().await
+    }
+    .await;
+    if let Err(error) = result {
+        for (domain, content) in backups {
+            match content {
+                Some(content) => nginx::write_compose_vhost(cfg, &domain, &content).await?,
+                None => nginx::remove_compose_vhost(cfg, &domain).await?,
+            }
+        }
+        // Reload can fail after the master accepted new files. Reload the restored
+        // config too; both immutable secret generations are still intact.
+        reload().await.map_err(|rollback| {
+            CoreError::External(format!(
+                "Nginx update failed: {error}; reloading restored configuration failed: {rollback}"
+            ))
+        })?;
+        return Err(CoreError::External(format!(
+            "Nginx update failed and was rolled back: {error}"
+        )));
+    }
+    Ok(())
+}
+
 async fn apply_domains(
     cfg: &AgentConfig,
     project_slug: &str,
@@ -1507,6 +1660,7 @@ async fn apply_domains(
     static_site: Option<(&Path, bool)>,
     log: &mut DeployLog,
 ) -> CoreResult<Vec<String>> {
+    let guard = nginx::CONFIG_LOCK.lock().await;
     let target = |binding: &ComposeDomainBinding| match static_site {
         Some((root, spa)) => VhostTarget::Static { root, spa },
         None => VhostTarget::Proxy(binding.host_port),
@@ -1522,13 +1676,10 @@ async fn apply_domains(
     }
     log.step("configuring domains").await?;
 
-    let mut backups: Vec<(String, Option<String>)> = Vec::new();
+    let mut changes = Vec::new();
     for binding in bindings {
-        backups.push((
-            binding.domain.clone(),
-            nginx::read_compose_vhost(cfg, &binding.domain).await,
-        ));
-        let dir = vhost_secrets::secrets_dir(cfg, &binding.domain);
+        let dir =
+            vhost_secrets::revision_dir(cfg, &binding.domain, binding.options.secret_revision);
         let tls = (binding.https
             && nginx::certificate_available(cfg, certificate_of(binding), &binding.options, &dir))
         .then(|| certificate_of(binding));
@@ -1541,38 +1692,20 @@ async fn apply_domains(
             &binding.options,
             &dir,
         );
-        nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
+        changes.push((binding.domain.clone(), Some(content)));
     }
     for stale in previous
         .iter()
         .filter(|domain| !bindings.iter().any(|b| &b.domain == *domain))
     {
-        backups.push((stale.clone(), nginx::read_compose_vhost(cfg, stale).await));
-        nginx::remove_compose_vhost(cfg, stale).await?;
+        changes.push((stale.clone(), None));
     }
-    // Secrets of dropped domains go only after Nginx accepted the change.
-    let dropped: Vec<String> = previous
-        .iter()
-        .filter(|domain| !bindings.iter().any(|b| &b.domain == *domain))
-        .cloned()
-        .collect();
-    if let Err(error) = nginx::test_and_reload().await {
-        for (domain, content) in backups {
-            match content {
-                Some(content) => nginx::write_compose_vhost(cfg, &domain, &content)
-                    .await
-                    .ok(),
-                None => nginx::remove_compose_vhost(cfg, &domain).await.ok(),
-            };
-        }
-        return Err(CoreError::External(format!(
-            "generated Nginx configuration was rejected and rolled back: {error}"
-        )));
-    }
+    apply_vhost_changes(cfg, &changes, nginx::test_and_reload_unlocked).await?;
     write_owned_domains(root, bindings).await?;
-    for domain in &dropped {
-        vhost_secrets::remove_domain_secrets(cfg, domain).await;
-    }
+    drop(guard); // certonly --webroot does not mutate Nginx; never lock during ACME.
+                 // ponytail: retain secret generations; a stale deployment cannot know which
+                 // revisions a re-bound domain or an in-flight deployment still references.
+                 // Collect only with an authoritative cross-deployment reference inventory.
 
     let mut warnings = Vec::new();
     // A named (wildcard) certificate is issued out of band, never by certbot
@@ -1586,7 +1719,7 @@ async fn apply_domains(
             binding.domain
         ));
     }
-    let mut reload = false;
+    let mut tls_changes = Vec::new();
     for binding in bindings.iter().filter(|b| {
         b.https && b.certificate.is_none() && !nginx::certificate_exists(cfg, &b.domain)
     }) {
@@ -1596,7 +1729,7 @@ async fn apply_domains(
                 cfg,
                 &binding.domain,
                 &binding.options,
-                &vhost_secrets::secrets_dir(cfg, &binding.domain),
+                &vhost_secrets::revision_dir(cfg, &binding.domain, binding.options.secret_revision),
             ) {
                 warnings.push(format!(
                     "no custom certificate uploaded for {}; serving HTTP only",
@@ -1626,10 +1759,9 @@ async fn apply_domains(
                 &target(binding),
                 Some(&binding.domain),
                 &binding.options,
-                &vhost_secrets::secrets_dir(cfg, &binding.domain),
+                &vhost_secrets::revision_dir(cfg, &binding.domain, binding.options.secret_revision),
             );
-            nginx::write_compose_vhost(cfg, &binding.domain, &content).await?;
-            reload = true;
+            tls_changes.push((binding.domain.clone(), Some(content)));
         } else {
             warnings.push(format!(
                 "certificate for {} could not be issued; serving HTTP only",
@@ -1637,8 +1769,26 @@ async fn apply_domains(
             ));
         }
     }
-    if reload {
-        nginx::test_and_reload().await?;
+    if !tls_changes.is_empty() {
+        let _guard = nginx::CONFIG_LOCK.lock().await;
+        for (domain, _) in &tls_changes {
+            let original = changes
+                .iter()
+                .find(|(d, _)| d == domain)
+                .and_then(|(_, c)| c.as_deref());
+            let path = cfg
+                .nginx_sites_available
+                .join(format!("scontrol-compose-{domain}.conf"));
+            let current = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| CoreError::Io(format!("rechecking vhost after issuance: {e}")))?;
+            if Some(current.as_str()) != original {
+                return Err(CoreError::Cancelled(
+                    "vhost changed during certificate issuance".into(),
+                ));
+            }
+        }
+        apply_vhost_changes(cfg, &tls_changes, nginx::test_and_reload_unlocked).await?;
     }
     Ok(warnings)
 }
@@ -2589,8 +2739,10 @@ async fn validate_compose_file(
     let body = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| CoreError::Validation(format!("cannot read Compose file: {e}")))?;
-    let yaml: Yaml = serde_yaml::from_str(&body)
-        .map_err(|e| CoreError::Validation(format!("invalid Compose YAML: {e}")))?;
+    let yaml = expand_merges(
+        serde_yaml::from_str(&body)
+            .map_err(|e| CoreError::Validation(format!("invalid Compose YAML: {e}")))?,
+    )?;
     let services = yaml
         .get("services")
         .and_then(Yaml::as_mapping)
@@ -2670,7 +2822,40 @@ fn safe_relative_host_path(path: &str) -> Option<String> {
 /// `agent_files` are the agent's own files outside the source tree (the
 /// environment file, database credentials) that generated Compose files
 /// reference by absolute path; nothing else may be named that way.
+fn expand_merges(mut yaml: Yaml) -> CoreResult<Yaml> {
+    fn normalize(value: &mut Yaml, depth: usize) -> CoreResult<()> {
+        if depth > 64 {
+            return Err(CoreError::Validation(
+                "Compose nesting exceeds 64 levels".into(),
+            ));
+        }
+        // serde_yaml merges a parent before its children; nested aliases can
+        // otherwise leave an inherited << unresolved. Normalize bottom-up.
+        match value {
+            Yaml::Mapping(map) => {
+                for child in map.values_mut() {
+                    normalize(child, depth + 1)?;
+                }
+            }
+            Yaml::Sequence(items) => {
+                for child in items {
+                    normalize(child, depth + 1)?;
+                }
+            }
+            Yaml::Tagged(tag) => normalize(&mut tag.value, depth + 1)?,
+            _ => {}
+        }
+        value
+            .apply_merge()
+            .map_err(|e| CoreError::Validation(format!("invalid Compose merge: {e}")))
+    }
+    normalize(&mut yaml, 0)?;
+    Ok(yaml)
+}
+
 fn compose_policy(yaml: &Yaml, agent_files: &[PathBuf]) -> CoreResult<Vec<String>> {
+    // Compose resolves anchors before interpreting security and resource options.
+    let yaml = expand_merges(yaml.clone())?;
     let is_agent_file = |path: &str| agent_files.iter().any(|f| Path::new(path) == f);
     let mut host_paths = Vec::new();
     let Some(root) = yaml.as_mapping() else {
@@ -3520,7 +3705,15 @@ mod tests {
         .await
         .unwrap();
         assert!(logs.contains("no container"));
-        remove(&cfg, action()).await.unwrap();
+        remove(
+            &cfg,
+            RemoveComposeProjectParams {
+                project_slug: "site".into(),
+                expected_project_id: None,
+            },
+        )
+        .await
+        .unwrap();
         assert!(!root.exists());
         assert!(!static_site_dir(&cfg, "site").exists());
         std::fs::remove_dir_all(tmp).ok();
@@ -3945,6 +4138,335 @@ mod tests {
             let yaml: Yaml = serde_yaml::from_str(bad).unwrap();
             assert!(ephemeral_policy(&yaml).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn merge_keys_cannot_hide_preview_resources_or_privileges() {
+        for section in ["volumes", "networks"] {
+            for field in ["name: production_data", "external: true"] {
+                let text = format!("x-base: &base {{{field}}}\nx-nested: &nested\n  <<: *base\n{section}:\n  data:\n    <<: [*nested]\nservices:\n  web:\n    image: nginx\n");
+                let yaml: Yaml = serde_yaml::from_str(&text).unwrap();
+                assert!(ephemeral_policy(&yaml).is_err(), "{text}");
+            }
+        }
+        for field in [
+            "privileged: true",
+            "network_mode: host",
+            "pid: host",
+            "devices: [/dev/kvm]",
+            "cap_add: [SYS_ADMIN]",
+            "volumes: [/etc:/host]",
+        ] {
+            let text = format!(
+                "x-base: &base\n  {field}\nservices:\n  web:\n    <<: *base\n    image: nginx\n"
+            );
+            assert!(policy(&text).is_err(), "{text}");
+        }
+        assert!(policy("x-base: &base\n  driver_opts: {type: none, device: /etc, o: bind}\nvolumes:\n  data:\n    <<: *base\nservices:\n  web:\n    image: nginx\n").is_err());
+        // Explicit keys override merged values, exactly as Compose interprets them.
+        policy("x-base: &base {privileged: true}\nservices:\n  web:\n    <<: *base\n    privileged: false\n    image: nginx\n").unwrap();
+    }
+
+    /// Real Nginx/OpenSSL regression for a matched, date-valid weak RSA pair.
+    #[tokio::test]
+    #[ignore = "requires Linux nginx and openssl; run in an isolated container"]
+    async fn nginx_rejected_pair_preserves_live_certificate_and_config() {
+        use panel_core::adapters::WriteVhostSecretsParams;
+        use panel_core::vhost::{CustomCertificate, SecretChange};
+        let root = std::env::temp_dir().join(format!("gene82-nginx-{}", uuid::Uuid::new_v4()));
+        let cfg = AgentConfig {
+            nginx_sites_available: root.join("available"),
+            nginx_sites_enabled: root.join("enabled"),
+            nginx_vhost_secrets_dir: root.join("secrets"),
+            nginx_main_conf: root.join("nginx.conf"),
+            ..AgentConfig::default()
+        };
+        tokio::fs::create_dir_all(&cfg.nginx_sites_available)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&cfg.nginx_sites_enabled)
+            .await
+            .unwrap();
+        let main = cfg.nginx_main_conf.to_string_lossy().into_owned();
+        tokio::fs::write(&cfg.nginx_main_conf, format!("user www-data;\npid {}/nginx.pid;\nerror_log {}/nginx-error.log;\nevents {{}}\nhttp {{ access_log off; include {}/*; }}\n", root.display(), root.display(), cfg.nginx_sites_enabled.display())).await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let domain = "shop.example.com";
+        let mut revisions = Vec::new();
+        let mut pairs = Vec::new();
+        for bits in ["2048", "1024"] {
+            let cert = root
+                .join(format!("{bits}.crt"))
+                .to_string_lossy()
+                .into_owned();
+            let key = root
+                .join(format!("{bits}.key"))
+                .to_string_lossy()
+                .into_owned();
+            run(
+                "openssl",
+                &[
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    &format!("rsa:{bits}"),
+                    "-nodes",
+                    "-subj",
+                    "/CN=shop.example.com",
+                    "-days",
+                    "30",
+                    "-keyout",
+                    &key,
+                    "-out",
+                    &cert,
+                ],
+            )
+            .await
+            .unwrap();
+            let pair = CustomCertificate {
+                certificate_pem: tokio::fs::read_to_string(cert).await.unwrap(),
+                private_key_pem: tokio::fs::read_to_string(key).await.unwrap(),
+            };
+            let revision = uuid::Uuid::new_v4();
+            vhost_secrets::write_vhost_secrets(
+                &cfg,
+                WriteVhostSecretsParams {
+                    project_slug: "shop".into(),
+                    domain: domain.into(),
+                    revision,
+                    previous_revision: None,
+                    basic_auth: SecretChange::Keep,
+                    certificate: SecretChange::Set(pair.clone()),
+                },
+            )
+            .await
+            .unwrap();
+            revisions.push(revision);
+            pairs.push(pair);
+        }
+        let render = |revision| {
+            let dir = vhost_secrets::revision_dir(&cfg, domain, Some(revision));
+            format!("server {{ listen 127.0.0.1:{port} ssl; server_name {domain}; ssl_certificate {}/cert.pem; ssl_certificate_key {}/key.pem; location / {{ return 200 'old pair serving'; }} }}\n", dir.display(), dir.display())
+        };
+        let old = render(revisions[0]);
+        nginx::write_compose_vhost(&cfg, domain, &old)
+            .await
+            .unwrap();
+        // A file error log prevents the daemon retaining exec's capture pipe.
+        run("nginx", &["-c", &main]).await.unwrap();
+        let result = apply_vhost_changes(
+            &cfg,
+            &[(domain.into(), Some(render(revisions[1])))],
+            || async {
+                run("nginx", &["-t", "-c", &main]).await?;
+                run("nginx", &["-s", "reload", "-c", &main]).await?;
+                Ok(())
+            },
+        )
+        .await;
+        let response = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap()
+            .get(format!("https://127.0.0.1:{port}/"))
+            .send()
+            .await;
+        let _ = run("nginx", &["-s", "quit", "-c", &main]).await;
+        assert!(result.is_err(), "Nginx must reject the 1024-bit key");
+        assert!(response.unwrap().status().is_success());
+        assert_eq!(
+            tokio::fs::read_to_string(
+                cfg.nginx_sites_available
+                    .join(format!("scontrol-compose-{domain}.conf"))
+            )
+            .await
+            .unwrap(),
+            old
+        );
+        let old_dir = vhost_secrets::revision_dir(&cfg, domain, Some(revisions[0]));
+        assert_eq!(
+            tokio::fs::read_to_string(old_dir.join("cert.pem"))
+                .await
+                .unwrap(),
+            pairs[0].certificate_pem
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(old_dir.join("key.pem"))
+                .await
+                .unwrap(),
+            pairs[0].private_key_pem
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_removal_cannot_touch_a_recreated_slug() {
+        let tmp = std::env::temp_dir().join(format!("gene82-incarnation-{}", uuid::Uuid::new_v4()));
+        let cfg = AgentConfig {
+            docker_projects_root: tmp.clone(),
+            ..AgentConfig::default()
+        };
+        let root = project_root(&cfg, "preview");
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let first = project_guard(&root).await;
+        prepare_incarnation(&cfg, &root, old).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), project_guard(&root))
+                .await
+                .is_err()
+        );
+        assert!(fence_removal(&cfg, &root, Some(old)).await.unwrap());
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+        drop(first);
+        let second = project_guard(&root).await;
+        prepare_incarnation(&cfg, &root, new).await.unwrap();
+        assert!(
+            prepare_incarnation(&cfg, &root, old).await.is_err(),
+            "old deployments stay fenced after deletion"
+        );
+        drop(second);
+        // This follows exactly the RPC removal path, before any host mutation.
+        remove(
+            &cfg,
+            RemoveComposeProjectParams {
+                project_slug: "preview".into(),
+                expected_project_id: Some(old),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(project_owner(&root).await.unwrap(), Some(new));
+        let legacy = project_root(&cfg, "legacy");
+        create_private_dir(&legacy).await.unwrap();
+        let legacy_id = uuid::Uuid::new_v4();
+        assert!(fence_removal(&cfg, &legacy, Some(legacy_id)).await.unwrap());
+        assert_eq!(project_owner(&legacy).await.unwrap(), Some(legacy_id));
+        tokio::fs::remove_dir_all(&legacy).await.unwrap();
+        create_private_dir(&legacy).await.unwrap(); // recreated, still undeployed
+        assert!(!fence_removal(&cfg, &legacy, Some(legacy_id)).await.unwrap());
+        tokio::fs::remove_dir_all(tmp).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_vhost_validation_reload_and_write_restore_config_and_secret_paths() {
+        let root = std::env::temp_dir().join(format!("gene82-vhost-{}", uuid::Uuid::new_v4()));
+        let cfg = AgentConfig {
+            nginx_sites_available: root.join("available"),
+            nginx_sites_enabled: root.join("enabled"),
+            ..AgentConfig::default()
+        };
+        tokio::fs::create_dir_all(&cfg.nginx_sites_available)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&cfg.nginx_sites_enabled)
+            .await
+            .unwrap();
+        let domain = "shop.example.com";
+        let path = cfg
+            .nginx_sites_available
+            .join(format!("scontrol-compose-{domain}.conf"));
+        let old =
+            "ssl_certificate /secrets/old/cert.pem; ssl_certificate_key /secrets/old/key.pem;";
+        nginx::write_compose_vhost(&cfg, domain, old).await.unwrap();
+        let changes = vec![(
+            domain.to_string(),
+            Some("ssl_certificate /secrets/new/cert.pem;".into()),
+        )];
+        for failure in ["nginx -t", "reload"] {
+            let mut calls = 0;
+            let result = apply_vhost_changes(&cfg, &changes, || {
+                calls += 1;
+                let result = if calls == 1 {
+                    Err(CoreError::External(failure.into()))
+                } else {
+                    Ok(())
+                };
+                std::future::ready(result)
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls, 2, "restored config must be reloaded");
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), old);
+        }
+        // First write succeeds, second staging write fails: restore before nginx -t.
+        let blocked = cfg
+            .nginx_sites_available
+            .join(".scontrol-compose-blocked.example.com.conf.tmp");
+        tokio::fs::create_dir_all(&blocked).await.unwrap();
+        let changes = vec![
+            changes[0].clone(),
+            ("blocked.example.com".into(), Some("new".into())),
+        ];
+        let mut reloaded = false;
+        assert!(apply_vhost_changes(&cfg, &changes, || {
+            reloaded = true;
+            std::future::ready(Ok(()))
+        })
+        .await
+        .is_err());
+        assert!(
+            reloaded,
+            "must enter rollback after the first mutation, not fail at backup"
+        );
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), old);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    /// Uses only UUID-namespaced fixture resources; requires Docker + alpine:latest.
+    #[tokio::test]
+    #[ignore = "requires a Docker daemon and alpine:latest"]
+    async fn docker_preview_merge_isolation_fixture() {
+        let slug = format!("gene82-{}", uuid::Uuid::new_v4().simple());
+        let production = format!("{slug}-fixture-production");
+        let root = std::env::temp_dir().join(&slug);
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let source = root.join("compose.yml");
+        let source_arg = source.to_string_lossy().into_owned();
+        let result: CoreResult<()> = async {
+            run("docker", &["volume", "create", &production]).await?;
+            let mount = format!("{production}:/data");
+            run("docker", &["run", "--rm", "--pull=never", "-v", &mount, "alpine:latest", "touch", "/data/production-canary"]).await?;
+            // Compose really resolves this anchor to the fixture production volume.
+            let hostile = format!("x-resource: &resource\n  name: {production}\nservices:\n  web:\n    image: alpine:latest\n    volumes: [data:/data]\nvolumes:\n  data:\n    <<: *resource\n");
+            tokio::fs::write(&source, &hostile).await.map_err(|e| CoreError::Io(e.to_string()))?;
+            let model = run("docker", &["compose", "-p", &slug, "-f", &source_arg, "config", "--format", "json"]).await?;
+            let model: serde_json::Value = serde_json::from_str(&model).map_err(|e| CoreError::External(e.to_string()))?;
+            if model["volumes"]["data"]["name"] != production {
+                return Err(CoreError::External("fixture did not resolve merge".into()));
+            }
+            let hostile: Yaml = serde_yaml::from_str(&hostile).unwrap();
+            if ephemeral_policy(&hostile).is_ok() { return Err(CoreError::External("merged shared volume was allowed".into())); }
+            // A safe anchored model gets a separate project-scoped volume.
+            let safe = "x-resource: &resource {}\nservices:\n  web:\n    image: alpine:latest\n    volumes: [data:/data]\nvolumes:\n  data:\n    <<: *resource\n";
+            ephemeral_policy(&serde_yaml::from_str(safe).unwrap())?;
+            tokio::fs::write(&source, safe).await.map_err(|e| CoreError::Io(e.to_string()))?;
+            run("docker", &["compose", "-p", &slug, "-f", &source_arg, "run", "--rm", "--pull", "never", "web", "test", "!", "-e", "/data/production-canary"]).await?;
+            run("docker", &["compose", "-p", &slug, "-f", &source_arg, "down"]).await?;
+            remove_owned_volumes(&slug).await?;
+            let (code, _, _) = run_allow_nonzero("docker", &["volume", "inspect", &format!("{slug}_data")]).await?;
+            if code == 0 { return Err(CoreError::External("preview volume was not removed".into())); }
+            run("docker", &["run", "--rm", "--pull=never", "-v", &mount, "alpine:latest", "test", "-e", "/data/production-canary"]).await?;
+            Ok(())
+        }.await;
+        // Cleanup even on a failed assertion; never touch non-fixture resources.
+        let _ = run_allow_nonzero(
+            "docker",
+            &[
+                "compose",
+                "-p",
+                &slug,
+                "-f",
+                &source_arg,
+                "down",
+                "--volumes",
+            ],
+        )
+        .await;
+        let _ = run_allow_nonzero("docker", &["volume", "rm", &production]).await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
+        result.unwrap();
     }
 
     #[test]

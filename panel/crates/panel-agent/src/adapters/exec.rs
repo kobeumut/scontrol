@@ -588,10 +588,10 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_reaches_the_child_without_touching_argv() {
-        // `sleep` is the only program tests may add; it ignores stdin, so
-        // this checks the pipe is closed (no hang) and stdout is captured.
+        // `sleep` is the only program tests may add. Give the stdin writer
+        // time to run: sleep 0 can exit first and legitimately produce EPIPE.
         assert_eq!(
-            run_with_stdin("sleep", &["0"], b"secret").await.unwrap(),
+            run_with_stdin("sleep", &["1"], b"secret").await.unwrap(),
             ""
         );
     }
