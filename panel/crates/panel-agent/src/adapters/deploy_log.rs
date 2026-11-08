@@ -36,6 +36,11 @@ impl DeployLog {
         &self.secrets
     }
 
+    pub fn extend_secrets(&mut self, secrets: Vec<String>) {
+        self.secrets.extend(secrets);
+        self.secrets = maskable_secrets(std::mem::take(&mut self.secrets));
+    }
+
     pub async fn create(
         logs_dir: &Path,
         deployment_id: Uuid,
@@ -129,10 +134,32 @@ pub fn log_path(logs_dir: &Path, deployment_id: Uuid) -> PathBuf {
 pub fn maskable_secrets(secrets: Vec<String>) -> Vec<String> {
     let mut secrets: Vec<String> = secrets
         .into_iter()
+        // Output is line-oriented; a multiline secret must also mask each
+        // printed fragment, not only the complete value containing newlines.
+        .flat_map(|s| {
+            let mut lines: Vec<String> = s.lines().map(str::to_string).collect();
+            lines.push(s);
+            lines
+        })
         .filter(|s| s.len() >= MIN_SECRET_LEN)
         .collect();
-    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    secrets.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    secrets.dedup();
     secrets
+}
+
+/// Returned errors reach API records as well as logs. Preserve their kind
+/// (especially cancellation) while removing the same values as log output.
+pub fn redact_error(error: CoreError, secrets: &[String]) -> CoreError {
+    match error {
+        CoreError::Validation(m) => CoreError::Validation(redact(&m, secrets)),
+        CoreError::NotFound(m) => CoreError::NotFound(redact(&m, secrets)),
+        CoreError::AlreadyExists(m) => CoreError::AlreadyExists(redact(&m, secrets)),
+        CoreError::PermissionDenied(m) => CoreError::PermissionDenied(redact(&m, secrets)),
+        CoreError::Io(m) => CoreError::Io(redact(&m, secrets)),
+        CoreError::External(m) => CoreError::External(redact(&m, secrets)),
+        CoreError::Cancelled(m) => CoreError::Cancelled(redact(&m, secrets)),
+    }
 }
 
 /// Masks every value of `secrets` (from [`maskable_secrets`]) in `line`.

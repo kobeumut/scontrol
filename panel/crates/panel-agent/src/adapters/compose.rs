@@ -13,7 +13,7 @@
 //! code/                     checked-out Git source or raw Compose file
 //! env                       0600 merged environment file (`--env-file`)
 //! env.masked                0600 overridden inherited values, masked in logs
-//! env.run                   static builds only: 0600 copy of `env` in the
+//! env.run-<uuid>            static builds only: 0600 copy of `env` in the
 //!                           unquoted `docker run --env-file` format, removed
 //!                           when the build ends
 //! scontrol.override.yml     generated loopback port publishing for domains
@@ -46,7 +46,10 @@
 use super::db_exposure;
 use super::deploy_log::{self, maskable_secrets, redact, DeployLog};
 use super::docker_config;
-use super::exec::{follow_lines, run, run_allow_nonzero, run_allow_nonzero_within, run_streamed};
+use super::exec::{
+    follow_lines, run, run_allow_nonzero, run_allow_nonzero_within, run_streamed,
+    run_with_stdin_env,
+};
 use super::git_auth;
 use super::nginx::{self, VhostTarget};
 use super::releases;
@@ -76,6 +79,8 @@ const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
 /// so the build context resolves relative to the repository root.
 const APPLICATION_COMPOSE_FILE: &str = ".scontrol-app.yml";
 const ENV_FILE: &str = "env";
+const ENV_FORMAT_PREFIX: &str = "# scontrol-env-format:";
+const ENV_FORMAT: &str = "# scontrol-env-format: 1";
 /// Overridden inherited values (0600), read only to mask them in logs.
 const MASKED_VALUES_FILE: &str = "env.masked";
 /// The environment for `docker run --env-file` (static builds), which takes
@@ -133,7 +138,14 @@ pub async fn deploy(
     let result = match &params.source {
         ComposeSource::Static(spec) => deploy_static(cfg, &params, spec, &root, &mut log).await,
         _ => deploy_steps(cfg, &params, &root, &env_path, &mut log).await,
-    };
+    }
+    .map(|mut outcome| {
+        for warning in &mut outcome.warnings {
+            *warning = redact(warning, log.secrets());
+        }
+        outcome
+    })
+    .map_err(|error| deploy_log::redact_error(error, log.secrets()));
     // Registry logins live only for the deployment, whatever its outcome.
     tokio::fs::remove_dir_all(docker_config::config_dir(&root))
         .await
@@ -228,6 +240,17 @@ async fn deploy_steps(
         env: Some(env_path.to_path_buf()),
         override_file: override_body.is_some().then_some(override_path),
     };
+    // Resolve privately with the same files and process environment as `up`,
+    // before any Compose output or diagnostics can reach a log.
+    let docker_config = docker_config::config_dir(root)
+        .to_string_lossy()
+        .into_owned();
+    let envs = [("DOCKER_CONFIG", docker_config.as_str())];
+    let secrets = tokio::select! {
+        result = resolved_environment_secrets(root, &params.project_slug, &paths, &envs) => result?,
+        _ = log.cancelled() => return Err(CoreError::Cancelled("deployment cancelled".into())),
+    };
+    log.extend_secrets(secrets);
     if params.ephemeral {
         check_ephemeral_publications(&params.project_slug, &paths, &params.domains).await?;
     }
@@ -248,10 +271,6 @@ async fn deploy_steps(
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let timeout = Duration::from_secs(cfg.deploy_timeout_secs.max(60));
     // Pulls use the project's own registry logins, never root's `~/.docker`.
-    let docker_config = docker_config::config_dir(root)
-        .to_string_lossy()
-        .into_owned();
-    let envs = [("DOCKER_CONFIG", docker_config.as_str())];
     let code = run_streamed("docker", &refs, &envs, log, timeout).await?;
     if code != 0 {
         return Err(CoreError::External(format!(
@@ -417,6 +436,65 @@ pub(crate) async fn environment_secrets(root: &Path) -> CoreResult<Vec<String>> 
     Ok(secrets)
 }
 
+/// Capture Compose's own interpolation and service env-file results. Never
+/// stream config output: even a failed config can put secrets in stderr.
+/// Keep original/inherited masks as well as effective and multiline values.
+pub(crate) async fn resolved_environment_secrets(
+    root: &Path,
+    slug: &str,
+    paths: &ProjectPaths,
+    envs: &[(&str, &str)],
+) -> CoreResult<Vec<String>> {
+    let mut secrets = environment_secrets(root).await?;
+    let environment = private_compose_config(slug, paths, envs, &["--environment"]).await?;
+    for line in environment.lines() {
+        // Continuations of multiline values have no key; retain them too.
+        secrets.push(
+            line.split_once('=')
+                .map_or(line, |(_, value)| value)
+                .to_string(),
+        );
+        secrets.push(line.to_string());
+    }
+    let model = private_compose_config(slug, paths, envs, &["--format", "json"]).await?;
+    let model: serde_json::Value = serde_json::from_str(&model)
+        .map_err(|_| CoreError::External("cannot decode private Compose configuration".into()))?;
+    if let Some(services) = model.get("services").and_then(serde_json::Value::as_object) {
+        for service in services.values() {
+            for values in [service.get("environment"), service.pointer("/build/args")]
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_object)
+            {
+                for value in values.values().filter_map(serde_json::Value::as_str) {
+                    secrets.push(value.to_string());
+                    // `config` escapes runtime dollars for a subsequent
+                    // Compose load. Mask both its export and container form.
+                    secrets.push(value.replace("$$", "$"));
+                }
+            }
+        }
+    }
+    Ok(maskable_secrets(secrets))
+}
+
+async fn private_compose_config(
+    slug: &str,
+    paths: &ProjectPaths,
+    envs: &[(&str, &str)],
+    options: &[&str],
+) -> CoreResult<String> {
+    let mut args = compose_args(slug, paths);
+    args.push("config".into());
+    args.extend(options.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_with_stdin_env("docker", &refs, envs, b"")
+        .await
+        .map_err(|_| CoreError::External(
+            "cannot resolve Compose environment safely; check the Compose configuration privately".into(),
+        ))
+}
+
 fn validate_masked_values(values: &[String]) -> CoreResult<()> {
     if values.len() > MAX_MERGED_ENV_VARS
         || values
@@ -441,7 +519,14 @@ pub async fn stop(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Core
     args.extend(["stop".into()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
-    write_action_log(&project_root(cfg, &params.project_slug), &stdout, &stderr).await?;
+    write_action_log(
+        &project_root(cfg, &params.project_slug),
+        &params.project_slug,
+        &paths,
+        &stdout,
+        &stderr,
+    )
+    .await?;
     if code != 0 {
         return Err(CoreError::External(format!(
             "docker compose stop failed (exit code {code})"
@@ -464,7 +549,14 @@ pub async fn restart(cfg: &AgentConfig, params: ComposeProjectActionParams) -> C
     args.extend(["restart".into()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
-    write_action_log(&project_root(cfg, &params.project_slug), &stdout, &stderr).await?;
+    write_action_log(
+        &project_root(cfg, &params.project_slug),
+        &params.project_slug,
+        &paths,
+        &stdout,
+        &stderr,
+    )
+    .await?;
     if code != 0 {
         return Err(CoreError::External(format!(
             "docker compose restart failed (exit code {code})"
@@ -553,7 +645,7 @@ pub async fn remove(cfg: &AgentConfig, params: ComposeProjectActionParams) -> Co
     args.extend(["down".into(), "--remove-orphans".into()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
-    write_action_log(&root, &stdout, &stderr).await?;
+    write_action_log(&root, &params.project_slug, &paths, &stdout, &stderr).await?;
     if code != 0 {
         return Err(CoreError::External(format!(
             "docker compose removal failed (exit code {code})"
@@ -706,20 +798,26 @@ pub async fn logs(cfg: &AgentConfig, params: ComposeProjectLogsParams) -> CoreRe
         );
     }
     let paths = existing_project_paths(cfg, &params.project_slug)?;
+    let secrets = resolved_environment_secrets(
+        &project_root(cfg, &params.project_slug),
+        &params.project_slug,
+        &paths,
+        &[],
+    )
+    .await?;
     let tail = params.tail_lines.clamp(1, 2_000).to_string();
     let mut args = compose_args(&params.project_slug, &paths);
     args.extend(["logs".into(), "--no-color".into(), "--tail".into(), tail]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (code, stdout, stderr) = run_allow_nonzero_within("docker", &refs, LOGS_TIMEOUT).await?;
+    let (code, stdout, stderr) = run_allow_nonzero_within("docker", &refs, LOGS_TIMEOUT)
+        .await
+        .map_err(|error| deploy_log::redact_error(error, &secrets))?;
     if code != 0 {
         return Err(CoreError::External(format!(
-            "docker compose logs failed: {stderr}"
+            "docker compose logs failed: {}",
+            redact(&stderr, &secrets)
         )));
     }
-    let secrets = environment_secrets(&project_root(cfg, &params.project_slug))
-        .await
-        .map(maskable_secrets)
-        .unwrap_or_default();
     Ok(stdout
         .lines()
         .map(|line| redact(line, &secrets) + "\n")
@@ -775,10 +873,13 @@ pub async fn follow_logs(
     let permit = LOG_FOLLOWERS.clone().try_acquire_owned().map_err(|_| {
         CoreError::External("too many live log viewers are open; close one and retry".into())
     })?;
-    let secrets = environment_secrets(&project_root(cfg, &params.project_slug))
-        .await
-        .map(maskable_secrets)
-        .unwrap_or_default();
+    let secrets = resolved_environment_secrets(
+        &project_root(cfg, &params.project_slug),
+        &params.project_slug,
+        &paths,
+        &[],
+    )
+    .await?;
 
     let base = compose_args(&params.project_slug, &paths);
     let mut options = vec!["--no-color".to_string()];
@@ -1763,12 +1864,57 @@ async fn run_static_build(
     build: &panel_core::types::StaticBuild,
     log: &mut DeployLog,
 ) -> CoreResult<()> {
-    let run_env = root.join(RUN_ENV_FILE);
-    let environment = read_environment(&root.join(ENV_FILE)).await?;
-    write_private_file(&run_env, &docker_run_env_body(&environment)).await?;
-    let result = run_static_build_steps(cfg, slug, &run_env, code_dir, build, log).await;
-    tokio::fs::remove_file(&run_env).await.ok();
-    result
+    let body = tokio::fs::read_to_string(root.join(ENV_FILE))
+        .await
+        .map_err(|e| CoreError::Io(format!("reading static environment: {e}")))?;
+    let run_env = RunEnvironment::create(root, &body)?;
+    run_static_build_steps(cfg, slug, &run_env.path, code_dir, build, log).await
+}
+
+/// Legacy files go straight to Docker, byte-for-byte as before. Only marked
+/// files need a decoded copy. Synchronous create/write/drop avoids async fs
+/// work outliving cancellation and leaving a second secret file behind.
+struct RunEnvironment {
+    path: PathBuf,
+    temporary: bool,
+}
+
+impl RunEnvironment {
+    fn create(root: &Path, body: &str) -> CoreResult<Self> {
+        if !encoded_environment(body)? {
+            return Ok(Self {
+                path: root.join(ENV_FILE),
+                temporary: false,
+            });
+        }
+        let environment = parse_environment(body)?;
+        let path = root.join(format!("{RUN_ENV_FILE}-{}", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|e| CoreError::Io(format!("creating static environment: {e}")))?;
+        let guard = Self {
+            path,
+            temporary: true,
+        };
+        std::io::Write::write_all(&mut file, docker_run_env_body(&environment).as_bytes())
+            .map_err(|e| CoreError::Io(format!("writing static environment: {e}")))?;
+        Ok(guard)
+    }
+}
+
+impl Drop for RunEnvironment {
+    fn drop(&mut self) {
+        if self.temporary {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// `docker run --env-file` reads `KEY=value` with no quoting, comments, or
@@ -2557,7 +2703,7 @@ async fn adopt_legacy_env_file(root: &Path, env_path: &Path) {
 }
 
 async fn write_environment(path: &Path, environment: &[(String, String)]) -> CoreResult<()> {
-    let mut body = String::new();
+    let mut body = format!("{ENV_FORMAT}\n");
     for (key, value) in environment {
         // Newlines are rejected in validation, so one key/value occupies one
         // line.
@@ -2645,8 +2791,8 @@ fn env_reference_len(s: &str) -> Option<usize> {
     Some("${".len() + end + 1)
 }
 
-/// Reverses [`encode_env_value`] (for log masking). Unquoted lines, as
-/// written before values were quoted, are returned as they are.
+/// Reverses [`encode_env_value`] only for files bearing [`ENV_FORMAT`].
+/// Legacy values must never be guessed from their leading/trailing quotes.
 fn decode_env_value(raw: &str) -> String {
     let Some(inner) = raw
         .strip_prefix('"')
@@ -2693,17 +2839,42 @@ pub(crate) async fn write_private_file(path: &Path, body: &str) -> CoreResult<()
 /// A missing file becomes an empty one so `--env-file` always resolves.
 pub(crate) async fn read_environment(path: &Path) -> CoreResult<Vec<(String, String)>> {
     match tokio::fs::read_to_string(path).await {
-        Ok(body) => Ok(body
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .map(|(key, value)| (key.to_string(), decode_env_value(value)))
-            .collect()),
+        Ok(body) => parse_environment(&body),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             write_environment(path, &[]).await?;
             Ok(Vec::new())
         }
         Err(e) => Err(CoreError::Io(format!("reading environment file: {e}"))),
     }
+}
+
+fn encoded_environment(body: &str) -> CoreResult<bool> {
+    match body.lines().next() {
+        Some(ENV_FORMAT) => Ok(true),
+        Some(header) if header.starts_with(ENV_FORMAT_PREFIX) => Err(CoreError::Validation(
+            "unsupported environment file format".into(),
+        )),
+        _ => Ok(false),
+    }
+}
+
+fn parse_environment(body: &str) -> CoreResult<Vec<(String, String)>> {
+    let encoded = encoded_environment(body)?;
+    Ok(body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                if encoded {
+                    decode_env_value(value)
+                } else {
+                    value.to_string()
+                },
+            )
+        })
+        .collect())
 }
 
 /// Parses and validates the Compose file, then checks that every host path
@@ -3164,13 +3335,21 @@ fn compose_args(slug: &str, paths: &ProjectPaths) -> Vec<String> {
 }
 
 /// Output of stop/remove actions (deployments have their own logs).
-async fn write_action_log(root: &Path, stdout: &str, stderr: &str) -> CoreResult<()> {
+async fn write_action_log(
+    root: &Path,
+    slug: &str,
+    paths: &ProjectPaths,
+    stdout: &str,
+    stderr: &str,
+) -> CoreResult<()> {
+    let secrets = resolved_environment_secrets(root, slug, paths, &[]).await?;
+    let body = redact(&format!("{stdout}{stderr}"), &secrets);
     let logs = root.join("logs");
     tokio::fs::create_dir_all(&logs)
         .await
         .map_err(|e| CoreError::Io(format!("creating deployment logs: {e}")))?;
     let path = logs.join("latest.log");
-    tokio::fs::write(&path, format!("{stdout}{stderr}"))
+    tokio::fs::write(&path, body)
         .await
         .map_err(|e| CoreError::Io(format!("writing action log: {e}")))?;
     #[cfg(unix)]
@@ -4345,6 +4524,184 @@ mod tests {
             vec![("OLD".to_string(), "raw value#1".to_string())]
         );
         std::fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn environment_versions_preserve_legacy_values_and_clean_up_on_cancel() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("scontrol-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join(ENV_FILE);
+        let legacy = "QUOTED=\"keep quotes\"\nSINGLE='keep quotes'\nSLASH=\"a\\n\\t\\\\b\"\nDOLLAR=\"a$$b\"\n";
+        std::fs::write(&path, legacy).unwrap();
+        let parsed = read_environment(&path).await.unwrap();
+        for (line, (_, value)) in legacy.lines().zip(&parsed) {
+            assert_eq!(line.split_once('=').unwrap().1, value);
+        }
+        let guard = RunEnvironment::create(&base, legacy).unwrap();
+        assert_eq!(guard.path, path);
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+        assert!(parse_environment("# scontrol-env-format: 99\nX=y\n").is_err());
+
+        let env = vec![("TOKEN".to_string(), "p #ss \"q\" $x \\end".to_string())];
+        write_environment(&path, &env).await.unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with(ENV_FORMAT));
+        assert_eq!(read_environment(&path).await.unwrap(), env);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let root = base.clone();
+        let task = tokio::spawn(async move {
+            let guard = RunEnvironment::create(&root, &body).unwrap();
+            tx.send(guard.path.clone()).unwrap();
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        let run_path = rx.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&run_path).unwrap(),
+            docker_run_env_body(&env)
+        );
+        assert_eq!(
+            std::fs::metadata(&run_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!run_path.exists());
+        assert!(path.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Run with `cargo test -p panel-agent --features docker real_compose_ -- --ignored`.
+    /// Needs the Compose plugin, not a Docker daemon or any pulled images.
+    #[tokio::test]
+    #[ignore = "requires the real Docker Compose plugin"]
+    async fn real_compose_resolution_masks_effective_values() {
+        let base =
+            std::env::temp_dir().join(format!("scontrol-real-compose-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = ProjectPaths {
+            code_dir: base.clone(),
+            compose: base.join("compose.yml"),
+            env: Some(base.join(ENV_FILE)),
+            override_file: Some(base.join("override.yml")),
+        };
+        let environment: Vec<(String, String)> = [
+            ("BASE", "base-secret-8371"),
+            ("RESOLVED", "${BASE}/suffix"),
+            (
+                "FALLBACK",
+                "${SCONTROL_TEST_MISSING_8842:-fallback-secret-8371}",
+            ),
+            ("ALTERNATE", "x${BASE:+alternate-secret-8371}y"),
+            ("DOLLAR", "price$789 # hash"),
+            ("JSON", r#"{"a": "b\\c"}"#),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        write_environment(paths.env.as_ref().unwrap(), &environment)
+            .await
+            .unwrap();
+        std::fs::write(base.join("legacy.env"), "LEGACY=\"quoted-legacy-8371\"\nSINGLE='single-legacy-8371'\nCOMMENT=comment-secret-8371 # ignored\nLOCAL_DOLLAR='local$secret-8371'\n").unwrap();
+        std::fs::write(&paths.compose, "services:\n  web:\n    image: alpine\n    env_file: [env, legacy.env]\n    build:\n      context: .\n      args:\n        TOKEN: ${BASE}/build\n        LITERAL: 'build$$secret-8371'\n    environment:\n      INLINE: 'inline$$secret-8371'\n      DIRECT: ${BASE}/direct\n      HOST_ONLY: ${SCONTROL_TEST_HOST_8842}\n      MULTILINE: ${SCONTROL_TEST_MULTILINE_8842}\n").unwrap();
+        std::fs::write(
+            paths.override_file.as_ref().unwrap(),
+            "services:\n  web:\n    environment:\n      OVERRIDE: ${BASE}/override\n",
+        )
+        .unwrap();
+        let envs = [
+            ("SCONTROL_TEST_HOST_8842", "host-secret-8371"),
+            (
+                "SCONTROL_TEST_MULTILINE_8842",
+                "first-secret-8371\nlast-secret-8371",
+            ),
+        ];
+        let secrets = resolved_environment_secrets(&base, "mask-test", &paths, &envs)
+            .await
+            .unwrap();
+        let expected = [
+            "base-secret-8371/suffix",
+            "fallback-secret-8371",
+            "xalternate-secret-8371y",
+            "price$789 # hash",
+            r#"{"a": "b\\c"}"#,
+            "quoted-legacy-8371",
+            "single-legacy-8371",
+            "comment-secret-8371",
+            "local$secret-8371",
+            "inline$secret-8371",
+            "build$secret-8371",
+            "base-secret-8371/direct",
+            "base-secret-8371/build",
+            "base-secret-8371/override",
+            "host-secret-8371",
+            "first-secret-8371",
+            "last-secret-8371",
+        ];
+        let id = uuid::Uuid::new_v4();
+        let mut log = DeployLog::create(
+            &base.join("logs"),
+            id,
+            65536,
+            vec!["inherited-8371".into()],
+            watch::channel(false).1,
+        )
+        .await
+        .unwrap();
+        log.extend_secrets(secrets.clone());
+        for value in expected {
+            assert!(
+                secrets.iter().any(|s| s == value),
+                "unresolved mask: {value:?}"
+            );
+            assert_eq!(
+                filter_log_line(value, &secrets, None).as_deref(),
+                Some("********")
+            );
+            assert!(filter_log_line(value, &secrets, Some(value)).is_none());
+            log.line(value.as_bytes()).await.unwrap();
+            let error = deploy_log::redact_error(CoreError::External(value.into()), &secrets);
+            assert!(!error.message().contains(value));
+        }
+        log.line(b"inherited-8371").await.unwrap();
+        let content = deploy_log::read_chunk(&base.join("logs"), id, 0, 65536)
+            .await
+            .unwrap()
+            .content;
+        for value in expected.into_iter().chain(["inherited-8371"]) {
+            assert!(!content.contains(value));
+        }
+        write_action_log(
+            &base,
+            "mask-test",
+            &paths,
+            "fallback-secret-8371",
+            "quoted-legacy-8371",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("logs/latest.log")).unwrap(),
+            "****************"
+        );
+
+        // A required-variable diagnostic contains its secret default/error
+        // text in stderr; the public error must never echo that diagnostic.
+        std::fs::write(
+            &paths.compose,
+            "services:\n  web:\n    image: ${SCONTROL_TEST_MISSING_8842:?required-secret-8371}\n",
+        )
+        .unwrap();
+        let error = resolved_environment_secrets(&base, "mask-test", &paths, &envs)
+            .await
+            .unwrap_err();
+        assert!(error
+            .message()
+            .contains("cannot resolve Compose environment safely"));
+        assert!(!error.message().contains("required-secret-8371"));
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
