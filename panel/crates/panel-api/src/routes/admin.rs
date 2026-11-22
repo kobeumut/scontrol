@@ -3,8 +3,9 @@
 use crate::auth::{password, AdminUser};
 use crate::db::{self, users};
 use crate::error::{ApiError, ApiResult};
+use crate::services::user_purge;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use panel_core::types::User;
@@ -87,23 +88,62 @@ async fn disable_totp(
     Ok(Json(serde_json::json!({ "totp_enabled": false })))
 }
 
+#[derive(Deserialize, Default)]
+struct DeleteUserQuery {
+    /// Remove the user's sites and services from their hosts first.
+    #[serde(default)]
+    delete_resources: bool,
+}
+
 /// Deletes a panel user. Sessions, API keys, and role bindings go with the
 /// user (`ON DELETE CASCADE`); audit entries keep the action with no actor.
 ///
-/// Refused when the user is the caller (400), the last installation admin
-/// (409), or still owns sites or Compose services (409): those rows cascade
-/// too, which would leave their host resources (system users, vhosts,
-/// containers) running with nothing in the panel to manage them.
+/// A user who owns sites or services is refused (409) unless
+/// `?delete_resources=true`: then each of them is torn down on its host
+/// first (`services::user_purge`), so nothing is left running unmanaged.
+/// Also refused: the caller's own account (400), the last installation
+/// admin (409), and an installation admin when the caller is not one (403).
+/// All of these are checked before anything is removed.
 async fn delete_user(
     AdminUser(actor): AdminUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    query: Option<Query<DeleteUserQuery>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let Query(query) = query.unwrap_or_default();
     if id == actor.id {
         return Err(ApiError::BadRequest(
             "you cannot delete your own account".into(),
         ));
     }
+    let target = users::find_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    if target.is_admin && !actor.is_admin {
+        return Err(ApiError::Forbidden);
+    }
+    if target.is_admin {
+        let admins: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE is_admin")
+            .fetch_all(&state.db)
+            .await?;
+        if is_last_admin(&admins, id) {
+            return Err(ApiError::Conflict(
+                "cannot delete the last installation admin".into(),
+            ));
+        }
+    }
+    let owned = user_purge::owned(&state, id).await?;
+    let purged = if owned.is_empty() {
+        None
+    } else if query.delete_resources {
+        Some(user_purge::purge(&state, id, actor.id).await?)
+    } else {
+        return Err(ApiError::Conflict(format!(
+            "user owns {} site(s) and {} service(s); delete them with the user (delete_resources=true) or first",
+            owned.sites, owned.services
+        )));
+    };
+
     let mut tx = state.db.begin().await?;
     // Lock every admin row so two concurrent deletions cannot each see
     // another admin left and together remove the last one.
@@ -136,7 +176,7 @@ async fn delete_user(
     .await?;
     if owned.sites > 0 || owned.services > 0 {
         return Err(ApiError::Conflict(format!(
-            "user still owns {} site(s) and {} service(s); delete them first",
+            "user got {} site(s) and {} service(s) while being deleted; try again",
             owned.sites, owned.services
         )));
     }
@@ -150,11 +190,13 @@ async fn delete_user(
         "user",
         "delete_user",
         Some(&id.to_string()),
-        serde_json::json!({ "username": target.username, "is_admin": target.is_admin }),
+        serde_json::json!({ "username": target.username, "is_admin": target.is_admin, "removed": purged }),
     )
     .await
     .ok();
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "removed": purged }),
+    ))
 }
 
 /// Whether removing `id` leaves no installation admin.

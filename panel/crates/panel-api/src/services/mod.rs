@@ -13,4 +13,5 @@ pub mod registries;
 pub mod scheduled_jobs;
 pub mod secret_box;
 pub mod site_service;
+pub mod user_purge;
 pub mod webhook;

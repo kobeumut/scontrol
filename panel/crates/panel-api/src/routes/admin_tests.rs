@@ -96,33 +96,186 @@ async fn admin_cannot_delete_themselves() {
         .is_some());
 }
 
-#[tokio::test]
-async fn a_user_who_owns_a_site_is_not_deleted() {
-    let pool = test_support::test_pool().await;
-    let state = test_support::app_state(pool.clone(), Arc::new(MockAdapter::new()));
-    let router = crate::routes::build_router(state.clone());
-    let admin = test_support::user(&pool, true).await;
-    let cookie = test_support::session_cookie(&state, admin.id).await;
-    let owner = test_support::user(&pool, false).await;
+/// A site (with a cron job and a host database) and a Compose service owned
+/// by `owner`; returns `(site id, service id)`.
+async fn owned_resources(pool: &sqlx::PgPool, owner: &db::users::UserRow) -> (Uuid, Uuid) {
+    let site = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO sites (id, domain, owner_user_id, owner_username, runtime, document_root, status)
          VALUES ($1, $2, $3, $4, '{\"kind\":\"static\"}', '/srv/x', 'active')",
     )
-    .bind(Uuid::new_v4())
+    .bind(site)
     .bind(format!("{}.example.com", Uuid::new_v4().simple()))
     .bind(owner.id)
     .bind(&owner.username)
-    .execute(&pool)
+    .execute(pool)
     .await
     .unwrap();
+    db::cron::create(pool, site, "0 3 * * *", "/usr/bin/true")
+        .await
+        .unwrap();
+    let suffix = &Uuid::new_v4().simple().to_string()[..12];
+    sqlx::query(
+        "INSERT INTO databases (site_id, engine, name, username) VALUES ($1, 'postgres', $2, $2)",
+    )
+    .bind(site)
+    .bind(format!("d{suffix}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    let (service, _) = test_support::compose_project(pool).await;
+    sqlx::query("UPDATE compose_projects SET owner_user_id = $1 WHERE id = $2")
+        .bind(owner.id)
+        .bind(service)
+        .execute(pool)
+        .await
+        .unwrap();
+    (site, service)
+}
 
+async fn exists(pool: &sqlx::PgPool, table: &str, id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = $1)"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_user_who_owns_resources_is_kept_unless_they_are_deleted_too() {
+    let pool = test_support::test_pool().await;
+    let local = Arc::new(MockAdapter::new());
+    let state = test_support::app_state(pool.clone(), local.clone());
+    let router = crate::routes::build_router(state.clone());
+    let admin = test_support::user(&pool, true).await;
+    let cookie = test_support::session_cookie(&state, admin.id).await;
+    let owner = test_support::user(&pool, false).await;
+    let (site, service) = owned_resources(&pool, &owner).await;
     let uri = format!("/api/admin/users/{}", owner.id);
+
+    // Without the flag nothing is touched.
     let (status, body) = call(&router, &cookie, Method::DELETE, &uri, None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.to_string().contains("1 site(s) and 1 service(s)"),
+        "{body}"
+    );
+    assert!(local.calls.lock().unwrap().is_empty());
+    assert!(exists(&pool, "sites", site).await && exists(&pool, "compose_projects", service).await);
+
+    // With it, each resource is torn down on the host, then the user goes.
+    let (status, body) = call(
+        &router,
+        &cookie,
+        Method::DELETE,
+        &format!("{uri}?delete_resources=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["removed"]["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(body["removed"]["services"].as_array().unwrap().len(), 1);
+    assert_eq!(body["removed"]["cron_jobs"], 1);
+    assert_eq!(body["removed"]["databases"], 1);
+    let calls = local.calls.lock().unwrap().clone();
+    for call in [
+        "remove_compose_project",
+        "remove_cron_job",
+        "delete_database",
+        "delete_site",
+    ] {
+        assert!(
+            calls.iter().any(|c| c == call),
+            "{call} missing from {calls:?}"
+        );
+    }
+    assert!(!exists(&pool, "sites", site).await);
+    assert!(!exists(&pool, "compose_projects", service).await);
+    let databases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM databases WHERE site_id = $1")
+        .bind(site)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(databases, 0);
+    assert!(db::users::find_by_id(&pool, owner.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        audit_count(&pool, "delete_user", &owner.id.to_string()).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_failed_teardown_keeps_the_user_and_a_retry_finishes() {
+    let pool = test_support::test_pool().await;
+    let local = Arc::new(MockAdapter::new());
+    let state = test_support::app_state(pool.clone(), local.clone());
+    let router = crate::routes::build_router(state.clone());
+    let admin = test_support::user(&pool, true).await;
+    let cookie = test_support::session_cookie(&state, admin.id).await;
+    let owner = test_support::user(&pool, false).await;
+    let (site, service) = owned_resources(&pool, &owner).await;
+    let uri = format!("/api/admin/users/{}?delete_resources=true", owner.id);
+
+    // The host refuses the site: the service is already gone, the site and
+    // the user stay, and nothing is orphaned.
+    local.fail_next_call("delete_site");
+    let (status, _) = call(&router, &cookie, Method::DELETE, &uri, None).await;
+    assert!(!status.is_success());
+    assert!(!exists(&pool, "compose_projects", service).await);
+    assert!(exists(&pool, "sites", site).await);
     assert!(db::users::find_by_id(&pool, owner.id)
         .await
         .unwrap()
         .is_some());
+
+    let (status, body) = call(&router, &cookie, Method::DELETE, &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!exists(&pool, "sites", site).await);
+    assert!(db::users::find_by_id(&pool, owner.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn a_running_deployment_blocks_deleting_its_owner() {
+    let pool = test_support::test_pool().await;
+    let local = Arc::new(MockAdapter::new());
+    let state = test_support::app_state(pool.clone(), local.clone());
+    let router = crate::routes::build_router(state.clone());
+    let admin = test_support::user(&pool, true).await;
+    let cookie = test_support::session_cookie(&state, admin.id).await;
+    let owner = test_support::user(&pool, false).await;
+    let (site, service) = owned_resources(&pool, &owner).await;
+    sqlx::query("UPDATE compose_projects SET status = 'running' WHERE id = $1")
+        .bind(service)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let uri = format!("/api/admin/users/{}?delete_resources=true", owner.id);
+    let (status, body) = call(&router, &cookie, Method::DELETE, &uri, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(local.calls.lock().unwrap().is_empty());
+    assert!(exists(&pool, "sites", site).await && exists(&pool, "compose_projects", service).await);
+    assert!(db::users::find_by_id(&pool, owner.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    // Leave nothing behind in the shared database.
+    sqlx::query("UPDATE compose_projects SET status = 'succeeded' WHERE id = $1")
+        .bind(service)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _) = call(&router, &cookie, Method::DELETE, &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]

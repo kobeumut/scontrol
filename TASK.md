@@ -266,7 +266,7 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 - [x] Hosted sites screens (`Sites.tsx`): create (every runtime) and delete a site, issue a certificate, per-site host databases (one-time password) and cron jobs, and the host firewall (admin). Fixed with it: a site's deletion and cron jobs used the owner's panel username instead of the site's system user; the system user is validated in panel-api; a cron job the agent refuses is not kept, and its schedule/command are checked in panel-api.
 - [x] Account tab (`Account.tsx`): TOTP enrollment in the UI. Re-enrolling while 2FA is on is refused (409), because it replaced the active secret before the new one was verified.
 - [x] Users panel for installation admins (`Users.tsx`, in the Access tab): list, create, reset 2FA, delete. A taken username or email is a 409, not a 500.
-- [x] Browser end-to-end suite (`panel/e2e`, Playwright, 152 tests, 2026-11-22) against a throwaway PostgreSQL and `scontrol-mock-agent`; see `panel/e2e/README.md`. Defects it found and that are fixed:
+- [x] Browser end-to-end suite (`panel/e2e`, Playwright, 153 tests, 2026-11-22) against a throwaway PostgreSQL and `scontrol-mock-agent`; see `panel/e2e/README.md`. Defects it found and that are fixed:
   - Sign out left the dashboard on screen (`useApi` keeps data on error), and the logout cookie removal lacked `Path=/`.
   - Every slug/name `pattern` with a bare `-` in a character class was ignored by the browser (regex `v` flag).
   - Domain options: turning on a redirect still sent the hidden path prefix and kept basic auth, which the API refuses.
@@ -275,12 +275,13 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
   - Notification form kept a typed secret when the kind changed; Docker cleanup settings saved without feedback or browser validation.
   - Deleting a non-empty environment, project, or server returned 500 on PostgreSQL 18 (`ON DELETE RESTRICT` is SQLSTATE 23001 there).
 - [x] Remaining UI and API gaps (GENE-230, 2026-11-22):
-  - Delete a panel user: `DELETE /api/admin/users/:id` and a "delete" action (with confirmation) in the Users panel. Refused for the caller's own account (400), the last installation admin (409; the admin rows are locked in the transaction so two concurrent deletions cannot remove the last two), a user who still owns sites or Compose services (409; those rows would cascade and leave their host resources unmanaged), and an installation admin by a role admin (403). Sessions, API keys, and role bindings go with the user; the deletion is audited.
+  - Delete a panel user: `DELETE /api/admin/users/:id` and a "delete" action (with confirmation) in the Users panel. Refused for the caller's own account (400), the last installation admin (409; the admin rows are locked in the transaction so two concurrent deletions cannot remove the last two), and an installation admin by a role admin (403). Sessions, API keys, and role bindings go with the user; the deletion is audited.
+  - A user who owns sites or services is refused (409, with counts) unless `?delete_resources=true` (`services/user_purge.rs`): every top-level service is torn down through the same path as removing it by hand (`compose_projects::teardown`: previews, containers, job timers, vhosts, agent files), then every site with its crontab entries and host databases, then the user. A running deployment refuses before anything is removed; a failure part-way keeps the user and a retry finishes. The UI asks to type the username. Named Docker volumes and the site's system user are kept, as with a manual removal.
   - Remove a firewall rule: `DELETE /api/firewall/:id`, new agent RPC `remove_firewall_rule` (`ufw delete allow|deny <port>/<proto>`), and a "remove" action in the Firewall table. UFW is changed first, so a rule the agent fails to remove stays listed. Audited.
   - Rename a remote server from the Servers tab (the panel host has no rename; the API already refuses it).
   - Docker cleanup "Clean up now on" picker when several servers exist; the run is sent with that `server_id`, and the run list shows the server.
   - Domains: a "Redeploy now when domains change" switch (on by default) for adding and removing domains, and a "Redeploy now" option in the domain options form; with it off the change is only saved (`redeploy: false`) and the screen says it takes effect with the next deployment.
-  - Tests: API integration tests for both deletions (`routes/admin_tests.rs`), `ufw` argv unit test, and 6 new browser tests (152 in total).
+  - Tests: API integration tests for both deletions and the resource teardown (`routes/admin_tests.rs`), `ufw` argv unit test, and 7 new browser tests (153 in total).
 - [ ] MCP tools for deleting users and firewall rules (only `apply_firewall_rule` exists).
 
 ## Validation

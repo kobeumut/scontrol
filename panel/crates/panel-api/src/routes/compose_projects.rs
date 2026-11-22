@@ -596,6 +596,26 @@ async fn remove(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let project = find_project(&state, id).await?;
+    teardown(&state, &project).await?;
+    db::audit::record(
+        &state.db,
+        Some(user.id),
+        user.actor_kind(),
+        "remove_compose_project",
+        Some(&project.slug),
+        serde_json::json!({ "project_id": project.id }),
+    )
+    .await
+    .ok();
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+/// Removes a service from its server and then from the panel: its previews,
+/// containers, scheduled-job timers, vhosts and agent files, then the row.
+/// Refused (409) while a deployment or a preview teardown is running. Used
+/// by service removal and by deleting the owning user.
+pub(crate) async fn teardown(state: &AppState, project: &ComposeProject) -> ApiResult<()> {
+    let id = project.id;
     if project.status == DeploymentStatus::Running {
         return Err(ApiError::Conflict(
             "a deployment is running; wait for it to finish".into(),
@@ -631,17 +651,7 @@ async fn remove(
         Err(error) => return Err(error.into()),
     }
     db::compose_projects::delete(&state.db, id).await?;
-    db::audit::record(
-        &state.db,
-        Some(user.id),
-        user.actor_kind(),
-        "remove_compose_project",
-        Some(&project.slug),
-        serde_json::json!({ "project_id": project.id }),
-    )
-    .await
-    .ok();
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    Ok(())
 }
 
 async fn services(

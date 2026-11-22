@@ -743,3 +743,51 @@ test('renames a server from the Servers tab; the panel host has no rename', asyn
     await admin.delete(`/api/servers/${id}`);
   }
 });
+
+test('deleting a user who owns a site and a service removes them too, after typing the username', async ({ page }) => {
+  const failures = watchForFailures(page);
+  const username = unique('own').replace(/-/g, '_');
+  const created = await admin.post('/api/admin/users', { data: { username, email: `${username}@example.test`, password: PASSWORD, is_admin: true } });
+  expect(created.status(), await created.text()).toBe(200);
+  const id = (await created.json()).id as string;
+  const owner = await apiAs({ username, password: PASSWORD });
+  const domain = `${unique('owned')}.example.test`;
+  const site = await owner.post('/api/sites', { data: { domain, owner_username: unique('sys').replace(/-/g, '_'), runtime: { kind: 'static' } } });
+  expect(site.ok(), await site.text()).toBe(true);
+  const slug = unique('owned');
+  const service = await owner.post('/api/compose-projects', {
+    data: { name: slug, slug, source: { kind: 'raw', compose_yaml: 'services:\n  web:\n    image: nginx:alpine\n' }, deploy: false },
+  });
+  expect(service.ok(), await service.text()).toBe(true);
+  await owner.dispose();
+
+  await signIn(page);
+  await openTab(page, 'Access');
+  const row = rowByText(page, username);
+  let deletes = 0;
+  page.on('request', (r) => { if (r.method() === 'DELETE' && r.url().includes(`/api/admin/users/${id}`)) deletes += 1; });
+
+  // A wrong confirmation deletes nothing.
+  const prompts: string[] = [];
+  page.on('dialog', (d) => {
+    if (d.type() === 'confirm') return d.accept();
+    prompts.push(d.message());
+    return d.accept(prompts.length === 1 ? 'wrong' : username);
+  });
+  await row.getByRole('button', { name: 'delete' }).click();
+  await expect(page.getByRole('alert')).toContainText('did not match');
+  expect(prompts[0]).toContain('owns 1 site(s) and 1 service(s)');
+  expect(deletes).toBe(1);
+  await expect(row).toBeVisible();
+
+  await row.getByRole('button', { name: 'delete' }).click();
+  await expect(page.getByRole('status')).toContainText(`Deleted ${username} with 1 site(s) and 1 service(s).`);
+  await expect(rowByText(page, username)).toHaveCount(0);
+  expect(deletes).toBe(3);
+
+  const sites: { domain: string }[] = await (await admin.get('/api/sites')).json();
+  expect(sites.some((s) => s.domain === domain)).toBe(false);
+  const services: { slug: string }[] = await (await admin.get('/api/compose-projects')).json();
+  expect(services.some((s) => s.slug === slug)).toBe(false);
+  expect(failures).toEqual([]);
+});
