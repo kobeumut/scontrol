@@ -19,3 +19,7 @@
 .kilo/
 
 graphify-out/
+# End-to-end tests
+/panel/e2e/node_modules/
+/panel/e2e/test-results/
+/panel/e2e/playwright-report/

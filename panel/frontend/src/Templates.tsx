@@ -1,5 +1,5 @@
 import { FormEvent, useState } from 'react';
-import { api, ComposeProject, Deployment, TemplateInfo, useApi } from './api';
+import { api, ComposeProject, Deployment, Project, TemplateInfo, useApi } from './api';
 import { ErrorLine, StateView, useAction } from './ui';
 
 type Installed = { project: ComposeProject; deployment: Deployment | null; suggested_domain: TemplateInfo['suggested_domain'] };
@@ -9,6 +9,8 @@ const slugify = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-
 /** Vetted application catalogue: one-click install with generated secrets. */
 export function Templates({ onInstalled }: { onInstalled?: (projectId: string) => void }) {
   const catalogue = useApi<TemplateInfo[]>('/templates');
+  const projects = useApi<Project[]>('/projects');
+  const [environmentId, setEnvironmentId] = useState('');
   const [chosen, setChosen] = useState<TemplateInfo>();
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
@@ -26,7 +28,7 @@ export function Templates({ onInstalled }: { onInstalled?: (projectId: string) =
     if (!chosen) return;
     action.run(async () => {
       const result = await api<Installed>(`/templates/${chosen.id}/install`, {
-        method: 'POST', body: { name: name.trim(), slug, inputs },
+        method: 'POST', body: { name: name.trim(), slug, inputs, environment_id: environmentId || undefined },
       });
       setDone(result);
       onInstalled?.(result.project.id);
@@ -48,7 +50,11 @@ export function Templates({ onInstalled }: { onInstalled?: (projectId: string) =
     {chosen && <form className="card" onSubmit={install}>
       <h3>Install {chosen.name}</h3>
       <label>Project name<input required value={name} onChange={(e) => setName(e.target.value)} /></label>
-      <label>Slug<input required className="mono" pattern="[a-z0-9][a-z0-9-]{0,39}" value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
+      <label>Slug<input required className="mono" pattern="[a-z0-9][a-z0-9\-]{0,39}" value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
+      <label>Project / environment<select value={environmentId} onChange={(e) => setEnvironmentId(e.target.value)}>
+        <option value="">Default / production</option>
+        {(projects.data ?? []).flatMap((p) => p.environments.map((e) => <option key={e.id} value={e.id}>{p.name} / {e.name}</option>))}
+      </select></label>
       {chosen.inputs.map((input) => <label key={input.name}>{input.label}
         <input required value={inputs[input.name] ?? ''} onChange={(e) => setInputs({ ...inputs, [input.name]: e.target.value })} />
       </label>)}

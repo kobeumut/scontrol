@@ -365,14 +365,13 @@ async fn remove(
             "delete this server's services first".into(),
         ));
     }
-    db::servers::delete(&state.db, id)
-        .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
-                ApiError::Conflict("delete this server's services first".into())
-            }
-            _ => e.into(),
-        })?;
+    db::servers::delete(&state.db, id).await.map_err(|e| {
+        if crate::error::is_still_referenced(&e) {
+            ApiError::Conflict("delete this server's services first".into())
+        } else {
+            e.into()
+        }
+    })?;
     audit(
         &state,
         &principal,

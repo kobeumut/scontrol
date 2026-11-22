@@ -263,7 +263,18 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
 - [x] Implement authenticated create/deploy/log workflows (D1).
 - [x] SPA health check called `/api/health/agent`, which did not exist (health was only mounted at `/health`). It is now mounted under both.
 - [x] Vite dev proxy (`SCONTROL_API`, default `http://127.0.0.1:8080`) for local UI work.
-- [ ] Hosted sites screens (create/delete site, TLS) are still read-only.
+- [x] Hosted sites screens (`Sites.tsx`): create (every runtime) and delete a site, issue a certificate, per-site host databases (one-time password) and cron jobs, and the host firewall (admin). Fixed with it: a site's deletion and cron jobs used the owner's panel username instead of the site's system user; the system user is validated in panel-api; a cron job the agent refuses is not kept, and its schedule/command are checked in panel-api.
+- [x] Account tab (`Account.tsx`): TOTP enrollment in the UI. Re-enrolling while 2FA is on is refused (409), because it replaced the active secret before the new one was verified.
+- [x] Users panel for installation admins (`Users.tsx`, in the Access tab): list, create, reset 2FA. A taken username or email is a 409, not a 500.
+- [x] Browser end-to-end suite (`panel/e2e`, Playwright, 146 tests, 2026-11-22) against a throwaway PostgreSQL and `scontrol-mock-agent`; see `panel/e2e/README.md`. Defects it found and that are fixed:
+  - Sign out left the dashboard on screen (`useApi` keeps data on error), and the logout cookie removal lacked `Path=/`.
+  - Every slug/name `pattern` with a bare `-` in a character class was ignored by the browser (regex `v` flag).
+  - Domain options: turning on a redirect still sent the hidden path prefix and kept basic auth, which the API refuses.
+  - The environment variables editor did not show a project variable saved a moment earlier; projects could not be renamed in the UI; template installs could not choose an environment.
+  - The bucket listing missed a backup that finished before the first poll; the log and terminal service pickers stayed empty after a first deployment; PR preview rows had no "open".
+  - Notification form kept a typed secret when the kind changed; Docker cleanup settings saved without feedback or browser validation.
+  - Deleting a non-empty environment, project, or server returned 500 on PostgreSQL 18 (`ON DELETE RESTRICT` is SQLSTATE 23001 there).
+- [ ] Not in the UI yet: renaming a server (`PUT /servers/:id`), Docker cleanup on a remote server (`server_id`), adding/removing a domain or saving its options without a redeploy (`redeploy: false`), deleting a firewall rule or a panel user (no API either).
 
 ## Validation
 

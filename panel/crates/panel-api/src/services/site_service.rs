@@ -33,6 +33,12 @@ pub async fn create_site(
             req.domain
         )));
     }
+    if !panel_core::types::validate::is_valid_username(&req.owner_username) {
+        return Err(CoreError::Validation(
+            "invalid system user: use 3 to 32 lowercase letters, digits, '-' or '_', starting with a letter"
+                .into(),
+        ));
+    }
     if db::sites::find_by_domain(pool, &req.domain)
         .await
         .map_err(|e| CoreError::External(e.to_string()))?
@@ -95,10 +101,9 @@ pub async fn delete_site(pool: &PgPool, agent: &dyn AdapterPort, site_id: Uuid) 
         .map_err(|e| CoreError::External(e.to_string()))?
         .ok_or_else(|| CoreError::NotFound(format!("site {site_id} not found")))?;
 
-    let owner_username = db::users::find_by_id(pool, site.owner_user_id)
+    let owner_username = db::sites::owner_username(pool, site_id)
         .await
         .map_err(|e| CoreError::External(e.to_string()))?
-        .map(|u| u.username)
         .unwrap_or_default();
 
     let php_version = match &site.runtime {

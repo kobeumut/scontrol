@@ -138,7 +138,7 @@ function RoleForm({ role, catalog, onDone }: { role?: Role; catalog: PermissionI
   };
   return <form className="card" onSubmit={submit}>
     <div className="grid2">
-      <label>Name<input required className="mono" pattern="[a-z0-9][a-z0-9-]*[a-z0-9]" maxLength={40} value={name} onChange={(e) => setName(e.target.value)} /></label>
+      <label>Name<input required className="mono" pattern="[a-z0-9][a-z0-9\-]*[a-z0-9]" maxLength={40} value={name} onChange={(e) => setName(e.target.value)} /></label>
       <label>Description<input maxLength={200} value={description} onChange={(e) => setDescription(e.target.value)} /></label>
     </div>
     {groups.map(([resource, permissions]) => <fieldset key={resource}><legend>{resource}</legend>

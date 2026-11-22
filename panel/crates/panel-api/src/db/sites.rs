@@ -137,3 +137,12 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
         .await?;
     Ok(())
 }
+
+/// The system account a site runs as: the one named when it was created,
+/// which need not be its owner's panel username.
+pub async fn owner_username(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT owner_username FROM sites WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}

@@ -64,3 +64,12 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+/// Whether a delete was refused because other rows still reference the row.
+/// PostgreSQL reports that as `foreign_key_violation` (23503), and since
+/// version 18 as `restrict_violation` (23001) for `ON DELETE RESTRICT`.
+pub fn is_still_referenced(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|e| e.is_foreign_key_violation() || e.code().as_deref() == Some("23001"))
+}

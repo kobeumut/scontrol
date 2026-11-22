@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { api, formatTime, useApi } from './api';
 import { ErrorLine, StateView, useAction } from './ui';
 
@@ -134,11 +134,18 @@ function DockerCleanup({ docker }: { docker: boolean }) {
       overview.reload();
     });
   };
-  const save = () => action.run(async () => {
-    if (!form) return;
-    await api('/observability/docker-cleanup/settings', { method: 'PUT', body: form });
-    overview.reload();
-  });
+  const [saved, setSaved] = useState(false);
+  const change = (next: CleanupSettings) => { setForm(next); setSaved(false); };
+  const save = (event: FormEvent) => {
+    event.preventDefault();
+    action.run(async () => {
+      if (!form) return;
+      setSaved(false);
+      await api('/observability/docker-cleanup/settings', { method: 'PUT', body: form });
+      setSaved(true);
+      overview.reload();
+    });
+  };
   const running = data?.runs.some((r) => r.status === 'running');
 
   return <section className="panel">
@@ -149,19 +156,20 @@ function DockerCleanup({ docker }: { docker: boolean }) {
     <p className="hint">Removes dangling images, unused images, and build cache older than the age filter. Images used by a container (stopped ones included) and rollback releases are kept. A cleanup waits while deployments are queued or running on the server, and deployments wait for a running cleanup.</p>
     <StateView state={overview} />
     <ErrorLine error={action.error} />
-    {form && <div className="toolbar">
-      <label className="check"><input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />Automatic cleanup</label>
+    {form && <form className="toolbar" onSubmit={save}>
+      <label className="check"><input type="checkbox" checked={form.enabled} onChange={(e) => change({ ...form, enabled: e.target.checked })} />Automatic cleanup</label>
       <label>Every
-        <select value={form.interval_hours} onChange={(e) => setForm({ ...form, interval_hours: Number(e.target.value) })}>
+        <select value={form.interval_hours} onChange={(e) => change({ ...form, interval_hours: Number(e.target.value) })}>
           {(data?.intervals ?? [form.interval_hours]).map((h) => <option key={h} value={h}>{h < 24 ? `${h} hours` : `${h / 24} day${h === 24 ? '' : 's'}`}</option>)}
         </select>
       </label>
       <label>Older than (hours)
-        <input type="number" min={1} max={8760} value={form.older_than_hours}
-          onChange={(e) => setForm({ ...form, older_than_hours: Number(e.target.value) })} />
+        <input type="number" required min={1} max={8760} value={form.older_than_hours}
+          onChange={(e) => change({ ...form, older_than_hours: Number(e.target.value) })} />
       </label>
-      <button className="ghost" disabled={action.busy} onClick={save}>Save</button>
-    </div>}
+      <button className="ghost" disabled={action.busy}>Save</button>
+      {saved && <span className="state">Saved.</span>}
+    </form>}
     {data && (data.runs.length === 0 ? <p className="state">No cleanups yet.</p>
       : <table><thead><tr><th>Started</th><th>Trigger</th><th>Status</th><th>Older than</th><th>Images freed</th><th>Build cache freed</th><th>Total freed</th></tr></thead><tbody>
         {data.runs.map((r) => <tr key={r.id}>

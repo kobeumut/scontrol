@@ -12,9 +12,11 @@ const LAYER_LABEL: Record<EnvLayer, string> = { project: 'project', environment:
  * the layers it overrides, so inherited and overridden variables are visible;
  * values are never loaded back, because the panel does not return them.
  */
-export function LayeredVariables({ path, layer, title, hint }: {
+export function LayeredVariables({ path, layer, title, hint, refresh, onSaved }: {
   /** API path of the layer: GET lists keys, PUT replaces the layer. */
   path: string; layer: EnvLayer; title: string; hint?: string;
+  /** Changes when a layer this one inherits from was saved elsewhere. */
+  refresh?: number; onSaved?: () => void;
 }) {
   const info = useApi<LayerVariables>(path);
   const [rows, setRows] = useState<Row[]>([]);
@@ -22,6 +24,9 @@ export function LayeredVariables({ path, layer, title, hint }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [saved, setSaved] = useState(false);
+
+  const reload = info.reload;
+  useEffect(() => { if (refresh) reload(); }, [refresh, reload]);
 
   const own = info.data?.layers.find((l) => l.layer === layer)?.keys;
   useEffect(() => {
@@ -41,7 +46,7 @@ export function LayeredVariables({ path, layer, title, hint }: {
       .map((r) => (r.stored && r.value === '' ? { key: r.key } : { key: r.key.trim(), value: r.value }));
     try {
       await api<LayerVariables>(path, { method: 'PUT', body: { variables } });
-      setDirty(false); setSaved(true); info.reload();
+      setDirty(false); setSaved(true); info.reload(); onSaved?.();
     } catch (e) {
       setError((e as Error).message);
     } finally {

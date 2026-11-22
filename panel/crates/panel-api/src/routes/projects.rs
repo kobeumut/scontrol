@@ -466,10 +466,7 @@ fn conflict_on_unique(error: anyhow::Error, message: &str) -> ApiError {
 }
 
 fn conflict_on_foreign_key(error: sqlx::Error, message: &str) -> ApiError {
-    if error
-        .as_database_error()
-        .is_some_and(|e| e.is_foreign_key_violation())
-    {
+    if crate::error::is_still_referenced(&error) {
         ApiError::Conflict(message.into())
     } else {
         ApiError::Db(error)

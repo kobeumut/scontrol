@@ -114,7 +114,7 @@ function ChannelForm({ channel, onDone }: { channel?: Channel; onDone: () => voi
   return <form className="card" onSubmit={submit}>
     <div className="grid2">
       <label>Name<input required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} /></label>
-      <label>Kind<select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
+      <label>Kind<select value={kind} onChange={(e) => { setKind(e.target.value as Kind); setSecret(''); }}>
         {(Object.keys(KINDS) as Kind[]).map((k) => <option key={k} value={k}>{KINDS[k].label}</option>)}
       </select></label>
       {spec.fields.map(([key, label]) => <label key={key}>{label}

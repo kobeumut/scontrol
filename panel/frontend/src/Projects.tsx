@@ -58,7 +58,7 @@ function CreateProject({ onCreated }: { onCreated: (id: string) => void }) {
   return <form className="card" onSubmit={submit}>
     <div className="grid2">
       <label>Name<input required maxLength={100} value={name} onChange={(e) => { setName(e.target.value); setSlug(toSlug(e.target.value)); }} /></label>
-      <label>Slug<input required className="mono" pattern="[a-z][a-z0-9-]{2,47}" value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
+      <label>Slug<input required className="mono" pattern="[a-z][a-z0-9\-]{2,47}" value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
     </div>
     <p className="hint">The project starts with a <span className="mono">production</span> environment.</p>
     {error && <p className="state error" role="alert">{error}</p>}
@@ -71,6 +71,8 @@ function ProjectDetail({ project, onBack, onChanged }: { project: Project; onBac
   const [newEnv, setNewEnv] = useState('');
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [projectSaves, setProjectSaves] = useState(0);
+  const [renaming, setRenaming] = useState<string>();
   const environment = project.environments.find((e) => e.id === envId) ?? project.environments[0];
   const base = `/projects/${project.id}`;
 
@@ -89,6 +91,13 @@ function ProjectDetail({ project, onBack, onChanged }: { project: Project; onBac
     if (!environment || !window.confirm(`Delete environment ${environment.name} and its variables?`)) return;
     run(async () => { await api(`${base}/environments/${environment.id}`, { method: 'DELETE' }); setEnvId(''); });
   };
+  const rename = (event: FormEvent) => {
+    event.preventDefault();
+    run(async () => {
+      await api(base, { method: 'PATCH', body: { name: (renaming ?? '').trim() } });
+      setRenaming(undefined);
+    });
+  };
   const removeProject = () => {
     if (window.prompt(`Type ${project.slug} to delete this project, its environments and variables.`) !== project.slug) return;
     run(async () => { await api(base, { method: 'DELETE' }); onBack(); });
@@ -98,11 +107,20 @@ function ProjectDetail({ project, onBack, onChanged }: { project: Project; onBac
     <button className="link" onClick={onBack}>← All projects</button>
     <div className="panel-title">
       <h2>{project.name} <span className="mono muted">{project.slug}</span></h2>
-      <button className="ghost danger" disabled={busy} onClick={removeProject}>Delete project</button>
+      <div className="toolbar">
+        <button className="ghost" disabled={busy} onClick={() => setRenaming(renaming === undefined ? project.name : undefined)}>{renaming === undefined ? 'Rename' : 'Cancel rename'}</button>
+        <button className="ghost danger" disabled={busy} onClick={removeProject}>Delete project</button>
+      </div>
     </div>
+    {renaming !== undefined && <form className="toolbar" onSubmit={rename}>
+      <input aria-label="Project name" required maxLength={100} value={renaming} onChange={(e) => setRenaming(e.target.value)} />
+      <button className="action" disabled={busy || !renaming.trim() || renaming.trim() === project.name}>Save name</button>
+      <span className="hint">The slug stays <span className="mono">{project.slug}</span>.</span>
+    </form>}
     {error && <p className="state error" role="alert">{error}</p>}
 
     <LayeredVariables key={`p-${project.id}`} path={`${base}/variables`} layer="project" title="Project variables"
+      onSaved={() => setProjectSaves((n) => n + 1)}
       hint="Write-only. Shared by every environment and service of this project unless they override a key." />
 
     <h3>Environments</h3>
@@ -121,7 +139,7 @@ function ProjectDetail({ project, onBack, onChanged }: { project: Project; onBac
     </form>
 
     {environment && <LayeredVariables key={`e-${environment.id}`} path={`${base}/environments/${environment.id}/variables`}
-      layer="environment" title={`${environment.name} variables`}
+      layer="environment" title={`${environment.name} variables`} refresh={projectSaves}
       hint="Write-only. Override project variables for the services of this environment; a service can override them again." />}
   </section>;
 }

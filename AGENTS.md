@@ -148,6 +148,10 @@ sudo cargo run --bin panel-agent
 
 # Frontend
 cd frontend && npm install && npm run build
+
+# Browser end-to-end tests (after building panel-api and the frontend)
+cargo build -p panel-core --features test-utils --bin scontrol-mock-agent
+cd e2e && npm install && npm test
 ```
 
 Before you report work as done, run the build, lint, and test commands that apply, and say which ones you could not run.
@@ -158,12 +162,15 @@ Before you report work as done, run the build, lint, and test commands that appl
 - Integration tests for the full site provisioning flow.
 - Compose validation tests, including rejection of privileged mode and host bind mounts.
 - MCP tool-call validation tests.
+- Browser end-to-end tests live in `panel/e2e` (Playwright; see its `README.md`). They run the real frontend and panel-api against a throwaway PostgreSQL and `scontrol-mock-agent`, so they need no root, Nginx, or Docker. A change to a screen or to the API it calls updates the matching spec. When a screen needs the host to answer, extend `scontrol-mock-agent`, not `MockAdapter`'s defaults.
 - Pending: E2E test of the installer on a clean Ubuntu 24.04 VM (tracked in `TASK.md`).
 
 ## Frontend
 
 - React 19 + Vite + TypeScript. Styling is plain CSS in `panel/frontend/src/styles.css`. Tailwind is not installed.
 - New screens need loading, error, and optional-capability states (for example, Docker not installed).
+- Write a `-` inside an input `pattern` character class as `\-`. Browsers compile `pattern` with the regex `v` flag, where a bare `-` is a syntax error and the whole pattern is silently ignored.
+- `useApi` keeps the last data when a reload fails; where an error means the data is gone (the session), check `error` first.
 
 ## Installation and Operations
 
@@ -185,5 +192,6 @@ panel/
 │   │                       #   docker, mail, antivirus
 │   ├── panel-api/          # Axum API: auth/, db/, routes/, services/, mcp/, migrations/
 │   └── panel-cli/          # administration CLI
-└── frontend/               # React 19 + Vite dashboard (package: scontrol-web)
+├── frontend/               # React 19 + Vite dashboard (package: scontrol-web)
+└── e2e/                    # Playwright end-to-end tests and the stack launcher
 ```
