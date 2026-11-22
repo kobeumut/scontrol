@@ -59,3 +59,21 @@ pub async fn list_all(pool: &PgPool) -> anyhow::Result<Vec<FirewallRule>> {
     .await?;
     records.into_iter().map(|r| r.into_rule()).collect()
 }
+
+pub async fn find(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<FirewallRule>> {
+    let record = sqlx::query_as!(
+        FirewallRecord,
+        "SELECT id, port, protocol, allow, description FROM firewall_rules WHERE id = $1",
+        id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    record.map(|r| r.into_rule()).transpose()
+}
+
+pub async fn delete(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
+    sqlx::query!("DELETE FROM firewall_rules WHERE id = $1", id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

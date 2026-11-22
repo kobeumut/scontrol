@@ -38,6 +38,17 @@ export function Servers({ canManage }: { canManage: boolean }) {
       servers.reload();
     });
   };
+  const rename = (s: Server) => {
+    const raw = window.prompt(`New name for ${s.name} (lowercase letters, digits, and -):`, s.name);
+    if (raw === null) return;
+    const name = raw.trim();
+    if (name === s.name) return;
+    if (!name) { action.fail('Enter a name.'); return; }
+    action.run(async () => {
+      await api(`/servers/${s.id}`, { method: 'PUT', body: { name, draining: s.draining, max_services: s.max_services } });
+      servers.reload();
+    });
+  };
   const showCertificate = (s: Server) => action.run(async () => {
     setBundle({ title: s.name, ...await api<CertificateInfo>(`/servers/${s.id}/certificate`) });
   });
@@ -85,6 +96,7 @@ export function Servers({ canManage }: { canManage: boolean }) {
           <button className="link" disabled={action.busy} onClick={() => check(s)}>check</button>
           {canManage && <button className="link" disabled={action.busy} onClick={() => toggleDrain(s)}>{s.draining ? 'undrain' : 'drain'}</button>}
           {canManage && <button className="link" disabled={action.busy} onClick={() => setCapacity(s)}>capacity</button>}
+          {canManage && s.id !== LOCAL_SERVER_ID && <button className="link" disabled={action.busy} onClick={() => rename(s)}>rename</button>}
           {s.transport === 'mtls' && <button className="link" disabled={action.busy} onClick={() => showCertificate(s)}>certificate</button>}
           {canManage && s.transport === 'mtls' && <button className="link" disabled={action.busy} onClick={() => { setRotating(s); setBundle(undefined); }}>rotate</button>}
           {canManage && s.id !== LOCAL_SERVER_ID && <button className="link danger" disabled={action.busy || s.service_count > 0}
@@ -173,13 +185,15 @@ export function placement(value: string): { server_id?: string; auto_place?: boo
 }
 
 /** Where a new service runs: `''` this host (or, when it is draining or full, the least loaded server), `'auto'`, or a server id. */
-export function ServerSelect({ value, onChange }: { value: string; onChange: (id: string) => void }) {
+export function ServerSelect({ value, onChange, auto = true, label = 'Server' }: {
+  value: string; onChange: (id: string) => void; auto?: boolean; label?: string;
+}) {
   const servers = useApi<Server[]>('/servers');
   if (servers.error || (servers.data && servers.data.length < 2)) return null;
-  return <label>Server
+  return <label>{label}
     <select value={value} disabled={servers.loading} onChange={(e) => onChange(e.target.value)}>
       <option value="">this host</option>
-      <option value="auto">automatic (least loaded online server)</option>
+      {auto && <option value="auto">automatic (least loaded online server)</option>}
       {servers.data?.map((s) => <option key={s.id} value={s.id} disabled={s.status !== 'online' || s.draining}>
         {s.name}{s.status !== 'online' ? ` (${s.status})` : s.draining ? ' (draining)' : ''}
       </option>)}

@@ -455,4 +455,46 @@ test('firewall applies an allow rule, replaces it with deny, and validates the p
   await section.getByRole('button', { name: 'Apply rule' }).click();
   await expect(portInput).toHaveJSProperty('validity.valueMissing', true);
   expect(posts).toBe(0);
+
+  for (const r of await stored()) await page.request.delete(`/api/firewall/${r.id}`);
+});
+
+test('firewall removes a rule after confirming, and only that rule', async ({ page }) => {
+  const failures = watchForFailures(page);
+  const section = page.locator('section.panel').filter({ has: page.getByRole('heading', { name: 'Firewall' }) });
+  const port = randomPort();
+  const description = unique('fwdel');
+  const rules = () => section.getByRole('row').filter({ hasText: description });
+  const stored = async () => (await apiGet(page, '/firewall')).filter((r: { port: number }) => r.port === port);
+  for (const protocol of ['tcp', 'udp'] as const) {
+    await section.getByLabel('Port').fill(String(port));
+    await section.getByLabel('Protocol').selectOption(protocol);
+    await section.getByLabel('Rule').selectOption('deny');
+    await section.getByLabel('Description').fill(description);
+    await section.getByRole('button', { name: 'Apply rule' }).click();
+    await expect(section.getByLabel('Port')).toHaveValue('');
+  }
+  await expect(rules()).toHaveCount(2);
+  const udp = rules().filter({ hasText: 'udp' });
+
+  // Dismissing the confirmation sends nothing.
+  let deletes = 0;
+  page.on('request', (r) => { if (r.method() === 'DELETE' && r.url().includes('/api/firewall/')) deletes += 1; });
+  page.once('dialog', (d) => d.dismiss());
+  await udp.getByRole('button', { name: 'remove' }).click();
+  await expect(rules()).toHaveCount(2);
+  expect(deletes).toBe(0);
+
+  page.once('dialog', (d) => { expect(d.message()).toContain(`deny rule for ${port}/udp`); return d.accept(); });
+  await udp.getByRole('button', { name: 'remove' }).click();
+  await expect(rules()).toHaveCount(1);
+  await expect(rules()).toContainText('tcp');
+  expect(await stored()).toMatchObject([{ port, protocol: 'tcp' }]);
+
+  page.once('dialog', (d) => d.accept());
+  await rules().getByRole('button', { name: 'remove' }).click();
+  await expect(rules()).toHaveCount(0);
+  expect(await stored()).toEqual([]);
+  expect(deletes).toBe(2);
+  expect(failures).toEqual([]);
 });

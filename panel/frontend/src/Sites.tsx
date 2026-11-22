@@ -240,17 +240,22 @@ function Firewall() {
       rules.reload();
     });
   };
+  const remove = (rule: FirewallRule) => {
+    if (!window.confirm(`Remove the ${rule.allow ? 'allow' : 'deny'} rule for ${rule.port}/${rule.protocol} from UFW?`)) return;
+    action.run(async () => { await api(`/firewall/${rule.id}`, { method: 'DELETE' }); rules.reload(); });
+  };
 
   return <section className="panel">
     <div className="panel-title"><h2>Firewall</h2></div>
     <p className="hint">UFW rules on this host. Applying a rule for a port and protocol that already has one replaces it (allow ↔ deny).</p>
     <StateView state={rules} />
-    {rules.data && <table><thead><tr><th>Port</th><th>Protocol</th><th>Rule</th><th>Description</th></tr></thead><tbody>
-      {rules.data.length === 0 ? <tr><td colSpan={4} className="empty">No rules applied through the panel.</td></tr>
+    {rules.data && <table><thead><tr><th>Port</th><th>Protocol</th><th>Rule</th><th>Description</th><th /></tr></thead><tbody>
+      {rules.data.length === 0 ? <tr><td colSpan={5} className="empty">No rules applied through the panel.</td></tr>
         : rules.data.map((rule) => <tr key={rule.id}>
           <td className="mono">{rule.port}</td><td>{rule.protocol}</td>
           <td><span className={`badge ${rule.allow ? 'succeeded' : 'failed'}`}>{rule.allow ? 'allow' : 'deny'}</span></td>
           <td>{rule.description || '—'}</td>
+          <td><button className="link danger" disabled={action.busy} onClick={() => remove(rule)}>remove</button></td>
         </tr>)}
     </tbody></table>}
     <form className="toolbar" onSubmit={apply}>

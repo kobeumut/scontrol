@@ -111,6 +111,15 @@ pub struct ApplyFirewallRuleParams {
     pub description: String,
 }
 
+/// Removes a UFW rule. `allow` selects which rule (`allow` or `deny`) for
+/// the port and protocol is deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoveFirewallRuleParams {
+    pub port: u16,
+    pub protocol: FirewallProtocol,
+    pub allow: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UpsertCronJobParams {
     pub owner_username: String,
@@ -747,6 +756,7 @@ pub trait AdapterPort: Send + Sync {
     async fn delete_system_user(&self, params: DeleteSystemUserParams) -> CoreResult<()>;
 
     async fn apply_firewall_rule(&self, params: ApplyFirewallRuleParams) -> CoreResult<()>;
+    async fn remove_firewall_rule(&self, params: RemoveFirewallRuleParams) -> CoreResult<()>;
 
     async fn upsert_cron_job(&self, params: UpsertCronJobParams) -> CoreResult<()>;
     async fn remove_cron_job(&self, params: RemoveCronJobParams) -> CoreResult<()>;
@@ -966,6 +976,10 @@ pub mod mock {
 
         async fn apply_firewall_rule(&self, _params: ApplyFirewallRuleParams) -> CoreResult<()> {
             self.record("apply_firewall_rule")
+        }
+
+        async fn remove_firewall_rule(&self, _params: RemoveFirewallRuleParams) -> CoreResult<()> {
+            self.record("remove_firewall_rule")
         }
 
         async fn upsert_cron_job(&self, _params: UpsertCronJobParams) -> CoreResult<()> {

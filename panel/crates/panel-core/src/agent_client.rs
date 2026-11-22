@@ -296,6 +296,10 @@ impl AdapterPort for AgentClient {
         self.call(AgentRequest::ApplyFirewallRule(params)).await
     }
 
+    async fn remove_firewall_rule(&self, params: RemoveFirewallRuleParams) -> CoreResult<()> {
+        self.call(AgentRequest::RemoveFirewallRule(params)).await
+    }
+
     async fn upsert_cron_job(&self, params: UpsertCronJobParams) -> CoreResult<()> {
         self.call(AgentRequest::UpsertCronJob(params)).await
     }

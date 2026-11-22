@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { api, formatTime, useApi } from './api';
+import { api, formatTime, LOCAL_SERVER_ID, Server, useApi } from './api';
+import { ServerSelect } from './Servers';
 import { ErrorLine, StateView, useAction } from './ui';
 
 type HostTotals = {
@@ -17,7 +18,7 @@ type RequestStats = {
 };
 type CleanupSettings = { enabled: boolean; interval_hours: number; older_than_hours: number };
 type CleanupRun = {
-  id: string; trigger: 'schedule' | 'manual'; status: 'running' | 'succeeded' | 'failed';
+  id: string; server_id: string; trigger: 'schedule' | 'manual'; status: 'running' | 'succeeded' | 'failed';
   older_than_hours: number; started_at: string; finished_at: string | null;
   images_freed_bytes: number; builder_freed_bytes: number; error_message: string | null;
 };
@@ -121,20 +122,29 @@ function DockerCleanup({ docker }: { docker: boolean }) {
   const overview = useApi<CleanupOverview>(docker ? '/observability/docker-cleanup' : null, 10000);
   const action = useAction();
   const [form, setForm] = useState<CleanupSettings>();
+  const [saved, setSaved] = useState(false);
+  // '' cleans this host; otherwise a server id.
+  const [serverId, setServerId] = useState('');
+  const servers = useApi<Server[]>(docker ? '/servers' : null);
   const data = overview.data;
   useEffect(() => { if (data && !form) setForm(data.settings); }, [data, form]);
 
   if (!docker) return <section className="panel"><div className="panel-title"><h2>Docker cleanup</h2></div>
     <p className="state">Docker was not selected at install time.</p></section>;
 
+  const serverName = (id: string) => servers.data?.find((s) => s.id === id)?.name ?? (id === LOCAL_SERVER_ID ? 'this host' : id.slice(0, 8));
+  const target = serverId || LOCAL_SERVER_ID;
   const runNow = () => {
-    if (!window.confirm('Remove all unused images and build cache older than the configured age?')) return;
+    const where = serverId ? ` on ${serverName(serverId)}` : '';
+    if (!window.confirm(`Remove all unused images and build cache older than the configured age${where}?`)) return;
     action.run(async () => {
-      await api('/observability/docker-cleanup/run', { method: 'POST', body: { older_than_hours: form?.older_than_hours } });
+      await api('/observability/docker-cleanup/run', {
+        method: 'POST',
+        body: { older_than_hours: form?.older_than_hours, ...(serverId ? { server_id: serverId } : {}) },
+      });
       overview.reload();
     });
   };
-  const [saved, setSaved] = useState(false);
   const change = (next: CleanupSettings) => { setForm(next); setSaved(false); };
   const save = (event: FormEvent) => {
     event.preventDefault();
@@ -146,7 +156,9 @@ function DockerCleanup({ docker }: { docker: boolean }) {
       overview.reload();
     });
   };
-  const running = data?.runs.some((r) => r.status === 'running');
+  // Only a cleanup on the chosen server blocks another one there.
+  const running = data?.runs.some((r) => r.status === 'running' && r.server_id === target);
+  const manyServers = (servers.data?.length ?? 0) > 1;
 
   return <section className="panel">
     <div className="panel-title">
@@ -156,6 +168,10 @@ function DockerCleanup({ docker }: { docker: boolean }) {
     <p className="hint">Removes dangling images, unused images, and build cache older than the age filter. Images used by a container (stopped ones included) and rollback releases are kept. A cleanup waits while deployments are queued or running on the server, and deployments wait for a running cleanup.</p>
     <StateView state={overview} />
     <ErrorLine error={action.error} />
+    {manyServers && <div className="toolbar">
+      <ServerSelect auto={false} label="Clean up now on" value={serverId} onChange={setServerId} />
+      <span className="small muted">Automatic cleanup runs on every server.</span>
+    </div>}
     {form && <form className="toolbar" onSubmit={save}>
       <label className="check"><input type="checkbox" checked={form.enabled} onChange={(e) => change({ ...form, enabled: e.target.checked })} />Automatic cleanup</label>
       <label>Every
@@ -171,9 +187,10 @@ function DockerCleanup({ docker }: { docker: boolean }) {
       {saved && <span className="state">Saved.</span>}
     </form>}
     {data && (data.runs.length === 0 ? <p className="state">No cleanups yet.</p>
-      : <table><thead><tr><th>Started</th><th>Trigger</th><th>Status</th><th>Older than</th><th>Images freed</th><th>Build cache freed</th><th>Total freed</th></tr></thead><tbody>
+      : <table><thead><tr><th>Started</th>{manyServers && <th>Server</th>}<th>Trigger</th><th>Status</th><th>Older than</th><th>Images freed</th><th>Build cache freed</th><th>Total freed</th></tr></thead><tbody>
         {data.runs.map((r) => <tr key={r.id}>
           <td className="small">{formatTime(r.started_at)}</td>
+          {manyServers && <td className="small">{serverName(r.server_id)}</td>}
           <td className="small">{r.trigger}</td>
           <td><span className={`badge ${r.status}`}>{r.status}</span>{r.error_message && <div className="small danger">{r.error_message}</div>}</td>
           <td className="small">{r.older_than_hours} h</td>

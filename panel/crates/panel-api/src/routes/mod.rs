@@ -65,4 +65,6 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 #[cfg(test)]
+mod admin_tests;
+#[cfg(test)]
 mod rbac_tests;

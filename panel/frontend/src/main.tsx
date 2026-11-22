@@ -106,7 +106,7 @@ function App() {
         {active === 'sites' ? <Sites isAdmin={user.is_admin} />
           : active === 'account' ? <Account user={user} onChanged={me.reload} />
           : active === 'servers' ? <Servers canManage={holdsGlobally(access.data, 'servers:manage')} />
-          : active === 'access' ? <>{user.is_admin && <Users onChanged={() => setUsersVersion((v) => v + 1)} />}<Access key={usersVersion} /></>
+          : active === 'access' ? <>{user.is_admin && <Users currentUserId={user.id} onChanged={() => setUsersVersion((v) => v + 1)} />}<Access key={usersVersion} /></>
           : active === 'keys' ? <ApiKeys me={access.data} />
           : active === 'observability' ? <Observability isAdmin={user.is_admin} docker={docker !== false} />
           : active === 'monitoring' ? <Monitoring docker={docker !== false} />

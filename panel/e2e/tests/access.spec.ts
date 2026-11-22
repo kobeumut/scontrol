@@ -662,3 +662,132 @@ test('the name inputs refuse invalid names in the browser (pattern attribute)', 
   expect(await roleName.evaluate((el: HTMLInputElement) => el.validity.patternMismatch)).toBe(false);
   expect(sent).toEqual([]);
 });
+
+// ------------------------------------------------- Deleting users, renaming servers
+
+test('an admin deletes a user from the Users panel; their session stops working', async ({ page }) => {
+  const failures = watchForFailures(page);
+  const user = await createUser(admin, 'del');
+  const session = await apiAs(user);
+  expect((await session.get('/api/auth/me')).status()).toBe(200);
+
+  await signIn(page);
+  await openTab(page, 'Access');
+  const row = rowByText(page, user.username);
+  await expect(row).toBeVisible();
+  // The signed-in admin cannot delete their own account from the UI.
+  await expect(rowByText(page, ADMIN.username).first().getByRole('button', { name: 'delete' })).toHaveCount(0);
+
+  // Dismissing the confirmation keeps the user.
+  page.once('dialog', (d) => d.dismiss());
+  await row.getByRole('button', { name: 'delete' }).click();
+  await expect(row).toBeVisible();
+
+  page.once('dialog', (d) => d.accept());
+  const deleted = page.waitForResponse((r) => r.request().method() === 'DELETE' && r.url().endsWith(`/api/admin/users/${user.id}`));
+  await row.getByRole('button', { name: 'delete' }).click();
+  expect((await deleted).status()).toBe(200);
+  await expect(rowByText(page, user.username)).toHaveCount(0);
+  // Gone from the role-binding user select too.
+  await expect(page.getByLabel('User').locator('option', { hasText: user.username })).toHaveCount(0);
+
+  expect((await session.get('/api/auth/me')).status()).toBe(401);
+  await session.dispose();
+  const users: { id: string }[] = await (await admin.get('/api/admin/users')).json();
+  expect(users.some((u) => u.id === user.id)).toBe(false);
+  expect(failures).toEqual([]);
+});
+
+test('user deletion refuses self-deletion, unknown users and non-admins', async () => {
+  const me = await (await admin.get('/api/auth/me')).json();
+  const self = await admin.delete(`/api/admin/users/${me.id}`);
+  expect(self.status()).toBe(400);
+  expect(await self.text()).toContain('your own account');
+  expect((await admin.delete('/api/admin/users/00000000-0000-0000-0000-00000000beef')).status()).toBe(404);
+
+  const user = await createUser(admin, 'nodel');
+  const other = await createUser(admin, 'victim');
+  const session = await apiAs(user);
+  expect((await session.delete(`/api/admin/users/${other.id}`)).status()).toBe(403);
+  await session.dispose();
+  expect((await admin.delete(`/api/admin/users/${user.id}`)).status()).toBe(200);
+  expect((await admin.delete(`/api/admin/users/${other.id}`)).status()).toBe(200);
+});
+
+test('renames a server from the Servers tab; the panel host has no rename', async ({ page }) => {
+  const failures = watchForFailures(page);
+  const name = unique('ren');
+  const created = await admin.post('/api/servers', { data: { name, transport: 'ssh_socket', address: `/run/scontrol/remote/${name}.sock` } });
+  expect(created.ok(), await created.text()).toBe(true);
+  const id = (await created.json()).server.id as string;
+  try {
+    await signIn(page);
+    await openTab(page, 'Servers');
+    await expect(page.getByRole('row').filter({ hasText: 'panel host' }).getByRole('button', { name: 'rename' })).toHaveCount(0);
+
+    // An invalid name is refused by the server and the old name stays.
+    page.once('dialog', (d) => d.accept('Bad Name'));
+    await serverRow(page, name).getByRole('button', { name: 'rename' }).click();
+    await expect(page.getByRole('alert')).toContainText('server names are');
+    await expect(serverRow(page, name)).toBeVisible();
+
+    const renamed = `${name}-x`;
+    page.once('dialog', (d) => d.accept(renamed));
+    await serverRow(page, name).getByRole('button', { name: 'rename' }).click();
+    await expect(serverRow(page, renamed)).toBeVisible();
+    await expect(serverRow(page, name)).toHaveCount(0);
+    const servers: { id: string; name: string }[] = await (await admin.get('/api/servers')).json();
+    expect(servers.find((s) => s.id === id)?.name).toBe(renamed);
+    expect(failures).toEqual([]);
+  } finally {
+    await admin.delete(`/api/servers/${id}`);
+  }
+});
+
+test('deleting a user who owns a site and a service removes them too, after typing the username', async ({ page }) => {
+  const failures = watchForFailures(page);
+  const username = unique('own').replace(/-/g, '_');
+  const created = await admin.post('/api/admin/users', { data: { username, email: `${username}@example.test`, password: PASSWORD, is_admin: true } });
+  expect(created.status(), await created.text()).toBe(200);
+  const id = (await created.json()).id as string;
+  const owner = await apiAs({ username, password: PASSWORD });
+  const domain = `${unique('owned')}.example.test`;
+  const site = await owner.post('/api/sites', { data: { domain, owner_username: unique('sys').replace(/-/g, '_'), runtime: { kind: 'static' } } });
+  expect(site.ok(), await site.text()).toBe(true);
+  const slug = unique('owned');
+  const service = await owner.post('/api/compose-projects', {
+    data: { name: slug, slug, source: { kind: 'raw', compose_yaml: 'services:\n  web:\n    image: nginx:alpine\n' }, deploy: false },
+  });
+  expect(service.ok(), await service.text()).toBe(true);
+  await owner.dispose();
+
+  await signIn(page);
+  await openTab(page, 'Access');
+  const row = rowByText(page, username);
+  let deletes = 0;
+  page.on('request', (r) => { if (r.method() === 'DELETE' && r.url().includes(`/api/admin/users/${id}`)) deletes += 1; });
+
+  // A wrong confirmation deletes nothing.
+  const prompts: string[] = [];
+  page.on('dialog', (d) => {
+    if (d.type() === 'confirm') return d.accept();
+    prompts.push(d.message());
+    return d.accept(prompts.length === 1 ? 'wrong' : username);
+  });
+  await row.getByRole('button', { name: 'delete' }).click();
+  await expect(page.getByRole('alert')).toContainText('did not match');
+  expect(prompts[0]).toContain('owns 1 site(s) and 1 service(s)');
+  expect(deletes).toBe(1);
+  await expect(row).toBeVisible();
+
+  await row.getByRole('button', { name: 'delete' }).click();
+  await expect(page.getByRole('status')).toContainText(`Deleted ${username} with 1 site(s) and 1 service(s).`);
+  await expect(rowByText(page, username)).toHaveCount(0);
+  expect(deletes).toBe(3);
+
+  const sites: { domain: string }[] = await (await admin.get('/api/sites')).json();
+  expect(sites.some((s) => s.domain === domain)).toBe(false);
+  const services: { slug: string }[] = await (await admin.get('/api/compose-projects')).json();
+  expect(services.some((s) => s.slug === slug)).toBe(false);
+  expect(failures).toEqual([]);
+});
