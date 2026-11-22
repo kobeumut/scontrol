@@ -87,7 +87,7 @@ function CreateForm({ engines, onDone }: { engines?: EngineInfo[]; onDone: (id?:
     </div>
     <div className="grid2">
       <label>Name<input required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} /></label>
-      <label>Slug<input className="mono" pattern="[a-z][a-z0-9-]{2,47}" placeholder={slugify(name) || 'shop-db'} value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
+      <label>Slug<input className="mono" pattern="[a-z][a-z0-9\-]{2,47}" placeholder={slugify(name) || 'shop-db'} value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
       <label>Version
         <select value={version || info?.default_version || ''} onChange={(e) => setVersion(e.target.value)} disabled={!info}>
           {info?.versions.map((v) => <option key={v} value={v}>{v}</option>)}

@@ -120,7 +120,7 @@ function AddServer({ onDone }: { onDone: (enrolled?: Enrolled) => void }) {
       <button type="button" className={transport === 'ssh_socket' ? 'selected' : ''} onClick={() => setTransport('ssh_socket')}>SSH-forwarded socket</button>
     </div>
     <div className="grid3">
-      <label>Name<input required className="mono" pattern="[a-z0-9][a-z0-9-]*[a-z0-9]" maxLength={40} placeholder="web-2" value={name} onChange={(e) => setName(e.target.value)} /></label>
+      <label>Name<input required className="mono" pattern="[a-z0-9][a-z0-9\-]*[a-z0-9]" maxLength={40} placeholder="web-2" value={name} onChange={(e) => setName(e.target.value)} /></label>
       <label>{transport === 'mtls' ? 'Address (host:port)' : 'Forwarded socket'}
         <input required className="mono" placeholder={transport === 'mtls' ? 'web-2.example.com:7843' : `/run/scontrol/remote/${name || '<name>'}.sock`}
           value={address} onChange={(e) => setAddress(e.target.value)} /></label>

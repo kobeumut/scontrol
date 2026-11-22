@@ -146,7 +146,12 @@ async fn logout(State(state): State<AppState>, jar: CookieJar) -> ApiResult<Cook
             users::delete_session(&state.db, &hash).await.ok();
         }
     }
-    Ok(jar.remove(Cookie::from(session::SESSION_COOKIE_NAME)))
+    // The removal must name the cookie's path, or the browser keeps it.
+    Ok(jar.remove(
+        Cookie::build(session::SESSION_COOKIE_NAME)
+            .path("/")
+            .build(),
+    ))
 }
 
 async fn me(AuthUser(user): AuthUser) -> Json<UserResponse> {
@@ -163,6 +168,13 @@ async fn totp_enroll(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
 ) -> ApiResult<Json<TotpEnrollResponse>> {
+    // Enrolling again would replace the active secret before the new one is
+    // proven, so a password-only session could take over the second factor.
+    if user.totp_enabled {
+        return Err(ApiError::Conflict(
+            "two-factor authentication is already enabled; ask an admin to reset it first".into(),
+        ));
+    }
     let enrollment = totp::generate_enrollment(&user.username).map_err(ApiError::Internal)?;
     users::set_totp_secret(&state.db, user.id, &enrollment.secret_base32).await?;
     Ok(Json(TotpEnrollResponse {

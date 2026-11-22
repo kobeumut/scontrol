@@ -101,7 +101,9 @@ function RegistryForm({ registry, onDone }: { registry?: Registry; onDone: () =>
       <label>Server<input required className="mono" placeholder="ghcr.io" value={server} onChange={(e) => setServer(e.target.value)} /></label>
       <label>Username<input required className="mono" autoComplete="off" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
       <label>Password or token<input type="password" autoComplete="new-password" value={password}
-        required={!registry} placeholder={registry ? 'stored; leave empty to keep' : ''}
+        required={!registry}
+        placeholder={!registry ? '' : server.trim() !== registry.server_url || username.trim() !== registry.username
+          ? 'enter it again: the server or username changed' : 'stored; leave empty to keep'}
         onChange={(e) => setPassword(e.target.value)} /></label>
     </div>
     <p className="hint">Docker Hub: an access token. GitHub: a classic token with <span className="mono">read:packages</span>. GitLab: a deploy or access token. ECR: the output of <span className="mono">aws ecr get-login-password</span> (expires after 12 hours).</p>

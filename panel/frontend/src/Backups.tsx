@@ -106,6 +106,9 @@ function DestinationForm({ destination, onDone }: { destination?: Destination; o
   const [result, setResult] = useState<TestResult>();
   const [busy, setBusy] = useState(false);
 
+  // Stored keys are never sent to another endpoint or bucket.
+  const keysHint = !destination ? '' : endpoint.trim() !== destination.endpoint || bucket.trim() !== destination.bucket
+    ? 'enter it again: the endpoint or bucket changed' : 'stored; leave empty to keep';
   const body = () => ({
     name: name.trim(), endpoint: endpoint.trim(), region: region.trim(), bucket: bucket.trim(),
     prefix: prefix.trim(), retention_count: Number(retention),
@@ -140,9 +143,9 @@ function DestinationForm({ destination, onDone }: { destination?: Destination; o
       <label>Key prefix<input required className="mono" value={prefix} onChange={(e) => setPrefix(e.target.value)} /></label>
       <label>Backups to keep (0 = all)<input type="number" min={0} max={1000} required value={retention} onChange={(e) => setRetention(e.target.value)} /></label>
       <label>Access key ID<input className="mono" autoComplete="off" required={!destination} value={accessKey}
-        placeholder={destination ? 'stored; leave empty to keep' : ''} onChange={(e) => setAccessKey(e.target.value)} /></label>
+        placeholder={keysHint} onChange={(e) => setAccessKey(e.target.value)} /></label>
       <label>Secret access key<input type="password" autoComplete="new-password" required={!destination} value={secretKey}
-        placeholder={destination ? 'stored; leave empty to keep' : ''} onChange={(e) => setSecretKey(e.target.value)} /></label>
+        placeholder={keysHint} onChange={(e) => setSecretKey(e.target.value)} /></label>
     </div>
     {error && <p className="state error" role="alert">{error}</p>}
     {result && <p className={result.ok ? 'state' : 'state error'} role="status">{result.ok ? 'Bucket reachable.' : `Check failed: ${result.message}`}</p>}
@@ -160,13 +163,19 @@ function DestinationDetail({ destination, docker }: { destination: Destination; 
   const [restoring, setRestoring] = useState<BackupObject>();
   const running = runs.data?.some((r) => r.status === 'running');
 
-  // Poll while a run is in flight; refresh the object list when it ends.
+  // Poll while a run is in flight.
   useEffect(() => {
     if (!running) return undefined;
     const timer = window.setInterval(() => runs.reload(), 3000);
-    return () => { window.clearInterval(timer); objects.reload(); };
+    return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running]);
+  // Refresh the object list whenever a run has finished. Counting finished
+  // runs (not watching `running`) also catches a run that ended before the
+  // first poll ever saw it running.
+  const finished = runs.data?.filter((r) => r.status !== 'running').map((r) => r.id).join(',');
+  const reloadObjects = objects.reload;
+  useEffect(() => { if (finished) reloadObjects(); }, [finished, reloadObjects]);
 
   return <section className="panel">
     <div className="panel-title"><h2>{destination.name}: backups</h2></div>

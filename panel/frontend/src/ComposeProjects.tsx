@@ -40,7 +40,7 @@ const toPairs = (rows: EnvRow[]) => rows.filter((r) => r.key.trim()).map((r) => 
 /** Builders the agent reports as installed; `undefined` while unknown. */
 export function ComposeProjects({ buildTools }: { buildTools?: BuildTool[] }) {
   const [openId, setOpenId] = useState<string | null>(null);
-  if (openId) return <ProjectDetail id={openId} onBack={() => setOpenId(null)} />;
+  if (openId) return <ProjectDetail key={openId} id={openId} onBack={() => setOpenId(null)} onOpen={setOpenId} />;
   return <ProjectList onOpen={setOpenId} buildTools={buildTools} />;
 }
 
@@ -161,7 +161,7 @@ function CreateProjectForm({ projects, buildTools, onCreated }: { projects?: Pro
         setName(e.target.value);
         setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48));
       }} /></label>
-      <label>Slug<input required className="mono" pattern="[a-z][a-z0-9-]{2,47}" value={slug}
+      <label>Slug<input required className="mono" pattern="[a-z][a-z0-9\-]{2,47}" value={slug}
         onChange={(e) => setSlug(e.target.value)} /></label>
     </div>
     <label>Project / environment<select value={environmentId} onChange={(e) => setEnvironmentId(e.target.value)}>
@@ -368,7 +368,7 @@ function SourceSummary({ source }: { source: ComposeSource }) {
     {' · '}{limits}</>;
 }
 
-function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
+function ProjectDetail({ id, onBack, onOpen }: { id: string; onBack: () => void; onOpen: (id: string) => void }) {
   const project = useApi<ComposeProject>(`/compose-projects/${id}`, 3000);
   const deployments = useApi<Deployment[]>(`/compose-projects/${id}/deployments`, 3000);
   const [selected, setSelected] = useState<string | null>(null);
@@ -418,16 +418,16 @@ function ProjectDetail({ id, onBack }: { id: string; onBack: () => void }) {
       {shown && <DeploymentLog key={shown.id} projectId={id} deployment={shown} />}
 
       <Services projectId={id} refreshKey={latest?.status} />
-      {!isStatic && <ContainerLogs projectId={id} />}
+      {!isStatic && <ContainerLogs projectId={id} refreshKey={latest?.status} />}
       <Domains projectId={id} isStatic={isStatic} onDeploy={(d) => { setSelected(d.id); deployments.reload(); }} />
       {!isStatic && <ScheduledJobs projectId={id} />}
-      {!isStatic && <ProjectTerminal projectId={id} />}
+      {!isStatic && <ProjectTerminal projectId={id} refreshKey={latest?.status} />}
       <LayeredVariables path={`/compose-projects/${id}/variables`} layer="service" title="Variables"
         hint="Write-only. Merged at each deployment: project → environment → this service, the most specific value wins. Stored values are never shown again." />
       <RegistryPanel projectId={id} />
       {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
       {gitCheckout(project.data.source) && <Webhook projectId={id} />}
-      {gitCheckout(project.data.source) && <Previews projectId={id} />}
+      {gitCheckout(project.data.source) && <Previews projectId={id} onOpenProject={onOpen} />}
     </>}
   </section>;
 }
@@ -538,8 +538,12 @@ const MAX_LIVE_LINES = 2000;
  * agent, after secrets are masked. A dropped connection is not retried
  * automatically, because a reconnect would replay the tail as duplicates.
  */
-function ContainerLogs({ projectId }: { projectId: string }) {
-  const services = useApi<ServiceInfo[]>(`/compose-projects/${projectId}/services`);
+function ContainerLogs({ projectId, refreshKey }: { projectId: string; refreshKey?: string }) {
+  // Reloaded like the Services table, so the services of a deployment that
+  // just finished can be picked.
+  const services = useApi<ServiceInfo[]>(`/compose-projects/${projectId}/services`, 10000);
+  const reloadServices = services.reload;
+  useEffect(reloadServices, [refreshKey, reloadServices]);
   const [service, setService] = useState('');
   const [search, setSearch] = useState('');
   const [timestamps, setTimestamps] = useState(false);
@@ -810,8 +814,10 @@ function Webhook({ projectId }: { projectId: string }) {
 }
 
 /** Terminal for the project's services (admin-only endpoint). */
-function ProjectTerminal({ projectId }: { projectId: string }) {
+function ProjectTerminal({ projectId, refreshKey }: { projectId: string; refreshKey?: string }) {
   const services = useApi<ServiceInfo[]>(`/compose-projects/${projectId}/services`);
+  const { reload } = services;
+  useEffect(reload, [refreshKey, reload]);
   const names = Array.from(new Set((services.data ?? []).map((s) => s.name)));
   return names.length === 0 ? null : <Terminal projectId={projectId} services={names} />;
 }

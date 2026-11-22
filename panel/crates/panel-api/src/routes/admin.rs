@@ -59,8 +59,14 @@ async fn create_user(
     }
     let hash = password::hash_password(&body.password)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
-    let user =
-        users::create_user(&state.db, &body.username, &body.email, &hash, body.is_admin).await?;
+    let user = users::create_user(&state.db, &body.username, &body.email, &hash, body.is_admin)
+        .await
+        .map_err(|error| match error.as_database_error() {
+            Some(db) if db.is_unique_violation() => {
+                ApiError::Conflict("a user with that username or email already exists".into())
+            }
+            _ => error.into(),
+        })?;
     Ok(Json(user.to_public()))
 }
 

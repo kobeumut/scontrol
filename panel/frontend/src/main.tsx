@@ -1,7 +1,8 @@
 import { FormEvent, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Access } from './Access';
-import { AccessMe, api, ApiError, Capability, holdsGlobally, Site, useApi, User } from './api';
+import { Account } from './Account';
+import { AccessMe, api, ApiError, Capability, holdsGlobally, useApi, User } from './api';
 import { ApiKeys } from './ApiKeys';
 import { ComposeProjects } from './ComposeProjects';
 import { Databases } from './Databases';
@@ -14,6 +15,8 @@ import { Observability } from './Observability';
 import { Registries } from './Registries';
 import { Templates } from './Templates';
 import { Servers } from './Servers';
+import { Sites } from './Sites';
+import { Users } from './Users';
 import './styles.css';
 
 function Login({ onSignedIn }: { onSignedIn: () => void }) {
@@ -46,23 +49,15 @@ function Login({ onSignedIn }: { onSignedIn: () => void }) {
   </form>;
 }
 
-function Sites() {
-  const sites = useApi<Site[]>('/sites');
-  return <section className="panel">
-    <div className="panel-title"><h2>Hosted sites</h2><button className="action" disabled>New site</button></div>
-    {sites.loading && <p className="state">Loading…</p>}
-    {sites.error && <p className="state error">{sites.error}</p>}
-    {sites.data && <table><thead><tr><th>Domain</th><th>Runtime</th><th>Status</th><th>TLS</th></tr></thead><tbody>
-      {sites.data.length === 0 ? <tr><td colSpan={4} className="empty">No sites provisioned.</td></tr> : sites.data.map((site) => <tr key={site.id}><td>{site.domain}</td><td>{site.runtime.kind}</td><td><span className={`badge ${site.status}`}>{site.status}</span></td><td>{site.ssl_enabled ? 'enabled' : '—'}</td></tr>)}
-    </tbody></table>}
-  </section>;
-}
-
 function App() {
   const health = useApi<{ status: string; capabilities?: Capability }>('/health/agent', 30000);
   const me = useApi<User>('/auth/me');
-  const access = useApi<AccessMe>(me.data ? '/access/me' : null);
-  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'templates' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications' | 'observability' | 'monitoring' | 'servers' | 'access' | 'keys'>('projects');
+  // `useApi` keeps the last data when a reload fails, so after signing out
+  // (or an expired session) the error is what says nobody is signed in.
+  const user = me.error ? undefined : me.data;
+  const access = useApi<AccessMe>(user ? '/access/me' : null);
+  const [active, setActive] = useState<'sites' | 'groups' | 'projects' | 'templates' | 'databases' | 'registries' | 'backups' | 'github' | 'notifications' | 'observability' | 'monitoring' | 'servers' | 'access' | 'keys' | 'account'>('projects');
+  const [usersVersion, setUsersVersion] = useState(0);
   const canSeeServers = holdsGlobally(access.data, 'servers:read');
   const canManageAccess = holdsGlobally(access.data, 'access:manage');
   const docker = health.data?.capabilities?.docker;
@@ -77,7 +72,7 @@ function App() {
       <div><span className="mark">S/</span><span className="product">scontrol</span></div>
       <div className="system-state">
         <i className={health.data?.status === 'ok' ? 'lamp up' : 'lamp'} /> agent {health.data?.status ?? 'checking'}
-        {me.data && <> · {me.data.username} <button className="link" onClick={signOut}>sign out</button></>}
+        {user && <> · {user.username} <button className="link" onClick={signOut}>sign out</button></>}
       </div>
     </header>
 
@@ -89,7 +84,7 @@ function App() {
     </section>
 
     {me.loading ? <p className="state">Checking session…</p>
-      : !me.data ? <Login onSignedIn={me.reload} />
+      : !user ? <Login onSignedIn={me.reload} />
       : <>
         <nav className="tabs" aria-label="Primary content">
           <button className={active === 'groups' ? 'selected' : ''} onClick={() => setActive('groups')}>Projects &amp; environments</button>
@@ -106,12 +101,14 @@ function App() {
           {canSeeServers && <button className={active === 'servers' ? 'selected' : ''} onClick={() => setActive('servers')}>Servers</button>}
           {canManageAccess && <button className={active === 'access' ? 'selected' : ''} onClick={() => setActive('access')}>Access</button>}
           <button className={active === 'keys' ? 'selected' : ''} onClick={() => setActive('keys')}>API keys</button>
+          <button className={active === 'account' ? 'selected' : ''} onClick={() => setActive('account')}>Account</button>
         </nav>
-        {active === 'sites' ? <Sites />
+        {active === 'sites' ? <Sites isAdmin={user.is_admin} />
+          : active === 'account' ? <Account user={user} onChanged={me.reload} />
           : active === 'servers' ? <Servers canManage={holdsGlobally(access.data, 'servers:manage')} />
-          : active === 'access' ? <Access />
+          : active === 'access' ? <>{user.is_admin && <Users onChanged={() => setUsersVersion((v) => v + 1)} />}<Access key={usersVersion} /></>
           : active === 'keys' ? <ApiKeys me={access.data} />
-          : active === 'observability' ? <Observability isAdmin={me.data.is_admin} docker={docker !== false} />
+          : active === 'observability' ? <Observability isAdmin={user.is_admin} docker={docker !== false} />
           : active === 'monitoring' ? <Monitoring docker={docker !== false} />
           : active === 'notifications' ? <Notifications />
             : active === 'github' ? <GitHubApps />

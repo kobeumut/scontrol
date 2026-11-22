@@ -34,3 +34,9 @@ base64 = { workspace = true }
 [features]
 default = []
 test-utils = []
+# Serves the agent protocol from MockAdapter for the end-to-end tests in
+# `panel/e2e`. Not part of a normal build or an installation.
+[[bin]]
+name = "scontrol-mock-agent"
+path = "src/bin/scontrol-mock-agent.rs"
+required-features = ["test-utils"]

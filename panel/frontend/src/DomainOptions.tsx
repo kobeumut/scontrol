@@ -25,8 +25,11 @@ export function DomainOptions({ projectId, domain, onSaved }: {
     event.preventDefault();
     action.run(async () => {
       let basic_auth: SecretChange<{ username: string; password: string }[]> = { action: 'keep' };
-      if (authMode === 'remove') basic_auth = { action: 'remove' };
-      if (authMode === 'set') {
+      // A redirect cannot have a prefix or basic auth, and their controls are
+      // hidden while it is on: turning it on clears both.
+      if (redirectOn) { if (current.basic_auth) basic_auth = { action: 'remove' }; }
+      else if (authMode === 'remove') basic_auth = { action: 'remove' };
+      else if (authMode === 'set') {
         // One `user:password` per line; the password never leaves the request.
         const parsed = users.split('\n').map((l) => l.trim()).filter(Boolean).map((line) => {
           const at = line.indexOf(':');
@@ -40,8 +43,8 @@ export function DomainOptions({ projectId, domain, onSaved }: {
           : certMode === 'remove' ? { action: 'remove' } : { action: 'keep' };
       const options: VhostOptions = {
         redirect: redirectOn ? { status, target: target.trim(), preserve_path: preserve } : null,
-        path_prefix: prefix.trim() || null,
-        basic_auth: authMode === 'set' || (authMode === 'keep' && current.basic_auth),
+        path_prefix: redirectOn ? null : prefix.trim() || null,
+        basic_auth: !redirectOn && (authMode === 'set' || (authMode === 'keep' && current.basic_auth)),
         custom_cert: certMode === 'set' || (certMode === 'keep' && current.custom_cert),
       };
       const result = await api<{ deployment?: Deployment }>(
@@ -63,6 +66,7 @@ export function DomainOptions({ projectId, domain, onSaved }: {
       <input required aria-label="Redirect target" className="mono" placeholder="https://example.com" value={target} onChange={(e) => setTarget(e.target.value)} />
       <label className="check"><input type="checkbox" checked={preserve} onChange={(e) => setPreserve(e.target.checked)} /> keep path</label>
     </div>}
+    {redirectOn && (current.basic_auth || current.path_prefix) && <p className="hint">Saving the redirect removes this domain's {[current.path_prefix && 'path prefix', current.basic_auth && 'basic auth'].filter(Boolean).join(' and ')}.</p>}
     {!redirectOn && <label>Path prefix <span className="muted small">(empty serves at /)</span>
       <input className="mono" placeholder="/app/" value={prefix} onChange={(e) => setPrefix(e.target.value)} /></label>}
     {!redirectOn && <>
