@@ -1,6 +1,6 @@
 //! Web terminal (`GET /api/compose-projects/:id/terminal`, WebSocket).
 //!
-//! Only admins may connect. The session is an interactive
+//! Only principals with scoped `services:terminal` may connect. The session is an interactive
 //! `docker exec -it <service container> <sh|bash|ash>` run by the agent on a
 //! pseudoterminal. A host shell can not be requested: the request names a
 //! project service and one of three shell names, nothing else. Opening and
@@ -11,7 +11,7 @@
 //! text frames are JSON control messages. In: `{"type":"resize","cols":N,
 //! "rows":N}`. Out: `{"type":"exit","code":N}` once the shell ended.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, ServiceAccess};
 use crate::db;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -25,7 +25,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use panel_core::adapters::{
-    OpenTerminalParams, TerminalCloseParams, TerminalReadParams, TerminalResizeParams,
+    AdapterPort, OpenTerminalParams, TerminalCloseParams, TerminalReadParams, TerminalResizeParams,
     TerminalShell, TerminalWriteParams,
 };
 use panel_core::types::{validate, ComposeSource};
@@ -78,7 +78,7 @@ enum Control {
 }
 
 async fn connect(
-    AdminUser(user): AdminUser,
+    access: ServiceAccess<perm::ServicesTerminal>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<TerminalQuery>,
@@ -102,9 +102,11 @@ async fn connect(
             "this project type has no container terminal".into(),
         ));
     }
+    let user = access.principal;
+    // Resolve once, before the upgrade; pin every operation to this same host.
+    let agent = state.agents.for_service(&state.db, id).await?;
     // Opened before the upgrade, so a missing container is a plain HTTP error.
-    let session = state
-        .agent
+    let session = agent
         .open_terminal(OpenTerminalParams {
             project_slug: project.slug.clone(),
             service_name: query.service.clone(),
@@ -117,7 +119,7 @@ async fn connect(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "terminal_open",
         Some(&project.slug),
         serde_json::json!({
@@ -136,22 +138,21 @@ async fn connect(
         let bytes_in = Arc::new(AtomicU64::new(0));
         let bytes_out = Arc::new(AtomicU64::new(0));
         pump(
-            &state,
+            agent.clone(),
             socket,
             session_id,
             bytes_in.clone(),
             bytes_out.clone(),
         )
         .await;
-        state
-            .agent
+        agent
             .close_terminal(TerminalCloseParams { session_id })
             .await
             .ok();
         db::audit::record(
             &state.db,
             Some(user.id),
-            "user",
+            user.actor_kind(),
             "terminal_close",
             Some(&slug),
             serde_json::json!({
@@ -167,17 +168,17 @@ async fn connect(
 }
 
 async fn pump(
-    state: &AppState,
+    agent: Arc<dyn AdapterPort>,
     socket: WebSocket,
     session_id: Uuid,
     bytes_in: Arc<AtomicU64>,
     bytes_out: Arc<AtomicU64>,
 ) {
     let (mut tx, mut rx) = socket.split();
-    let agent = state.agent.clone();
+    let output_agent = agent.clone();
     let output = async {
         loop {
-            let read = agent
+            let read = output_agent
                 .read_terminal(TerminalReadParams {
                     session_id,
                     wait_ms: 20_000,
@@ -201,7 +202,6 @@ async fn pump(
             }
         }
     };
-    let agent = state.agent.clone();
     let input = async {
         while let Some(Ok(message)) = rx.next().await {
             match message {

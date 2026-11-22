@@ -251,6 +251,7 @@ pub mod perm {
         ServicesUpdate,
         ServicesDelete,
         ServicesDeploy,
+        ServicesTerminal,
         VariablesRead,
         VariablesUpdate,
         ServersRead,

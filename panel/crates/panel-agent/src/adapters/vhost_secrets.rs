@@ -8,7 +8,8 @@
 //! is 0600 and owned by the worker user (hashes only, never the key).
 //! Passwords are hashed here with SHA-512 crypt; the plain text is never
 //! written or logged. An uploaded pair is parsed and matched with `openssl`
-//! in a staging area first; the active pair is swapped only when it is valid.
+//! in a new immutable generation. Vhosts reference a generation directly, so
+//! neither a failed reload nor a concurrent upload can overwrite an active pair.
 
 use crate::config::AgentConfig;
 use panel_core::adapters::WriteVhostSecretsParams;
@@ -28,6 +29,15 @@ pub fn secrets_dir(cfg: &AgentConfig, domain: &str) -> PathBuf {
 /// uid/gid of the Nginx worker (`user` directive of the main config,
 /// default `www-data`), or `None` when it cannot be resolved.
 fn nginx_worker_ids(cfg: &AgentConfig) -> Option<(u32, u32)> {
+    // A non-root Nginx master ignores `user`: its workers retain the master uid.
+    // Rootless fixtures use that same model. Never relax the file's 0600 mode.
+    if rustix::process::geteuid().as_raw() != 0 {
+        return None;
+    }
+    configured_worker_ids(cfg)
+}
+
+fn configured_worker_ids(cfg: &AgentConfig) -> Option<(u32, u32)> {
     let conf = std::fs::read_to_string(&cfg.nginx_main_conf).unwrap_or_default();
     let mut user = "www-data".to_string();
     let mut group: Option<String> = None;
@@ -111,6 +121,11 @@ async fn write_private(path: &Path, content: &[u8], owner: Option<(u32, u32)>) -
         .map_err(|e| CoreError::Io(format!("installing {}: {e}", path.display())))
 }
 
+pub fn revision_dir(cfg: &AgentConfig, domain: &str, revision: Option<uuid::Uuid>) -> PathBuf {
+    let dir = secrets_dir(cfg, domain);
+    revision.map_or_else(|| dir.clone(), |id| dir.join(id.to_string()))
+}
+
 async fn remove_if_present(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
 }
@@ -133,41 +148,82 @@ pub async fn write_vhost_secrets(
     if let SecretChange::Set(cert) = &params.certificate {
         validate_certificate(cert).map_err(CoreError::Validation)?;
     }
-    let dir = secrets_dir(cfg, &params.domain);
-    let wants_files = htpasswd.is_some() || matches!(params.certificate, SecretChange::Set(_));
-    if wants_files {
-        tokio::fs::create_dir_all(&dir)
+    let parent = secrets_dir(cfg, &params.domain);
+    let dir = revision_dir(cfg, &params.domain, Some(params.revision));
+    {
+        tokio::fs::create_dir_all(&parent)
             .await
             .map_err(|e| CoreError::Io(format!("creating {}: {e}", dir.display())))?;
-        for path in [cfg.nginx_vhost_secrets_dir.clone(), dir.clone()] {
+        for path in [cfg.nginx_vhost_secrets_dir.clone(), parent.clone()] {
             tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o711))
                 .await
                 .map_err(|e| CoreError::Io(format!("securing {}: {e}", path.display())))?;
         }
     }
-    // Validate and stage the certificate pair before anything is replaced:
-    // a bad upload must leave the active (possibly referenced) pair alone.
-    if let SecretChange::Set(cert) = &params.certificate {
-        stage_certificate(&dir, cert).await?;
-    }
-    if let Some(content) = htpasswd {
-        let owner = nginx_worker_ids(cfg);
-        if let Err(error) = write_private(&dir.join("htpasswd"), content.as_bytes(), owner).await {
-            discard_staged_certificate(&dir).await;
-            return Err(error);
+    tokio::fs::create_dir(&dir)
+        .await
+        .map_err(|e| CoreError::Io(format!("creating secret generation: {e}")))?;
+    tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))
+        .await
+        .map_err(|e| CoreError::Io(format!("securing secret generation: {e}")))?;
+    let result = async {
+        // Copy kept values only; active generations and legacy files are never modified.
+        let previous = revision_dir(cfg, &params.domain, params.previous_revision);
+        for (name, keep) in [
+            ("htpasswd", matches!(params.basic_auth, SecretChange::Keep)),
+            ("cert.pem", matches!(params.certificate, SecretChange::Keep)),
+            ("key.pem", matches!(params.certificate, SecretChange::Keep)),
+        ] {
+            if keep {
+                match tokio::fs::read(previous.join(name)).await {
+                    Ok(content) => {
+                        write_private(
+                            &dir.join(name),
+                            &content,
+                            if name == "htpasswd" {
+                                nginx_worker_ids(cfg)
+                            } else {
+                                None
+                            },
+                        )
+                        .await?
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(CoreError::Io(format!("reading previous secret: {e}"))),
+                }
+            }
         }
-    } else if matches!(params.basic_auth, SecretChange::Remove) {
-        remove_if_present(&dir.join("htpasswd")).await;
-    }
-    match &params.certificate {
-        SecretChange::Set(_) => install_staged_certificate(&dir).await?,
-        SecretChange::Remove => {
-            remove_if_present(&dir.join("cert.pem")).await;
-            remove_if_present(&dir.join("key.pem")).await;
+        // Validate and stage the certificate pair before anything is replaced:
+        // a bad upload must leave the active (possibly referenced) pair alone.
+        if let SecretChange::Set(cert) = &params.certificate {
+            stage_certificate(&dir, cert).await?;
         }
-        SecretChange::Keep => {}
+        if let Some(content) = htpasswd {
+            let owner = nginx_worker_ids(cfg);
+            if let Err(error) =
+                write_private(&dir.join("htpasswd"), content.as_bytes(), owner).await
+            {
+                discard_staged_certificate(&dir).await;
+                return Err(error);
+            }
+        } else if matches!(params.basic_auth, SecretChange::Remove) {
+            remove_if_present(&dir.join("htpasswd")).await;
+        }
+        match &params.certificate {
+            SecretChange::Set(_) => install_staged_certificate(&dir).await?,
+            SecretChange::Remove => {
+                remove_if_present(&dir.join("cert.pem")).await;
+                remove_if_present(&dir.join("key.pem")).await;
+            }
+            SecretChange::Keep => {}
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+    result
 }
 
 async fn run_openssl(args: &[&str]) -> CoreResult<String> {
@@ -239,8 +295,9 @@ async fn install_staged_certificate(dir: &Path) -> CoreResult<()> {
     Ok(())
 }
 
-/// Deletes all vhost secrets of a domain (its binding was removed).
-pub async fn remove_domain_secrets(cfg: &AgentConfig, domain: &str) {
+/// Test cleanup only: runtime generations require reference-aware collection.
+#[cfg(test)]
+async fn remove_domain_secrets(cfg: &AgentConfig, domain: &str) {
     if validate::is_valid_domain(domain) {
         let _ = tokio::fs::remove_dir_all(secrets_dir(cfg, domain)).await;
     }
@@ -311,6 +368,8 @@ mod tests {
         WriteVhostSecretsParams {
             project_slug: "shop".into(),
             domain: "shop.example.com".into(),
+            revision: uuid::Uuid::new_v4(),
+            previous_revision: None,
             basic_auth,
             certificate,
         }
@@ -354,9 +413,9 @@ mod tests {
             group_file: tmp.join("group"),
             ..AgentConfig::default()
         };
-        assert_eq!(nginx_worker_ids(&config), Some((33, 77)));
+        assert_eq!(configured_worker_ids(&config), Some((33, 77)));
         std::fs::write(tmp.join("nginx.conf"), "events {}\n").unwrap();
-        assert_eq!(nginx_worker_ids(&config), None); // www-data absent
+        assert_eq!(configured_worker_ids(&config), None); // www-data absent
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -369,16 +428,13 @@ mod tests {
             eprintln!("openssl not installed; skipping");
             return;
         };
-        write_vhost_secrets(
-            &config,
-            params(
-                SecretChange::Set(vec![user("alice", "longenough")]),
-                SecretChange::Set(cert),
-            ),
-        )
-        .await
-        .unwrap();
-        let dir = secrets_dir(&config, "shop.example.com");
+        let first = params(
+            SecretChange::Set(vec![user("alice", "longenough")]),
+            SecretChange::Set(cert),
+        );
+        let revision = first.revision;
+        write_vhost_secrets(&config, first).await.unwrap();
+        let dir = revision_dir(&config, "shop.example.com", Some(revision));
         for name in ["htpasswd", "cert.pem", "key.pem"] {
             let mode = std::fs::metadata(dir.join(name))
                 .unwrap()
@@ -396,11 +452,16 @@ mod tests {
             .unwrap()
             .starts_with("alice:$6$"));
 
-        write_vhost_secrets(&config, params(SecretChange::Keep, SecretChange::Remove))
-            .await
-            .unwrap();
-        assert!(dir.join("htpasswd").exists());
-        assert!(!dir.join("key.pem").exists() && !dir.join("cert.pem").exists());
+        let mut removal = params(SecretChange::Keep, SecretChange::Remove);
+        removal.previous_revision = Some(revision);
+        let removed_dir = revision_dir(&config, "shop.example.com", Some(removal.revision));
+        write_vhost_secrets(&config, removal).await.unwrap();
+        assert!(removed_dir.join("htpasswd").exists());
+        assert!(!removed_dir.join("key.pem").exists() && !removed_dir.join("cert.pem").exists());
+        assert!(
+            dir.join("key.pem").exists(),
+            "active generation must remain intact"
+        );
 
         let bad = write_vhost_secrets(
             &config,
@@ -417,25 +478,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generations_are_immutable_under_concurrent_uploads_and_rename_failures() {
+        let tmp = std::env::temp_dir().join(format!("gene82-secrets-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = cfg(&tmp);
+        let pair = make_pair(&tmp, "active", "30")
+            .await
+            .expect("openssl is required for this regression");
+        let first = params(SecretChange::Keep, SecretChange::Set(pair.clone()));
+        let active = first.revision;
+        write_vhost_secrets(&cfg, first).await.unwrap();
+        let mut a = params(SecretChange::Keep, SecretChange::Keep);
+        a.previous_revision = Some(active);
+        let mut b = a.clone();
+        b.revision = uuid::Uuid::new_v4();
+        let (ra, rb) = tokio::join!(
+            write_vhost_secrets(&cfg, a.clone()),
+            write_vhost_secrets(&cfg, b.clone())
+        );
+        ra.unwrap();
+        rb.unwrap();
+        assert!(
+            write_vhost_secrets(&cfg, a.clone()).await.is_err(),
+            "an existing UUID is never overwritten"
+        );
+        for revision in [active, a.revision, b.revision] {
+            let dir = revision_dir(&cfg, "shop.example.com", Some(revision));
+            assert_eq!(
+                std::fs::read_to_string(dir.join("key.pem")).unwrap(),
+                pair.private_key_pem
+            );
+            assert_eq!(
+                std::fs::metadata(dir.join("key.pem"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        // Actual first/second rename failures in a disposable staging generation.
+        for blocked in ["cert.pem", "key.pem"] {
+            let dir = tmp.join(blocked);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cert.pem.new"), "new cert").unwrap();
+            std::fs::write(dir.join("key.pem.new"), "new key").unwrap();
+            std::fs::create_dir(dir.join(blocked)).unwrap();
+            assert!(install_staged_certificate(&dir).await.is_err());
+            let original = revision_dir(&cfg, "shop.example.com", Some(active));
+            assert_eq!(
+                std::fs::read_to_string(original.join("cert.pem")).unwrap(),
+                pair.certificate_pem
+            );
+            assert_eq!(
+                std::fs::read_to_string(original.join("key.pem")).unwrap(),
+                pair.private_key_pem
+            );
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_bad_replacement_leaves_the_active_pair_untouched() {
         let tmp = std::env::temp_dir().join(format!("scontrol-vhost-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let config = cfg(&tmp);
-        let (Some(good), Some(other), Some(expired)) = (
-            make_pair(&tmp, "good", "30").await,
-            make_pair(&tmp, "other", "30").await,
-            make_pair(&tmp, "old", "-1").await,
-        ) else {
-            eprintln!("openssl not installed; skipping");
-            return;
+        let good = make_pair(&tmp, "good", "30")
+            .await
+            .expect("openssl must generate the valid fixture");
+        let other = make_pair(&tmp, "other", "30")
+            .await
+            .expect("openssl must generate the mismatched fixture");
+        // Public TEST ONLY key: fixed 2000–2001 dates work with OpenSSL and
+        // LibreSSL, whose req/x509 reject negative -days on some versions.
+        let expired = CustomCertificate {
+            certificate_pem: include_str!("../../tests/fixtures/expired-cert.pem").into(),
+            private_key_pem: include_str!("../../tests/fixtures/expired-key.pem").into(),
         };
-        write_vhost_secrets(
-            &config,
-            params(SecretChange::Keep, SecretChange::Set(good.clone())),
-        )
-        .await
-        .unwrap();
-        let dir = secrets_dir(&config, "shop.example.com");
+        let first = params(SecretChange::Keep, SecretChange::Set(good.clone()));
+        let revision = first.revision;
+        write_vhost_secrets(&config, first).await.unwrap();
+        let dir = revision_dir(&config, "shop.example.com", Some(revision));
         let mismatched = CustomCertificate {
             certificate_pem: good.certificate_pem.clone(),
             private_key_pem: other.private_key_pem.clone(),
@@ -461,15 +584,17 @@ mod tests {
             assert!(!dir.join("cert.pem.new").exists() && !dir.join("key.pem.new").exists());
         }
         // A valid replacement does go in.
-        write_vhost_secrets(
-            &config,
-            params(SecretChange::Keep, SecretChange::Set(other.clone())),
-        )
-        .await
-        .unwrap();
+        let mut replacement = params(SecretChange::Keep, SecretChange::Set(other.clone()));
+        replacement.previous_revision = Some(revision);
+        let next = revision_dir(&config, "shop.example.com", Some(replacement.revision));
+        write_vhost_secrets(&config, replacement).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(next.join("cert.pem")).unwrap(),
+            other.certificate_pem
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("cert.pem")).unwrap(),
-            other.certificate_pem
+            good.certificate_pem
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

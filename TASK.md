@@ -8,7 +8,17 @@ The Dokploy parity roadmap, research basis, and performance budgets are in `PLAN
 
 - [x] Merge GENE-78 / PR #13 as the remote-agent/RBAC foundation.
 - [x] Integrate PR #12, then PR #11, preserving both features when resolving conflicts; combine named wildcard certificates with advanced vhost options and cover their rendering in a regression check.
-- [ ] GENE-82: fix cross-feature remote routing/RBAC, unprivileged chown, macOS terminal compilation, YAML merge-key isolation, and full TLS-file rollback; validate combined migrations and Ubuntu/remote-host flows. Stage 4 merge acceptance is not production-readiness approval.
+- [-] GENE-82: implementation delivered on a dedicated branch; awaiting human review, no automatic merge/deployment. Stage 4 merge acceptance is not production-readiness approval.
+  - [x] Route domain secrets and every preview lifecycle operation through the owning server; inherit parent placement. Remote terminal explicitly refuses with 409 (no local fallback).
+  - [x] Add scoped `services:terminal` / `templates:install`, preview/domain RBAC and indirect deploy/variable checks before mutations; initialize templates atomically.
+  - [x] Preserve 0600/root-worker ownership with rootless fixture-compatible writes; portable PTY close-on-exec on Darwin/Linux.
+  - [x] Expand YAML merge keys before all Compose policy/isolation checks; regress inherited name/external/driver_opts/security escapes.
+  - [x] Stage immutable vhost secret generations; retain active certificate/key/config on failed validation/reload, rename failure and concurrent updates. Serialize host Nginx mutations.
+  - [x] Fence preview removal/deploy by project incarnation; durable parent deletion gate (new 0021), disable/re-enable race coverage, and legacy/undeployed directory adoption.
+  - [x] Validate fresh/upgrade PostgreSQL histories (0017/0019/0020 checksums unchanged), online runtime SQL and offline metadata. Workspace 238 tests; optional agent 114 tests; workspace/feature clippy, fmt and frontend build pass.
+  - [x] Real Docker isolation fixture, Debian 13 Linux PTY/optional-agent suite, actual Nginx weak-key rejection with live HTTPS rollback, and 5 rootless secret tests pass. Remote routing uses injected agent mocks, not real remote-host E2E. Ubuntu/systemd/certbot/installer E2E remains unverified.
+
+GENE-82 reproducible checks: from `panel/`, `SQLX_OFFLINE=true cargo test --workspace` with an isolated `DATABASE_URL`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo fmt --all -- --check`; `cargo test -p panel-agent --features docker,builders,mail,antivirus`. Run Linux tests with `-- --test-threads=1` because the existing process-wide FD sampler assertion is sensitive to other tests. Explicit fixtures: filter `docker_preview_merge_isolation_fixture -- --ignored` with Docker available, and `nginx_rejected_pair_preserves_live_certificate_and_config -- --ignored` inside an isolated Linux container with Nginx/OpenSSL (starts a temporary Nginx). `SQLX_OFFLINE=false cargo sqlx prepare --workspace --check -- --all-targets` passes against the migrated database without metadata changes. Frontend: `npm ci && npm run build` passes; existing audit reports 2 high vulnerabilities and a large-bundle warning, not fixed in this security-integration scope.
 
 ## Foundation
 

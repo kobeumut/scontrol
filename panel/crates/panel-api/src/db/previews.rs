@@ -52,12 +52,29 @@ pub async fn settings(pool: &PgPool, project_id: Uuid) -> sqlx::Result<Option<Se
     .await
 }
 
+pub async fn settings_in(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+) -> sqlx::Result<Option<SettingsRow>> {
+    sqlx::query_as::<_, SettingsRow>(&format!(
+        "SELECT {SETTINGS_COLUMNS} FROM preview_settings WHERE project_id = $1"
+    ))
+    .bind(project_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 pub async fn upsert_settings(
     pool: &PgPool,
     project_id: Uuid,
     input: &SettingsInput<'_>,
-) -> sqlx::Result<SettingsRow> {
-    sqlx::query_as::<_, SettingsRow>(&format!(
+) -> sqlx::Result<Option<SettingsRow>> {
+    let mut tx = pool.begin().await?;
+    lock_parent(&mut tx, project_id).await?;
+    if is_deleting(&mut tx, project_id).await? {
+        return Ok(None);
+    }
+    let row = sqlx::query_as::<_, SettingsRow>(&format!(
         "INSERT INTO preview_settings (project_id, enabled, base_domain, service_name, \
              container_port, https, wildcard_certificate, max_active, ttl_hours, memory_mb, \
              cpu_millis) \
@@ -82,8 +99,27 @@ pub async fn upsert_settings(
     .bind(input.ttl_hours as i32)
     .bind(input.memory_mb as i32)
     .bind(input.cpu_millis as i32)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    if !input.enabled {
+        sqlx::query("UPDATE preview_deployments SET status = 'closing', close_reason = 'disabled' WHERE parent_project_id = $1 AND status = 'active'")
+            .bind(project_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(Some(row))
+}
+
+pub async fn is_deleting(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+) -> sqlx::Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, bool>("SELECT deleting FROM compose_projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .unwrap_or(true),
+    )
 }
 
 /// The sealed comment token, if one is stored.
@@ -220,19 +256,6 @@ pub async fn mark_closing(pool: &PgPool, id: Uuid, reason: &str) -> sqlx::Result
     Ok(updated == 1)
 }
 
-/// Marks every active preview of a project closing; returns how many.
-pub async fn mark_all_closing(pool: &PgPool, parent: Uuid, reason: &str) -> sqlx::Result<u64> {
-    Ok(sqlx::query(
-        "UPDATE preview_deployments SET status = 'closing', close_reason = $2 \
-         WHERE parent_project_id = $1 AND status = 'active'",
-    )
-    .bind(parent)
-    .bind(reason)
-    .execute(pool)
-    .await?
-    .rows_affected())
-}
-
 pub async fn set_comment_id(pool: &PgPool, id: Uuid, comment_id: i64) -> sqlx::Result<()> {
     sqlx::query("UPDATE preview_deployments SET comment_id = $2 WHERE id = $1")
         .bind(id)
@@ -305,9 +328,9 @@ pub async fn insert_preview(
 ) -> sqlx::Result<bool> {
     sqlx::query(
         "INSERT INTO compose_projects (id, name, slug, owner_user_id, environment_id, \
-             env_layered, source, github_app_id, github_installation_id, registry_id) \
+             env_layered, source, github_app_id, github_installation_id, registry_id, server_id) \
          SELECT $1, $2, $3, owner_user_id, environment_id, env_layered, $4, github_app_id, \
-             github_installation_id, registry_id \
+             github_installation_id, registry_id, server_id \
          FROM compose_projects WHERE id = $5",
     )
     .bind(new.preview_project_id)

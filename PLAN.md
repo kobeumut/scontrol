@@ -4,6 +4,16 @@ This plan covers the Docker deployment side of scontrol. The goal is to cover wh
 
 Dokploy is conceptual input only. No Dokploy code is copied into this repository.
 
+## Stage 4 integration hardening (GENE-82, 2026-11-05)
+
+- Service operations resolve the owning server through the agent pool; preview children inherit parent placement. Interactive terminals require scoped `services:terminal` and a same-host Unix transport; remote targets return 409 until a secure terminal stream exists.
+- Templates require `templates:install`, creation, variables and optional deploy grants on the target environment; project, credentials, placement and queued deployment commit atomically. Domain/preview changes check every indirect mutation before writing.
+- Expand Compose YAML merges before host-path and preview-isolation policy. Preview network/volume names and external resources remain forbidden after expansion.
+- Store vhost secrets as immutable UUID generations. Configuration references a complete generation; retain the previous generation and restore the config if Nginx validation/reload fails. Serialize host Nginx mutations. Garbage collection is deliberately deferred: deleting a generation before every active/rollback reference is gone risks losing a live certificate.
+- Persist parent deletion intent (forward-only migration 0021); settings/webhooks cannot re-enable previews during removal. Disable cleanup handles already-closing rows only. Agent deploy/remove share a slug lock, an incarnation marker and UUID tombstones, so timed-out old calls cannot remove a recreated project. Legacy/undeployed roots are adopted only on a first removal, never for a tombstoned ID.
+- Upgrade all agents and panel-api together (agent first); mixed old agents do not enforce generation/fencing semantics. Keep existing migration filenames/checksums, including the intentional 0018 gap. SQLx's build script watches the migration directory.
+- Verified on macOS, isolated PostgreSQL, real Docker fixtures and a Debian 13 container with Nginx/OpenSSL and a rootless user. Multi-host routing is mock-tested only; full remote-agent/Ubuntu/systemd/certbot/installer E2E is still a release gate. See `TASK.md` for runnable checks and counts.
+
 ## 1. Research basis
 
 - **Source:** `github.com/dokploy/dokploy` at commit `d64ebed` (2026-11-02), inspected 2026-11-03. Paths are relative to that repository. This supersedes the earlier `853ca33` notes in `TASK.md`.

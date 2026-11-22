@@ -36,6 +36,9 @@ pub struct VhostOptions {
     /// Use the uploaded certificate instead of a Let's Encrypt one.
     #[serde(default)]
     pub custom_cert: bool,
+    /// Immutable agent-side secret generation, assigned by the API (not a secret).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_revision: Option<uuid::Uuid>,
 }
 
 impl VhostOptions {

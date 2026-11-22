@@ -5,7 +5,7 @@
 //! The comment token is write-only: it is stored sealed and the API only
 //! reports whether one is set.
 
-use crate::auth::AdminUser;
+use crate::auth::{perm, ServiceAccess};
 use crate::db;
 use crate::db::previews::{PreviewRow, SettingsInput, SettingsRow};
 use crate::error::{ApiError, ApiResult};
@@ -16,6 +16,7 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use panel_core::previews::{self, ResourceLimits};
+use panel_core::rbac::Permission;
 use panel_core::types::{validate, ComposeProject};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -57,7 +58,7 @@ fn unavailable(project: &ComposeProject, is_preview: bool) -> Option<&'static st
 }
 
 async fn overview(
-    AdminUser(_): AdminUser,
+    _: ServiceAccess<perm::ServicesRead>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Overview>> {
@@ -106,11 +107,21 @@ fn default_ttl() -> u32 {
 }
 
 async fn update_settings(
-    AdminUser(user): AdminUser,
+    access: ServiceAccess<perm::ServicesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<SettingsBody>,
 ) -> ApiResult<Json<SettingsRow>> {
+    let user = &access.principal;
+    user.require(Permission::ServicesDeploy, access.service.target())?;
+    user.require(
+        if body.enabled {
+            Permission::ServicesCreate
+        } else {
+            Permission::ServicesDelete
+        },
+        access.service.target(),
+    )?;
     let project = find_project(&state, id).await?;
     let is_preview = db::previews::find_by_preview_project(&state.db, id)
         .await?
@@ -158,9 +169,6 @@ async fn update_settings(
     let limits = body.resource_limits.unwrap_or_default();
     limits.validate().map_err(ApiError::BadRequest)?;
 
-    let was_enabled = db::previews::settings(&state.db, id)
-        .await?
-        .is_some_and(|s| s.enabled);
     let settings = db::previews::upsert_settings(
         &state.db,
         id,
@@ -177,11 +185,12 @@ async fn update_settings(
             cpu_millis: limits.cpu_millis,
         },
     )
-    .await?;
+    .await?
+    .ok_or_else(|| ApiError::Conflict("project deletion is in progress".into()))?;
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "update_preview_settings",
         Some(&project.slug),
         json!({
@@ -198,16 +207,14 @@ async fn update_settings(
     .ok();
     // Disabling removes every preview of the project (in the background:
     // each teardown is a `docker compose down`).
-    if was_enabled && !body.enabled {
+    if !body.enabled {
         let (db, agent, previews) = (
             state.db.clone(),
-            state.agent.clone(),
+            state.agents.clone(),
             state.previews.clone(),
         );
         tokio::spawn(async move {
-            if let Err(error) =
-                preview_service::close_all(&db, agent.as_ref(), &previews, id, "disabled").await
-            {
+            if let Err(error) = preview_service::cleanup_closing(&db, &agent, &previews, id).await {
                 tracing::warn!(project_id = %id, %error, "removing previews failed");
             }
         });
@@ -221,11 +228,13 @@ struct CommentTokenBody {
 }
 
 async fn set_comment_token(
-    AdminUser(user): AdminUser,
+    access: ServiceAccess<perm::VariablesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<CommentTokenBody>,
 ) -> ApiResult<StatusCode> {
+    let user = &access.principal;
+    user.require(Permission::ServicesUpdate, access.service.target())?;
     let project = find_project(&state, id).await?;
     let token = body.token.trim();
     if token.is_empty()
@@ -245,7 +254,7 @@ async fn set_comment_token(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "set_preview_comment_token",
         Some(&project.slug),
         json!({ "project_id": id }),
@@ -256,16 +265,18 @@ async fn set_comment_token(
 }
 
 async fn remove_comment_token(
-    AdminUser(user): AdminUser,
+    access: ServiceAccess<perm::VariablesUpdate>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    let user = &access.principal;
+    user.require(Permission::ServicesUpdate, access.service.target())?;
     let project = find_project(&state, id).await?;
     db::previews::set_comment_token(&state.db, id, None).await?;
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "remove_preview_comment_token",
         Some(&project.slug),
         json!({ "project_id": id }),
@@ -278,10 +289,11 @@ async fn remove_comment_token(
 /// Removes one preview now (the request stays open; a new push recreates
 /// it).
 async fn remove_preview(
-    AdminUser(user): AdminUser,
+    access: ServiceAccess<perm::ServicesDelete>,
     State(state): State<AppState>,
     Path((id, number)): Path<(Uuid, i64)>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let user = &access.principal;
     let project = find_project(&state, id).await?;
     let preview = db::previews::find_by_pr(&state.db, id, number)
         .await?
@@ -290,7 +302,7 @@ async fn remove_preview(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "close_preview",
         Some(&preview.slug),
         json!({ "parent_project_id": project.id, "pr_number": number, "reason": "removed" }),
@@ -299,7 +311,7 @@ async fn remove_preview(
     .ok();
     preview_service::spawn_teardown(
         state.db.clone(),
-        state.agent.clone(),
+        state.agents.clone(),
         state.previews.clone(),
         id,
         number,
@@ -453,6 +465,181 @@ mod tests {
         assert_eq!(settings["base_domain"], base);
         assert_eq!(settings["has_comment_token"], false);
         (state, adapter, router, cookie, project.id, secret, slug)
+    }
+
+    #[tokio::test]
+    async fn parent_deletion_is_a_durable_gate_and_stale_disable_does_not_touch_reenabled_previews()
+    {
+        let _guard = test_support::QUEUE_TESTS.lock().await;
+        let (state, _local, router, cookie, parent, secret, _) = setup().await;
+        let current = db::previews::settings(&state.db, parent)
+            .await
+            .unwrap()
+            .unwrap();
+        let settings = |enabled| json!({"enabled":enabled, "base_domain":current.base_domain, "service_name":"web", "container_port":3000});
+        let uri = format!("/api/compose-projects/{parent}/previews");
+        assert_eq!(
+            call(&router, &cookie, Method::PUT, &uri, Some(settings(false)))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&router, &cookie, Method::PUT, &uri, Some(settings(true)))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (_, opened) = deliver(&router, parent, &secret, pr_event("opened", 1, 1)).await;
+        assert!(opened.get("deployment").is_some(), "{opened}");
+        // Execute an arbitrarily delayed cleanup from the earlier disable.
+        preview_service::cleanup_closing(&state.db, &state.agents, &state.previews, parent)
+            .await
+            .unwrap();
+        assert!(
+            db::previews::settings(&state.db, parent)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            db::previews::find_by_pr(&state.db, parent, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+        assert_eq!(
+            preview_service::close_all(
+                &state.db,
+                &state.agents,
+                &state.previews,
+                parent,
+                "removed"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            call(&router, &cookie, Method::PUT, &uri, Some(settings(true)))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let (_, ignored) = deliver(&router, parent, &secret, pr_event("opened", 2, 1)).await;
+        assert!(ignored.get("ignored").is_some(), "{ignored}");
+        assert!(db::previews::find_by_pr(&state.db, parent, 2)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_previews_inherit_placement_and_sweeper_never_calls_local() {
+        let _guard = test_support::QUEUE_TESTS.lock().await;
+        let (state, local, router, cookie, parent, secret, _) = setup().await;
+        let name = format!("remote-{}", Uuid::new_v4().simple());
+        let (status, created) = call(&router, &cookie, Method::POST, "/api/servers",
+            Some(json!({"name": name, "transport": "ssh_socket", "address": format!("/run/scontrol/remote/{name}.sock")}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let server: Uuid = created["server"]["id"].as_str().unwrap().parse().unwrap();
+        let remote = Arc::new(MockAdapter::new());
+        state.agents.set_override(server, remote.clone());
+        sqlx::query("UPDATE compose_projects SET server_id = $1 WHERE id = $2")
+            .bind(server)
+            .bind(parent)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let (status, opened) = deliver(&router, parent, &secret, pr_event("opened", 1, 1)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{opened}");
+        let row = db::previews::find_by_pr(&state.db, parent, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let project = db::compose_projects::find_by_id(&state.db, row.preview_project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.server_id, server);
+        let job = db::compose_projects::claim_next_deployment_of(&state.db, Some(project.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.project_id, project.id);
+        let agent = state
+            .agents
+            .for_service(&state.db, job.project_id)
+            .await
+            .unwrap();
+        crate::services::deploy_queue::run_job(
+            &state.db,
+            agent.as_ref(),
+            &state.secret_box,
+            &state.github_apps,
+            job,
+        )
+        .await;
+        assert_eq!(remote.deploys.lock().unwrap().len(), 1);
+        assert!(local.deploys.lock().unwrap().is_empty());
+        sqlx::query("UPDATE preview_deployments SET last_activity_at = now() - interval '49 hours' WHERE id = $1")
+            .bind(row.id).execute(&state.db).await.unwrap();
+        let report = preview_service::sweep(
+            &state.db,
+            &state.agents,
+            &state.previews,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert!(report.removed >= 1);
+        assert!(remote
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "remove_compose_project"));
+        assert!(!local
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "remove_compose_project"));
+        assert!(db::compose_projects::find_by_id(&state.db, project.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn disabling_under_the_parent_lock_blocks_inflight_creation() {
+        let _guard = test_support::QUEUE_TESTS.lock().await;
+        let (state, _, router, _, parent, secret, _) = setup().await;
+        let mut tx = state.db.begin().await.unwrap();
+        db::previews::lock_parent(&mut tx, parent).await.unwrap();
+        let delivery = deliver(&router, parent, &secret, pr_event("opened", 1, 1));
+        tokio::pin!(delivery);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut delivery)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE preview_settings SET enabled = FALSE WHERE project_id = $1")
+            .bind(parent)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let (status, response) = delivery.await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(response.get("ignored").is_some(), "{response}");
+        assert!(db::previews::list_for_parent(&state.db, parent)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -621,7 +808,7 @@ mod tests {
         assert_eq!(third["created"], true, "{third}");
 
         // Clean up the queue rows this test created.
-        preview_service::close_all(&pool, adapter.as_ref(), &state.previews, project, "removed")
+        preview_service::close_all(&pool, &state.agents, &state.previews, project, "removed")
             .await
             .unwrap();
         assert!(db::previews::list_for_parent(&pool, project)
@@ -669,7 +856,7 @@ mod tests {
                 .unwrap();
         assert!(claimed.is_none(), "a closing preview's job was claimed");
         assert!(
-            preview_service::teardown(&pool, adapter.as_ref(), &state.previews, &first)
+            preview_service::teardown(&pool, &state.agents, &state.previews, &first)
                 .await
                 .unwrap()
         );
@@ -699,7 +886,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            !preview_service::teardown(&pool, adapter.as_ref(), &state.previews, &row)
+            !preview_service::teardown(&pool, &state.agents, &state.previews, &row)
                 .await
                 .unwrap()
         );
@@ -719,7 +906,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            preview_service::teardown(&pool, adapter.as_ref(), &state.previews, &row)
+            preview_service::teardown(&pool, &state.agents, &state.previews, &row)
                 .await
                 .unwrap()
         );
@@ -773,7 +960,7 @@ mod tests {
         assert_eq!(count_jobs("queued", third.preview_project_id).await, 0);
         assert_eq!(count_jobs("running", third.preview_project_id).await, 0);
 
-        preview_service::close_all(&pool, adapter.as_ref(), &state.previews, project, "removed")
+        preview_service::close_all(&pool, &state.agents, &state.previews, project, "removed")
             .await
             .unwrap();
         assert!(db::previews::list_for_parent(&pool, project)
@@ -785,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_sweep_expires_idle_previews_only() {
         let _guard = test_support::QUEUE_TESTS.lock().await;
-        let (state, adapter, router, _cookie, project, secret, _slug) = setup().await;
+        let (state, _adapter, router, _cookie, project, secret, _slug) = setup().await;
         let pool = state.db.clone();
         for number in [5, 6] {
             let (_, opened) =
@@ -804,7 +991,7 @@ mod tests {
         .await
         .unwrap();
         let report =
-            preview_service::sweep(&pool, adapter.as_ref(), &state.previews, chrono::Utc::now())
+            preview_service::sweep(&pool, &state.agents, &state.previews, chrono::Utc::now())
                 .await
                 .unwrap();
         assert!(report.expired >= 1, "{report:?}");
@@ -818,7 +1005,7 @@ mod tests {
             .unwrap();
         assert_eq!(fresh.status, "active");
 
-        preview_service::close_all(&pool, adapter.as_ref(), &state.previews, project, "removed")
+        preview_service::close_all(&pool, &state.agents, &state.previews, project, "removed")
             .await
             .unwrap();
     }
@@ -879,7 +1066,7 @@ mod tests {
         let _guard = test_support::QUEUE_TESTS.lock().await;
         let (receiver, mut requests) = test_support::http_receiver().await;
         let base = receiver.trim_end_matches("/hook").to_string();
-        let (mut state, adapter, _router, cookie, project, secret, slug) = setup().await;
+        let (mut state, _adapter, _router, cookie, project, secret, slug) = setup().await;
         state.previews = preview_service::Previews::with_api_base(
             crate::services::secret_box::SecretBox::derive(&[42u8; 32]),
             test_support::github_apps(),
@@ -895,7 +1082,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let (_, opened) = deliver(&router, project, &secret, pr_event("opened", 4, 1)).await;
+        let (status, opened) = deliver(&router, project, &secret, pr_event("opened", 4, 1)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{opened}");
+        assert!(opened.get("deployment").is_some(), "{opened}");
         let deployment: Uuid = opened["deployment"]["id"]
             .as_str()
             .unwrap()
@@ -936,7 +1125,7 @@ mod tests {
 
         preview_service::close_all(
             &state.db,
-            adapter.as_ref(),
+            &state.agents,
             &state.previews,
             project,
             "removed",

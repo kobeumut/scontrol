@@ -302,6 +302,14 @@ pub struct ComposeProjectActionParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoveComposeProjectParams {
+    pub project_slug: String,
+    /// Incarnation fence. Older clients may omit it; new panel calls must set it.
+    #[serde(default)]
+    pub expected_project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ComposeProjectLogsParams {
     pub project_slug: String,
     /// Bounded by the agent to 1..=2,000 lines.
@@ -388,6 +396,10 @@ pub struct CreateContainerParams {
 pub struct WriteVhostSecretsParams {
     pub project_slug: String,
     pub domain: String,
+    /// New immutable generation. Reusing a revision is refused.
+    pub revision: Uuid,
+    #[serde(default)]
+    pub previous_revision: Option<Uuid>,
     #[serde(default)]
     pub basic_auth: crate::vhost::SecretChange<Vec<crate::vhost::BasicAuthUser>>,
     #[serde(default)]
@@ -768,7 +780,7 @@ pub trait AdapterPort: Send + Sync {
     /// `docker compose restart` of the last deployed project model.
     async fn restart_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
     async fn set_database_exposure(&self, params: SetDatabaseExposureParams) -> CoreResult<()>;
-    async fn remove_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()>;
+    async fn remove_compose_project(&self, params: RemoveComposeProjectParams) -> CoreResult<()>;
     async fn list_compose_project_services(
         &self,
         params: ComposeProjectActionParams,
@@ -1110,7 +1122,7 @@ pub mod mock {
 
         async fn remove_compose_project(
             &self,
-            _params: ComposeProjectActionParams,
+            _params: RemoveComposeProjectParams,
         ) -> CoreResult<()> {
             self.record("remove_compose_project")
         }
@@ -1341,6 +1353,8 @@ pub mod mock {
 
         async fn read_terminal(&self, _params: TerminalReadParams) -> CoreResult<TerminalOutput> {
             self.record("read_terminal")?;
+            // Empty long-polls must yield, like the real agent; avoid a busy mock.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             Ok(TerminalOutput::default())
         }
 

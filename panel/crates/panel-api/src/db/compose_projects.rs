@@ -125,6 +125,30 @@ pub async fn create(
         Some(id) => id,
         None => super::projects::default_environment(pool, owner_user_id).await?,
     };
+    let mut tx = pool.begin().await?;
+    let project = create_in(
+        &mut tx,
+        id,
+        name,
+        slug,
+        owner_user_id,
+        environment_id,
+        source,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(project)
+}
+
+pub async fn create_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    name: &str,
+    slug: &str,
+    owner_user_id: Uuid,
+    environment_id: Uuid,
+    source: &ComposeSource,
+) -> anyhow::Result<ComposeProject> {
     let source = serde_json::to_value(source)?;
     // A service created by the panel starts layered: the panel holds its
     // own variables from the first write on.
@@ -142,7 +166,7 @@ pub async fn create(
         environment_id,
         source,
     )
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     record.into_project()
 }
@@ -570,13 +594,34 @@ pub async fn domain_options_of_project(
     Ok(rows.into_iter().map(|(id, o)| (id, o.0)).collect())
 }
 
-/// Stores the options of a domain of `project_id`; false if there is none.
+/// Compare-and-set options under the domain row lock. A stale Keep request
+/// must not select a revoked secret revision. False means deleted or changed.
 pub async fn set_domain_options(
     pool: &PgPool,
     project_id: Uuid,
     domain_id: Uuid,
+    previous: &panel_core::vhost::VhostOptions,
     options: &panel_core::vhost::VhostOptions,
 ) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let domain: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM compose_project_domains WHERE id = $1 AND project_id = $2 FOR UPDATE",
+    )
+    .bind(domain_id)
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if domain.is_none() {
+        return Ok(false);
+    }
+    let current: Option<sqlx::types::Json<panel_core::vhost::VhostOptions>> =
+        sqlx::query_scalar("SELECT options FROM compose_domain_options WHERE domain_id = $1")
+            .bind(domain_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if current.map(|v| v.0).unwrap_or_default() != *previous {
+        return Ok(false);
+    }
     let result = sqlx::query(
         "INSERT INTO compose_domain_options (domain_id, options)
          SELECT id, $3 FROM compose_project_domains WHERE id = $1 AND project_id = $2
@@ -585,8 +630,9 @@ pub async fn set_domain_options(
     .bind(domain_id)
     .bind(project_id)
     .bind(sqlx::types::Json(options))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() == 1)
 }
 

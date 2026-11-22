@@ -9,6 +9,9 @@ use panel_core::types::Runtime;
 #[cfg(feature = "docker")]
 use panel_core::vhost::{Redirect, VhostOptions};
 
+// Nginx validates the whole host: every writer/reloader shares this transaction lock.
+pub(super) static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Deterministic local TCP port for a proxied (Node.js/Python) site, derived
 /// from the domain so restarts / re-provisioning are idempotent.
 pub fn app_port_for_domain(domain: &str) -> u16 {
@@ -99,6 +102,7 @@ pub async fn write_vhost(
     if !panel_core::types::validate::is_valid_domain(domain) {
         return Err(CoreError::Validation(format!("invalid domain: {domain}")));
     }
+    let _guard = CONFIG_LOCK.lock().await;
     let content = render_vhost(domain, document_root, runtime);
     let available = cfg.nginx_sites_available.join(format!("{domain}.conf"));
     tokio::fs::write(&available, content)
@@ -114,21 +118,28 @@ pub async fn write_vhost(
             .map_err(|e| CoreError::Io(format!("symlinking {}: {e}", enabled.display())))?;
     }
 
-    test_and_reload().await
+    test_and_reload_unlocked().await
 }
 
 pub async fn remove_vhost(cfg: &AgentConfig, domain: &str) -> CoreResult<()> {
     if !panel_core::types::validate::is_valid_domain(domain) {
         return Err(CoreError::Validation(format!("invalid domain: {domain}")));
     }
+    let _guard = CONFIG_LOCK.lock().await;
     let available = cfg.nginx_sites_available.join(format!("{domain}.conf"));
     let enabled = cfg.nginx_sites_enabled.join(format!("{domain}.conf"));
     let _ = tokio::fs::remove_file(&enabled).await;
     let _ = tokio::fs::remove_file(&available).await;
-    test_and_reload().await
+    test_and_reload_unlocked().await
 }
 
 pub async fn test_and_reload() -> CoreResult<()> {
+    let _guard = CONFIG_LOCK.lock().await;
+    test_and_reload_unlocked().await
+}
+
+/// Caller owns CONFIG_LOCK through mutation, validation and any rollback.
+pub(super) async fn test_and_reload_unlocked() -> CoreResult<()> {
     run("nginx", &["-t"]).await?;
     run("systemctl", &["reload", "nginx"]).await?;
     Ok(())
@@ -347,14 +358,6 @@ pub fn certificate_exists(cfg: &AgentConfig, domain: &str) -> bool {
 }
 
 /// Current content of a Compose vhost, used to restore it if a new
-/// configuration fails `nginx -t`.
-#[cfg(feature = "docker")]
-pub async fn read_compose_vhost(cfg: &AgentConfig, domain: &str) -> Option<String> {
-    tokio::fs::read_to_string(cfg.nginx_sites_available.join(compose_vhost_name(domain)))
-        .await
-        .ok()
-}
-
 /// Writes (atomically) and enables a Compose vhost. Does not reload Nginx;
 /// callers batch all changes and call [`test_and_reload`] once.
 #[cfg(feature = "docker")]
@@ -387,8 +390,16 @@ pub async fn remove_compose_vhost(cfg: &AgentConfig, domain: &str) -> CoreResult
         return Err(CoreError::Validation(format!("invalid domain: {domain}")));
     }
     let name = compose_vhost_name(domain);
-    let _ = tokio::fs::remove_file(cfg.nginx_sites_enabled.join(&name)).await;
-    let _ = tokio::fs::remove_file(cfg.nginx_sites_available.join(&name)).await;
+    for path in [
+        cfg.nginx_sites_enabled.join(&name),
+        cfg.nginx_sites_available.join(&name),
+    ] {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Io(format!("removing vhost: {e}"))),
+        }
+    }
     Ok(())
 }
 

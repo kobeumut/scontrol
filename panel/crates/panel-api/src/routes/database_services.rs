@@ -21,7 +21,9 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use panel_core::adapters::{ComposeProjectActionParams, SetDatabaseExposureParams};
+use panel_core::adapters::{
+    ComposeProjectActionParams, RemoveComposeProjectParams, SetDatabaseExposureParams,
+};
 use panel_core::error::CoreError;
 use panel_core::rbac::{Permission, Target};
 use panel_core::types::{
@@ -460,8 +462,9 @@ async fn remove(
         .agents
         .for_server_id(&state.db, project.server_id)
         .await?
-        .remove_compose_project(ComposeProjectActionParams {
+        .remove_compose_project(RemoveComposeProjectParams {
             project_slug: project.slug.clone(),
+            expected_project_id: Some(project.id),
         })
         .await
     {

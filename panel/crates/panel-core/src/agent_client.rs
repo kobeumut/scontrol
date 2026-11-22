@@ -371,7 +371,7 @@ impl AdapterPort for AgentClient {
         self.call(AgentRequest::SetDatabaseExposure(params)).await
     }
 
-    async fn remove_compose_project(&self, params: ComposeProjectActionParams) -> CoreResult<()> {
+    async fn remove_compose_project(&self, params: RemoveComposeProjectParams) -> CoreResult<()> {
         self.call(AgentRequest::RemoveComposeProject(params)).await
     }
 

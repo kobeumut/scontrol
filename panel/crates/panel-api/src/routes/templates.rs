@@ -7,7 +7,7 @@
 //! stored source. The agent applies the same Compose validator as for any
 //! user-supplied file when it deploys.
 
-use crate::auth::AdminUser;
+use crate::auth::{Authenticated, Principal};
 use crate::db;
 use crate::db::projects::EnvScope;
 use crate::error::{ApiError, ApiResult};
@@ -17,7 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use panel_core::adapters::ComposeProjectActionParams;
+use panel_core::rbac::{Permission, Target};
 use panel_core::templates::{self, Generator, SuggestedDomain, Template};
 use panel_core::types::{validate, ComposeProject, ComposeSource, DeploymentInfo};
 use serde::{Deserialize, Serialize};
@@ -82,11 +82,14 @@ fn view(template: &Template) -> TemplateView {
     }
 }
 
-async fn list(AdminUser(_): AdminUser) -> Json<Vec<TemplateView>> {
+async fn list(Authenticated(_): Authenticated) -> Json<Vec<TemplateView>> {
     Json(templates::catalogue().iter().map(view).collect())
 }
 
-async fn show(AdminUser(_): AdminUser, Path(id): Path<String>) -> ApiResult<Json<TemplateView>> {
+async fn show(
+    Authenticated(_): Authenticated,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TemplateView>> {
     let template =
         templates::find(&id).ok_or_else(|| ApiError::NotFound("template not found".into()))?;
     Ok(Json(view(&template)))
@@ -117,8 +120,19 @@ struct Installed {
     suggested_domain: Option<SuggestedDomain>,
 }
 
+// Installing always creates a service and writes generated variables.
+fn require_install(user: &Principal, target: Target, deploy: bool) -> ApiResult<()> {
+    user.require(Permission::TemplatesInstall, target)?;
+    user.require(Permission::ServicesCreate, target)?;
+    user.require(Permission::VariablesUpdate, target)?;
+    if deploy {
+        user.require(Permission::ServicesDeploy, target)?;
+    }
+    Ok(())
+}
+
 async fn install(
-    AdminUser(user): AdminUser,
+    Authenticated(user): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<InstallBody>,
@@ -133,11 +147,19 @@ async fn install(
     if !validate::is_valid_project_slug(&body.slug) {
         return Err(ApiError::BadRequest("invalid project slug".into()));
     }
-    if let Some(environment_id) = body.environment_id {
-        db::projects::find_environment(&state.db, environment_id)
-            .await?
-            .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
-    }
+    let target = match body.environment_id {
+        Some(id) => {
+            let env = db::projects::find_environment(&state.db, id)
+                .await?
+                .ok_or_else(|| ApiError::BadRequest("environment not found".into()))?;
+            Target::Environment {
+                project: env.project_id,
+                environment: env.id,
+            }
+        }
+        None => Target::Global,
+    };
+    require_install(&user, target, body.deploy)?;
     let environment =
         templates::generate_variables(&template, &body.inputs).map_err(ApiError::BadRequest)?;
     env_layers::validate_pairs(&environment)?;
@@ -145,13 +167,19 @@ async fn install(
     let source = ComposeSource::Raw {
         compose_yaml: template.compose_yaml.clone(),
     };
-    let project = db::compose_projects::create(
-        &state.db,
+    let server_id = super::compose_projects::place(&state, None, false, &source).await?;
+    let environment_id = match body.environment_id {
+        Some(id) => id,
+        None => db::projects::default_environment(&state.db, user.id).await?,
+    };
+    let mut tx = state.db.begin().await?;
+    let mut project = db::compose_projects::create_in(
+        &mut tx,
         Uuid::new_v4(),
         &body.name,
         &body.slug,
         user.id,
-        body.environment_id,
+        environment_id,
         &source,
     )
     .await
@@ -166,27 +194,21 @@ async fn install(
             ApiError::Internal(e)
         }
     })?;
-    // Generated secrets are sealed straight into the project's environment.
-    if let Err(error) = env_layers::replace(
-        &state.db,
+    sqlx::query("UPDATE compose_projects SET server_id = $1 WHERE id = $2")
+        .bind(server_id)
+        .bind(project.id)
+        .execute(&mut *tx)
+        .await?;
+    project.server_id = server_id;
+    // No worker may see a partially initialized service on the wrong host.
+    env_layers::replace_in(
+        &mut tx,
         &state.secret_box,
         EnvScope::Service(project.id),
         &environment,
     )
-    .await
-    {
-        state
-            .agent
-            .remove_compose_project(ComposeProjectActionParams {
-                project_slug: project.slug.clone(),
-            })
-            .await
-            .ok();
-        db::compose_projects::delete(&state.db, project.id)
-            .await
-            .ok();
-        return Err(error);
-    }
+    .await?;
+    tx.commit().await?;
     let deployment = if body.deploy {
         Some(
             state
@@ -200,7 +222,7 @@ async fn install(
     db::audit::record(
         &state.db,
         Some(user.id),
-        "user",
+        user.actor_kind(),
         "install_template",
         Some(&project.slug),
         serde_json::json!({ "project_id": project.id, "template": template.meta.id }),
