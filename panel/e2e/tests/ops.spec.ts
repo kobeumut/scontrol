@@ -202,6 +202,51 @@ test('docker cleanup confirms that settings were saved', async ({ page }) => {
   }
 });
 
+test('docker cleanup can run on a chosen server; the request carries its id', async ({ page }) => {
+  // A second, online server, so the picker is offered. Its list and the run
+  // are answered in the browser: nothing is pruned and no deployment waits.
+  const remote = {
+    id: '00000000-0000-4000-8000-00000000c1ea', name: unique('cleanup'), transport: 'ssh_socket',
+    address: '/run/scontrol/remote/x.sock', status: 'online', draining: false, max_services: null, service_count: 0,
+    agent_version: null, docker: true, last_error: null, last_seen_at: null, cert_expires_at: null,
+    cert_fingerprint: null, rotation_pending: false,
+  };
+  await page.route('**/api/servers', async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ response, json: [...await response.json(), remote] });
+  });
+  const sent: unknown[] = [];
+  await page.route('**/api/observability/docker-cleanup/run', async (route) => {
+    sent.push(route.request().postDataJSON());
+    await route.fulfill({ json: {
+      id: '00000000-0000-4000-8000-0000000000aa', server_id: remote.id, trigger: 'manual', status: 'succeeded',
+      older_than_hours: 24, started_at: new Date().toISOString(), finished_at: new Date().toISOString(),
+      images_freed_bytes: 0, builder_freed_bytes: 0, error_message: null,
+    } });
+  });
+
+  await openTab(page, 'Observability');
+  const section = page.locator('section.panel').filter({ has: page.getByRole('heading', { name: 'Docker cleanup' }) });
+  const picker = section.getByLabel('Clean up now on');
+  await expect(picker).toHaveValue('');
+  await expect(picker.getByRole('option', { name: /automatic/ })).toHaveCount(0);
+
+  await picker.selectOption({ label: remote.name });
+  // beforeEach accepts every dialog; this only records the question.
+  const messages: string[] = [];
+  page.on('dialog', (d) => { messages.push(d.message()); });
+  await section.getByRole('button', { name: 'Clean up now' }).click();
+  await expect.poll(() => sent.length).toBe(1);
+  expect(sent[0]).toMatchObject({ server_id: remote.id });
+  expect(messages[0]).toContain(`on ${remote.name}`);
+
+  // This host sends no server id.
+  await picker.selectOption({ label: 'this host' });
+  await section.getByRole('button', { name: 'Clean up now' }).click();
+  await expect.poll(() => sent.length).toBe(2);
+  expect(sent[1]).not.toHaveProperty('server_id');
+});
+
 // ------------------------------------------------------------- Notifications
 
 /** A local HTTP receiver the API can deliver webhooks to. */

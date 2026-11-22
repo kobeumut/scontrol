@@ -113,6 +113,7 @@ Durable project context that is not obvious from the code. Read it together with
 - **Every one-shot agent command has a hard limit and dies as a process group (decided 2026-11-05, GENE-85).** Dokploy saw `docker logs` readers that outlived their request time out and pile up until dockerd ran at 200%+ CPU. `kill_on_drop` only reaches the direct child, and `docker` runs Compose as a plugin child, so the exec layer now starts each command in its own group and, on timeout or a dropped future, SIGTERMs then SIGKILLs the whole group.
   - Why a 10-minute default rather than 30 s everywhere: `docker compose down`/`stop`, certbot, and similar one-shot calls can legitimately take minutes; quick reads (container logs) pass a 30 s limit explicitly, long scans (ClamAV, 6 h) a longer one.
 - **A log search counts matching lines, not scanned lines (decided 2026-11-05, GENE-85).** Docker's `--tail` applies before our filter, so a search over the last N lines missed older matches. The follower scans history up to an instant `T` and then follows `--since T`; splitting at one instant avoids both duplicates and gaps.
+- **A user who owns sites or services cannot be deleted (decided 2026-11-22, GENE-230).** `sites`, `compose_projects`, and `projects` reference `users` with `ON DELETE CASCADE`, so deleting the owner would drop the panel rows while the system users, vhosts, and containers keep running with nothing left to manage them. The API refuses with 409 instead; delete or hand over the resources first. Empty projects and environments still cascade.
 
 ## Open Items
 

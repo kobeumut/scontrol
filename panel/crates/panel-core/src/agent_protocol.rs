@@ -28,6 +28,7 @@ pub enum AgentRequest {
     CreateSystemUser(CreateSystemUserParams),
     DeleteSystemUser(DeleteSystemUserParams),
     ApplyFirewallRule(ApplyFirewallRuleParams),
+    RemoveFirewallRule(RemoveFirewallRuleParams),
     UpsertCronJob(UpsertCronJobParams),
     RemoveCronJob(RemoveCronJobParams),
     CreateContainer(CreateContainerParams),
@@ -174,6 +175,9 @@ pub async fn dispatch(adapter: &dyn AdapterPort, request: AgentRequest) -> Agent
         }
         AgentRequest::ApplyFirewallRule(p) => {
             AgentResponse::from_core_result(adapter.apply_firewall_rule(p).await)
+        }
+        AgentRequest::RemoveFirewallRule(p) => {
+            AgentResponse::from_core_result(adapter.remove_firewall_rule(p).await)
         }
         AgentRequest::UpsertCronJob(p) => {
             AgentResponse::from_core_result(adapter.upsert_cron_job(p).await)

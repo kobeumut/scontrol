@@ -612,7 +612,13 @@ function Domains({ projectId, isStatic, onDeploy }: {
   const [port, setPort] = useState('80');
   const [https, setHttps] = useState(true);
   const [editing, setEditing] = useState<string>();
+  // Off saves the change only; it takes effect with the next deployment.
+  const [redeploy, setRedeploy] = useState(true);
+  const [pending, setPending] = useState(false);
   const action = useAction();
+  const applied = (deployment?: Deployment) => {
+    if (deployment) { setPending(false); onDeploy(deployment); } else setPending(true);
+  };
 
   const add = (event: FormEvent) => {
     event.preventDefault();
@@ -621,25 +627,28 @@ function Domains({ projectId, isStatic, onDeploy }: {
         method: 'POST',
         // A static site has one implicit target: its release directory.
         body: isStatic
-          ? { domain: domain.trim(), service_name: 'static', container_port: 80, https }
-          : { domain: domain.trim(), service_name: service.trim(), container_port: Number(port), https },
+          ? { domain: domain.trim(), service_name: 'static', container_port: 80, https, redeploy }
+          : { domain: domain.trim(), service_name: service.trim(), container_port: Number(port), https, redeploy },
       });
       setDomain('');
       domains.reload();
-      if (created.deployment) onDeploy(created.deployment);
+      applied(created.deployment);
     });
   };
   const remove = (d: Domain) => action.run(async () => {
-    const result = await api<{ deployment?: Deployment }>(`/compose-projects/${projectId}/domains/${d.id}`, { method: 'DELETE' });
+    const result = await api<{ deployment?: Deployment }>(
+      `/compose-projects/${projectId}/domains/${d.id}${redeploy ? '' : '?redeploy=false'}`, { method: 'DELETE' });
     domains.reload();
-    if (result.deployment) onDeploy(result.deployment);
+    applied(result.deployment);
   });
 
   return <>
     <h3>Domains</h3>
     <p className="hint">{isStatic
-      ? 'Each domain serves the current release directly from Nginx. Changes queue a redeploy.'
-      : 'Each domain proxies to one service port published on loopback only. Changes queue a redeploy.'}</p>
+      ? 'Each domain serves the current release directly from Nginx.'
+      : 'Each domain proxies to one service port published on loopback only.'} With “Redeploy now” off, a change is only saved and takes effect with the next deployment.</p>
+    <label className="check"><input type="checkbox" checked={redeploy} onChange={(e) => setRedeploy(e.target.checked)} /> Redeploy now when domains change</label>
+    {pending && <p className="state" role="status">Saved. The change takes effect with the next deployment.</p>}
     <StateView state={domains} />
     {domains.data && domains.data.length > 0 && <table><thead><tr><th>Domain</th><th>Target</th><th>Loopback</th><th>HTTPS</th><th /></tr></thead><tbody>
       {domains.data.map((d) => <tr key={d.id}>
@@ -652,8 +661,8 @@ function Domains({ projectId, isStatic, onDeploy }: {
           <button className="link danger" disabled={action.busy} onClick={() => remove(d)}>remove</button></td>
       </tr>)}
     </tbody></table>}
-    {domains.data?.filter((d) => d.id === editing).map((d) => <DomainOptions key={d.id} projectId={projectId} domain={d}
-      onSaved={(deployment) => { setEditing(undefined); domains.reload(); if (deployment) onDeploy(deployment); }} />)}
+    {domains.data?.filter((d) => d.id === editing).map((d) => <DomainOptions key={d.id} projectId={projectId} domain={d} redeploy={redeploy}
+      onSaved={(deployment) => { setEditing(undefined); domains.reload(); applied(deployment); }} />)}
     <form className="inline-form" onSubmit={add}>
       <input required aria-label="Domain" placeholder="app.example.com" value={domain} onChange={(e) => setDomain(e.target.value)} />
       {!isStatic && <input required aria-label="Service" placeholder="service" className="mono" value={service} onChange={(e) => setService(e.target.value)} />}

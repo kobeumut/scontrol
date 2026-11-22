@@ -5,7 +5,7 @@ import { ErrorLine, StateView, useAction } from './ui';
 type PanelUser = User & { created_at: string };
 
 /** Panel users (installation admins only): create, and reset a lost second factor. */
-export function Users({ onChanged }: { onChanged?: () => void }) {
+export function Users({ onChanged, currentUserId }: { onChanged?: () => void; currentUserId?: string }) {
   const users = useApi<PanelUser[]>('/admin/users');
   const [creating, setCreating] = useState(false);
   const action = useAction();
@@ -14,13 +14,17 @@ export function Users({ onChanged }: { onChanged?: () => void }) {
     if (!window.confirm(`Turn off two-factor authentication for ${user.username}? They can sign in with the password alone until they set it up again.`)) return;
     action.run(async () => { await api(`/admin/users/${user.id}/disable-totp`, { method: 'POST' }); users.reload(); });
   };
+  const remove = (user: PanelUser) => {
+    if (!window.confirm(`Delete user ${user.username}? Their sessions, API keys, and role bindings are removed. This cannot be undone.`)) return;
+    action.run(async () => { await api(`/admin/users/${user.id}`, { method: 'DELETE' }); users.reload(); onChanged?.(); });
+  };
 
   return <section className="panel">
     <div className="panel-title">
       <h2>Users</h2>
       <button className="action" onClick={() => setCreating((c) => !c)}>{creating ? 'Close' : 'New user'}</button>
     </div>
-    <p className="hint">A new user can sign in but sees nothing until a role binding below gives them access. Admins hold every permission.</p>
+    <p className="hint">A new user can sign in but sees nothing until a role binding below gives them access. Admins hold every permission. A user who still owns sites or services cannot be deleted, and neither can the last admin.</p>
     {creating && <CreateUser onCreated={() => { setCreating(false); users.reload(); onChanged?.(); }} />}
     <StateView state={users} />
     <ErrorLine error={action.error} />
@@ -31,7 +35,10 @@ export function Users({ onChanged }: { onChanged?: () => void }) {
         <td>{user.is_admin ? 'admin' : 'user'}</td>
         <td>{user.totp_enabled ? 'enabled' : '—'}</td>
         <td className="small">{formatTime(user.created_at)}</td>
-        <td>{user.totp_enabled && <button className="link danger" disabled={action.busy} onClick={() => resetTotp(user)}>reset 2FA</button>}</td>
+        <td className="actions">
+          {user.totp_enabled && <button className="link danger" disabled={action.busy} onClick={() => resetTotp(user)}>reset 2FA</button>}
+          {user.id !== currentUserId && <button className="link danger" disabled={action.busy} onClick={() => remove(user)}>delete</button>}
+        </td>
       </tr>)}
     </tbody></table>}
   </section>;

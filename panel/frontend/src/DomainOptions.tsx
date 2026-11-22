@@ -5,8 +5,8 @@ import { ErrorLine, useAction } from './ui';
 const EMPTY: VhostOptions = { redirect: null, path_prefix: null, basic_auth: false, custom_cert: false };
 
 /** Redirect, path prefix, basic auth, and custom certificate for one domain. */
-export function DomainOptions({ projectId, domain, onSaved }: {
-  projectId: string; domain: Domain; onSaved: (deployment?: Deployment) => void;
+export function DomainOptions({ projectId, domain, redeploy: redeployDefault = true, onSaved }: {
+  projectId: string; domain: Domain; redeploy?: boolean; onSaved: (deployment?: Deployment) => void;
 }) {
   const current = domain.options ?? EMPTY;
   const [redirectOn, setRedirectOn] = useState(current.redirect !== null);
@@ -19,6 +19,7 @@ export function DomainOptions({ projectId, domain, onSaved }: {
   const [certMode, setCertMode] = useState<'keep' | 'set' | 'remove'>('keep');
   const [cert, setCert] = useState('');
   const [key, setKey] = useState('');
+  const [redeploy, setRedeploy] = useState(redeployDefault);
   const action = useAction();
 
   const save = (event: FormEvent) => {
@@ -49,7 +50,7 @@ export function DomainOptions({ projectId, domain, onSaved }: {
       };
       const result = await api<{ deployment?: Deployment }>(
         `/compose-projects/${projectId}/domains/${domain.id}/options`,
-        { method: 'PUT', body: { options, basic_auth, certificate } });
+        { method: 'PUT', body: { options, basic_auth, certificate, redeploy } });
       setUsers(''); setCert(''); setKey(''); setAuthMode('keep'); setCertMode('keep');
       onSaved(result.deployment);
     });
@@ -88,7 +89,8 @@ export function DomainOptions({ projectId, domain, onSaved }: {
         <textarea required aria-label="Private key PEM" className="mono" rows={4} placeholder="-----BEGIN PRIVATE KEY-----" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" />
       </>}
     </>}
-    <button className="action" disabled={action.busy}>Save and redeploy</button>
+    <label className="check"><input type="checkbox" checked={redeploy} onChange={(e) => setRedeploy(e.target.checked)} /> Redeploy now (otherwise the options apply with the next deployment)</label>
+    <button className="action" disabled={action.busy}>{redeploy ? 'Save and redeploy' : 'Save'}</button>
     <ErrorLine error={action.error} />
   </form>;
 }

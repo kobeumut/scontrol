@@ -100,6 +100,55 @@ test('rejects a duplicate domain, a bad domain and a bad service name', async ()
   await expect(row(domain)).toHaveCount(0);
 });
 
+test('domains can be added, edited and removed without a redeploy', async () => {
+  const redeploy = page.getByLabel('Redeploy now when domains change');
+  await expect(redeploy).toBeChecked();
+  const domain = `${unique('nodeploy')}.example.test`;
+  const response = (method: string, match: RegExp) =>
+    page.waitForResponse((r) => r.request().method() === method && match.test(r.url()));
+  try {
+    await redeploy.uncheck();
+    const added = response('POST', /\/domains$/);
+    await addDomain(domain);
+    const addRes = await added;
+    expect(addRes.request().postDataJSON()).toMatchObject({ domain, redeploy: false });
+    expect((await addRes.json()).deployment).toBeNull();
+    await expect(row(domain)).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: 'takes effect with the next deployment' })).toBeVisible();
+
+    // The options form follows the switch and says what it will do.
+    const form = await openOptions(domain);
+    await expect(form.getByLabel('Redeploy now (otherwise')).not.toBeChecked();
+    await expect(form.getByRole('button', { name: 'Save and redeploy' })).toHaveCount(0);
+    await form.getByLabel('Path prefix').fill('/later/');
+    const saved = response('PUT', /\/options$/);
+    await form.getByRole('button', { name: 'Save', exact: true }).click();
+    const saveRes = await saved;
+    expect(saveRes.request().postDataJSON()).toMatchObject({ redeploy: false, options: { path_prefix: '/later/' } });
+    expect((await saveRes.json()).deployment).toBeNull();
+    await expect(form).toHaveCount(0);
+    await expect(row(domain).getByRole('button', { name: /^options/ })).toHaveText('options •');
+
+    const removed = response('DELETE', /\/domains\/[0-9a-f-]+\?redeploy=false$/);
+    await row(domain).getByRole('button', { name: 'remove' }).click();
+    expect((await (await removed).json()).deployment).toBeNull();
+    await expect(row(domain)).toHaveCount(0);
+  } finally {
+    await redeploy.check();
+  }
+
+  // Back on, changes queue a deployment again.
+  const other = `${unique('deploy')}.example.test`;
+  const added = response('POST', /\/domains$/);
+  await addDomain(other);
+  const addRes = await added;
+  expect(addRes.request().postDataJSON()).toMatchObject({ redeploy: true });
+  expect((await addRes.json()).deployment).not.toBeNull();
+  await row(other).getByRole('button', { name: 'remove' }).click();
+  await expect(row(other)).toHaveCount(0);
+  expect(failures).toEqual([]);
+});
+
 test('a redirect, path prefix and basic auth are saved as domain options', async () => {
   const domain = `${unique('opts')}.example.test`;
   await addDomain(domain);

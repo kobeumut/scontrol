@@ -204,6 +204,10 @@ impl AdapterPort for LocalAdapter {
         firewall::apply_rule(params.port, params.protocol, params.allow).await
     }
 
+    async fn remove_firewall_rule(&self, params: RemoveFirewallRuleParams) -> CoreResult<()> {
+        firewall::remove_rule(params.port, params.protocol, params.allow).await
+    }
+
     async fn upsert_cron_job(&self, params: UpsertCronJobParams) -> CoreResult<()> {
         cron::upsert_job(
             &params.owner_username,

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT COUNT(*) FROM sites WHERE owner_user_id = $1) AS \"sites!\",\n                  (SELECT COUNT(*) FROM compose_projects WHERE owner_user_id = $1) AS \"services!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sites!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "services!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "48e0e12985403c1738054ec1ce87450f067a17b9295b0ac0a0a0de22e2e5566e"
+}
