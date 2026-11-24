@@ -1,5 +1,6 @@
 pub mod api_keys;
 pub mod audit;
+pub mod backup_schedules;
 pub mod backups;
 pub mod compose_projects;
 pub mod cron;

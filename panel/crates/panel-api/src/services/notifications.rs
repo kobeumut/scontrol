@@ -29,6 +29,7 @@ pub const EVENTS: &[&str] = &[
     "deploy_failed",
     "deploy_cancelled",
     "job_failed",
+    "backup_failed",
     "metric_alert",
     "metric_resolved",
 ];
@@ -459,6 +460,30 @@ impl Notification {
                     "finished_at": run.finished_at,
                     "duration_seconds": seconds,
                 },
+            }),
+            urgent: true,
+        }
+    }
+}
+
+impl Notification {
+    /// A failed scheduled backup. The error is already redacted of the S3
+    /// keys and the database password.
+    pub fn backup_failed(
+        schedule_name: &str,
+        source: &str,
+        run_id: Uuid,
+        schedule_id: Uuid,
+        error: &str,
+    ) -> Self {
+        let short: String = error.chars().take(MAX_BODY_ERROR_CHARS).collect();
+        Self {
+            event: "backup_failed",
+            title: format!("Scheduled backup failed: {schedule_name}"),
+            body: format!("Source: {source}\nError: {short}"),
+            data: json!({
+                "schedule": { "id": schedule_id, "name": schedule_name },
+                "run": { "id": run_id, "source": source, "error": data_error(error) },
             }),
             urgent: true,
         }

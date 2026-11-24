@@ -30,12 +30,15 @@ pub struct RunRow {
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// `manual` or `schedule`.
+    pub trigger: String,
+    pub schedule_id: Option<Uuid>,
 }
 
 const DEST_COLUMNS: &str = "id, name, endpoint, region, bucket, prefix, retention_count, \
      credential_ciphertext, created_at, updated_at";
 const RUN_COLUMNS: &str = "id, destination_id, kind, source, status, object_key, size_bytes, \
-     pruned, error, started_at, finished_at";
+     pruned, error, started_at, finished_at, trigger, schedule_id";
 
 pub struct DestinationFields<'a> {
     pub name: &'a str,
@@ -125,14 +128,31 @@ pub async fn start_run(
     kind: &str,
     source: &str,
 ) -> sqlx::Result<RunRow> {
+    start_run_for(pool, destination_id, kind, source, None).await
+}
+
+/// Records a `running` row; `schedule_id` marks a scheduled run.
+pub async fn start_run_for(
+    pool: &PgPool,
+    destination_id: Uuid,
+    kind: &str,
+    source: &str,
+    schedule_id: Option<Uuid>,
+) -> sqlx::Result<RunRow> {
     sqlx::query_as(&format!(
-        "INSERT INTO backup_runs (id, destination_id, kind, source)
-         VALUES ($1, $2, $3, $4) RETURNING {RUN_COLUMNS}"
+        "INSERT INTO backup_runs (id, destination_id, kind, source, trigger, schedule_id)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {RUN_COLUMNS}"
     ))
     .bind(Uuid::new_v4())
     .bind(destination_id)
     .bind(kind)
     .bind(source)
+    .bind(if schedule_id.is_some() {
+        "schedule"
+    } else {
+        "manual"
+    })
+    .bind(schedule_id)
     .fetch_one(pool)
     .await
 }
@@ -180,13 +200,19 @@ pub async fn fail_interrupted_runs(pool: &PgPool) -> sqlx::Result<u64> {
     .rows_affected())
 }
 
-pub async fn list_runs(pool: &PgPool, destination_id: Option<Uuid>) -> sqlx::Result<Vec<RunRow>> {
+pub async fn list_runs(
+    pool: &PgPool,
+    destination_id: Option<Uuid>,
+    schedule_id: Option<Uuid>,
+) -> sqlx::Result<Vec<RunRow>> {
     sqlx::query_as(&format!(
         "SELECT {RUN_COLUMNS} FROM backup_runs
          WHERE ($1::uuid IS NULL OR destination_id = $1)
+           AND ($2::uuid IS NULL OR schedule_id = $2)
          ORDER BY started_at DESC LIMIT 100"
     ))
     .bind(destination_id)
+    .bind(schedule_id)
     .fetch_all(pool)
     .await
 }

@@ -86,6 +86,7 @@ Status: ✅ done · 🟡 partial · ⬜ planned · ✖ out of scope.
 | Databases as services | Postgres, MySQL, MariaDB, Mongo, and Redis containers bound to `127.0.0.1` with persistent named volumes. An external port only through an explicit Nginx `stream` proxy plus UFW rule (Docker-published ports would bypass UFW) | D3 | ✅ |
 | Backups to S3 | Spawn the dump tool with argv and credentials in env. Stream through gzip into an in-process S3 multipart upload, or `rclone rcat` with env credentials. Retention by count; restore streams back | D3 | ✅ |
 | Volume backups | Optional stop, then `tar` streamed in-process from the volume mountpoint to S3, then start | D3 | ✅ |
+| Scheduled backups | Cron + time zone per database service or volume, run by the panel-api scheduler (secrets stay sealed in the panel), per-schedule retention, `backup_failed` notification | D3 | ✅ |
 | Scheduled jobs | Generated systemd timers (`OnCalendar=`, timezone; cron converted, Vixie day-of-month/day-of-week OR kept) running `docker compose exec -T` argv through the agent's helper mode. Runs recorded next to their masked 5 MiB logs and collected into `job_runs`; failures notify `job_failed` | D3 | ✅ (needs live E2E) |
 | Server and container metrics | Agent samples `/proc` and cgroup v2 every 10–30 s, with no process spawn. Kept as a downsampled ring in PostgreSQL. Threshold alerts fire on edge transitions | D4 | ✅ |
 | Request stats | Nginx JSON `log_format`, read incrementally with offset tracking and aggregated into PostgreSQL | D4 | ✅ |
@@ -134,7 +135,7 @@ These are targets for the D0–D4 work. They are not measured yet. `TASK.md` tra
 - Done: application model with image and Dockerfile sources, deploy keys, HTTPS tokens, GitHub App installation tokens, private Docker registries, projects/environments with env layering, Nixpacks/Railpack/buildpacks builders, and static apps.
 
 **D3: Data.**
-- Database services, S3 backups and restore, volume backups, and systemd-timer schedules.
+- Database services, S3 backups and restore, volume backups, systemd-timer schedules, and scheduled (cron) database/volume backups with per-schedule retention.
 - Done: database services (generated sealed credentials, loopback-only ports, opt-in outside access).
 
 **D4: Observability.**
