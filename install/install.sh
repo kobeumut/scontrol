@@ -10,6 +10,11 @@ readonly PROJECT_NAME="scontrol"
 readonly INSTALL_ROOT="/opt/scontrol"
 readonly CONFIG_ROOT="/etc/scontrol"
 readonly DATA_ROOT="/var/lib/scontrol"
+# ACME HTTP-01 webroot. It lives outside the 0750 data root (like the static
+# releases in /srv/scontrol/static) because Nginx serves challenges as its
+# unprivileged worker user, which must traverse every parent directory.
+readonly ACME_WEBROOT="/srv/scontrol/acme"
+readonly LEGACY_ACME_WEBROOT="${DATA_ROOT}/acme"
 readonly RUNTIME_ROOT="/run/scontrol"
 readonly PANEL_USER="scontrol"
 readonly PANEL_GROUP="scontrol"
@@ -300,7 +305,7 @@ nginx_sites_available = "/etc/nginx/sites-available"
 nginx_sites_enabled = "/etc/nginx/sites-enabled"
 systemd_unit_dir = "/etc/systemd/system"
 docker_projects_root = "/var/lib/scontrol/docker"
-acme_webroot = "/var/lib/scontrol/acme"
+acme_webroot = "${ACME_WEBROOT}"
 letsencrypt_live_dir = "/etc/letsencrypt/live"
 deploy_timeout_secs = 1800
 deployment_log_max_bytes = 5242880
@@ -325,13 +330,40 @@ EOF
 # (certbot --webroot). The deploy hook reloads Nginx after each renewal so
 # renewed certificates are picked up; it is a fixed command, not user input.
 configure_acme_webroot() {
-  install -d -o root -g root -m 0755 /var/lib/scontrol/acme
+  install -d -o root -g root -m 0755 /srv/scontrol "$ACME_WEBROOT"
+  migrate_legacy_acme_webroot
   install -d -o root -g root -m 0755 /etc/letsencrypt/renewal-hooks/deploy
   cat > /etc/letsencrypt/renewal-hooks/deploy/scontrol-reload-nginx <<'HOOK'
 #!/bin/sh
 exec systemctl reload nginx
 HOOK
   chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/scontrol-reload-nginx
+}
+
+# Installs before this change used ${DATA_ROOT}/acme, which the Nginx worker
+# cannot reach through the 0750 data root, so HTTP-01 challenges answered 404.
+# Existing Compose vhosts and certbot renewal configs are pointed at the new
+# webroot (fixed strings only), and the old path becomes a symlink so a
+# renewal config this misses still writes where Nginx now reads.
+migrate_legacy_acme_webroot() {
+  local file changed=false
+  for file in /etc/nginx/sites-available/scontrol-compose-*.conf /etc/letsencrypt/renewal/*.conf; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    if grep -qF "$LEGACY_ACME_WEBROOT" "$file"; then
+      sed -i "s#${LEGACY_ACME_WEBROOT}#${ACME_WEBROOT}#g" "$file"
+      changed=true
+    fi
+  done
+  if [[ -d "$LEGACY_ACME_WEBROOT" && ! -L "$LEGACY_ACME_WEBROOT" ]]; then
+    cp -a "$LEGACY_ACME_WEBROOT"/. "$ACME_WEBROOT"/ 2>/dev/null || true
+    rm -rf -- "$LEGACY_ACME_WEBROOT"
+  fi
+  if [[ ! -e "$LEGACY_ACME_WEBROOT" ]]; then
+    ln -s "$ACME_WEBROOT" "$LEGACY_ACME_WEBROOT"
+  fi
+  if [[ "$changed" == true ]] && command -v nginx >/dev/null 2>&1; then
+    nginx -t && systemctl reload nginx || log "warning: nginx did not accept the migrated ACME webroot; check nginx -t"
+  fi
 }
 
 # Database services are reachable from outside only through generated Nginx

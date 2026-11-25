@@ -20,6 +20,7 @@ pub mod projects;
 pub mod registries;
 pub mod scheduled_jobs;
 pub mod servers;
+pub mod shared_network;
 pub mod sites;
 pub mod templates;
 pub mod terminal;

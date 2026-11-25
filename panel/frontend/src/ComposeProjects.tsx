@@ -424,6 +424,7 @@ function ProjectDetail({ id, onBack, onOpen }: { id: string; onBack: () => void;
       {!isStatic && <ProjectTerminal projectId={id} refreshKey={latest?.status} />}
       <LayeredVariables path={`/compose-projects/${id}/variables`} layer="service" title="Variables"
         hint="Write-only. Merged at each deployment: project → environment → this service, the most specific value wins. Stored values are never shown again." />
+      {!isStatic && <SharedNetworkPanel key={id} projectId={id} />}
       <RegistryPanel projectId={id} />
       {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
       {gitCheckout(project.data.source) && <Webhook projectId={id} />}
@@ -679,6 +680,51 @@ function Domains({ projectId, isStatic, onDeploy }: {
  * key's private half never leaves the server; the token is never shown again.
  */
 /** Which private registry the project's image pulls use. */
+type SharedNetwork = {
+  network: string; joined: boolean; always: boolean; supported: boolean;
+  databases: { id: string; name: string; engine: string; host: string; port: number }[];
+};
+
+function SharedNetworkPanel({ projectId }: { projectId: string }) {
+  const current = useApi<SharedNetwork>(`/compose-projects/${projectId}/shared-network`);
+  const action = useAction();
+  const [saved, setSaved] = useState(false);
+  // Shown right away while the change is saved; the response replaces it.
+  const [pending, setPending] = useState<boolean>();
+  const [updated, setUpdated] = useState<SharedNetwork>();
+  const change = (joined: boolean) => {
+    setSaved(false); setPending(joined);
+    return action.run(async () => {
+      try {
+        setUpdated(await api<SharedNetwork>(`/compose-projects/${projectId}/shared-network`, { method: 'PUT', body: { joined } }));
+        setSaved(true);
+      } finally { setPending(undefined); }
+    });
+  };
+  const data = updated ?? current.data;
+  return <>
+    <h3>Database network</h3>
+    <StateView state={current} />
+    {data && <>
+      {data.always
+        ? <p className="hint">This database service is always on its environment&apos;s internal network <code>{data.network}</code>.</p>
+        : <label className="check">
+            <input type="checkbox" checked={pending ?? data.joined} disabled={action.busy || !data.supported}
+              onChange={(e) => change(e.target.checked)} />
+            Join the environment&apos;s internal network <code>{data.network}</code>
+          </label>}
+      {data.databases.length > 0
+        ? <table><thead><tr><th>Database service</th><th>Engine</th><th>Address on the network</th></tr></thead>
+            <tbody>{data.databases.map((d) => <tr key={d.id}><td>{d.name}</td><td>{d.engine}</td><td><code>{d.host}:{d.port}</code></td></tr>)}</tbody>
+          </table>
+        : <p className="hint">No database services in this environment on this server yet.</p>}
+      {!data.always && <p className="hint">Joined containers reach database services of the same environment by name, without the host&apos;s loopback port. Applies from the next deployment. Docker also registers every service name on this network, so keep service names unique across joined services. Previews never join.</p>}
+    </>}
+    <ErrorLine error={action.error} />
+    {saved && <p className="state" role="status">Saved. Redeploy to apply.</p>}
+  </>;
+}
+
 function RegistryPanel({ projectId }: { projectId: string }) {
   const current = useApi<{ registry_id: string | null }>(`/compose-projects/${projectId}/registry`);
   const action = useAction();

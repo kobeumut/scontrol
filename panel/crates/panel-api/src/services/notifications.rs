@@ -1,4 +1,4 @@
-//! Deployment, scheduled-job, and metric-alert notifications: Slack, Discord, Telegram,
+//! Deployment, scheduled-job, metric-alert, backup, and Docker cleanup notifications: Slack, Discord, Telegram,
 //! ntfy, Gotify, a generic signed webhook, and SMTP.
 //!
 //! Each channel has non-secret settings (`ChannelConfig`, stored as JSON)
@@ -31,6 +31,9 @@ pub const EVENTS: &[&str] = &[
     "job_failed",
     "metric_alert",
     "metric_resolved",
+    "backup_succeeded",
+    "backup_failed",
+    "docker_cleanup_finished",
 ];
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -465,6 +468,156 @@ impl Notification {
     }
 }
 
+/// Human-readable byte count for message bodies (binary units).
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes.max(0) as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", bytes.max(0))
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+impl Notification {
+    /// A finished backup or restore run: `backup_succeeded` or
+    /// `backup_failed`. The S3 credentials never reach this point, and the
+    /// stored error was already redacted against the database password and
+    /// the S3 keys by the run task.
+    pub fn backup_run(run: &db::backups::RunRow, destination: &str) -> Option<Self> {
+        let succeeded = match run.status.as_str() {
+            "succeeded" => true,
+            "failed" => false,
+            _ => return None,
+        };
+        let what = match run.kind.as_str() {
+            "database_backup" => "Database backup",
+            "database_restore" => "Database restore",
+            "volume_backup" => "Volume backup",
+            "volume_restore" => "Volume restore",
+            _ => "Backup",
+        };
+        let one_line = |s: &str| s.replace(['\n', '\r'], " ");
+        let seconds = run
+            .finished_at
+            .map(|end| (end - run.started_at).num_seconds().max(0));
+        let mut body = format!(
+            "Source: {}\nDestination: {}",
+            one_line(&run.source),
+            one_line(destination)
+        );
+        if let Some(key) = &run.object_key {
+            body.push_str(&format!("\nObject: {}", one_line(key)));
+        }
+        if let Some(size) = run.size_bytes {
+            body.push_str(&format!("\nSize: {}", human_bytes(size)));
+        }
+        if run.pruned > 0 {
+            body.push_str(&format!("\nOld backups pruned: {}", run.pruned));
+        }
+        if let Some(seconds) = seconds {
+            body.push_str(&format!("\nDuration: {seconds}s"));
+        }
+        if let Some(error) = &run.error {
+            let error: String = error.chars().take(MAX_BODY_ERROR_CHARS).collect();
+            body.push_str(&format!("\nError: {error}"));
+        }
+        Some(Self {
+            event: if succeeded {
+                "backup_succeeded"
+            } else {
+                "backup_failed"
+            },
+            title: format!(
+                "{what} {}: {}",
+                if succeeded { "succeeded" } else { "failed" },
+                one_line(&run.source)
+            ),
+            body,
+            data: json!({
+                "destination": { "id": run.destination_id, "name": destination },
+                "run": {
+                    "id": run.id,
+                    "kind": run.kind,
+                    "source": run.source,
+                    "status": run.status,
+                    "object_key": run.object_key,
+                    "size_bytes": run.size_bytes,
+                    "pruned": run.pruned,
+                    "error_message": run.error.as_deref().map(data_error),
+                    "started_at": run.started_at,
+                    "finished_at": run.finished_at,
+                    "duration_seconds": seconds,
+                },
+            }),
+            urgent: !succeeded,
+        })
+    }
+
+    /// A finished Docker cleanup (manual or scheduled), succeeded or failed.
+    pub fn docker_cleanup(run: &db::observability::CleanupRun, server: &str) -> Option<Self> {
+        let succeeded = match run.status.as_str() {
+            "succeeded" => true,
+            "failed" => false,
+            _ => return None,
+        };
+        let freed = run.images_freed_bytes.max(0) + run.builder_freed_bytes.max(0);
+        let seconds = run
+            .finished_at
+            .map(|end| (end - run.started_at).num_seconds().max(0));
+        let mut body = format!(
+            "Server: {server}\nTrigger: {}\nImages older than: {}h",
+            run.trigger, run.older_than_hours
+        );
+        if succeeded {
+            body.push_str(&format!(
+                "\nFreed: {} (images {}, build cache {})",
+                human_bytes(freed),
+                human_bytes(run.images_freed_bytes),
+                human_bytes(run.builder_freed_bytes)
+            ));
+        }
+        if let Some(seconds) = seconds {
+            body.push_str(&format!("\nDuration: {seconds}s"));
+        }
+        if let Some(error) = &run.error_message {
+            let error: String = error.chars().take(MAX_BODY_ERROR_CHARS).collect();
+            body.push_str(&format!("\nError: {error}"));
+        }
+        Some(Self {
+            event: "docker_cleanup_finished",
+            title: if succeeded {
+                format!("Docker cleanup on {server} freed {}", human_bytes(freed))
+            } else {
+                format!("Docker cleanup failed on {server}")
+            },
+            body,
+            data: json!({
+                "server": { "id": run.server_id, "name": server },
+                "run": {
+                    "id": run.id,
+                    "trigger": run.trigger,
+                    "status": run.status,
+                    "older_than_hours": run.older_than_hours,
+                    "images_freed_bytes": run.images_freed_bytes,
+                    "builder_freed_bytes": run.builder_freed_bytes,
+                    "freed_bytes": freed,
+                    "error_message": run.error_message.as_deref().map(data_error),
+                    "started_at": run.started_at,
+                    "finished_at": run.finished_at,
+                    "duration_seconds": seconds,
+                },
+            }),
+            urgent: !succeeded,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Notifier {
     secrets: SecretBox,
@@ -529,6 +682,61 @@ impl Notifier {
             )
             .await;
         });
+    }
+
+    /// Notifies `backup_succeeded` / `backup_failed` channels about a
+    /// finished backup or restore run, in the background.
+    pub fn backup_run_finished(&self, db: PgPool, run_id: Uuid) {
+        let notifier = self.clone();
+        tokio::spawn(async move {
+            let lookup = async {
+                let Some(run) = db::backups::find_run(&db, run_id).await? else {
+                    return anyhow::Ok(None);
+                };
+                let destination = db::backups::find_destination(&db, run.destination_id)
+                    .await?
+                    .map(|d| d.name)
+                    .unwrap_or_else(|| run.destination_id.to_string());
+                Ok(Notification::backup_run(&run, &destination))
+            };
+            match lookup.await {
+                Ok(Some(notification)) => notifier.send_to_subscribers(&db, &notification).await,
+                Ok(None) => {}
+                Err(error) => tracing::warn!(%run_id, %error, "backup notification failed"),
+            }
+        });
+    }
+
+    /// Notifies `docker_cleanup_finished` channels, in the background.
+    pub fn docker_cleanup_finished(&self, db: PgPool, run: db::observability::CleanupRun) {
+        let notifier = self.clone();
+        tokio::spawn(async move {
+            let server = match db::servers::find(&db, run.server_id).await {
+                Ok(Some(server)) => server.name,
+                _ if run.server_id == db::servers::LOCAL_SERVER_ID => "this server".to_string(),
+                _ => run.server_id.to_string(),
+            };
+            if let Some(notification) = Notification::docker_cleanup(&run, &server) {
+                notifier.send_to_subscribers(&db, &notification).await;
+            }
+        });
+    }
+
+    /// Delivers to every enabled channel subscribed to the event.
+    async fn send_to_subscribers(&self, db: &PgPool, notification: &Notification) {
+        match db::notifications::list_for_event(db, notification.event).await {
+            Ok(channels) => {
+                futures::future::join_all(
+                    channels
+                        .iter()
+                        .map(|channel| self.deliver_and_record(db, channel, notification)),
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(event = notification.event, %error, "notification lookup failed")
+            }
+        }
     }
 
     /// Notifies `job_failed` channels about a failed run, in the background.
@@ -793,6 +1001,91 @@ async fn send_email(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_and_cleanup_notifications_carry_status_and_bounded_errors() {
+        use chrono::Utc;
+        let now = Utc::now();
+        let mut run = db::backups::RunRow {
+            id: Uuid::new_v4(),
+            destination_id: Uuid::new_v4(),
+            kind: "volume_backup".into(),
+            source: "shop/data\nInjected: line".into(),
+            status: "running".into(),
+            object_key: None,
+            size_bytes: None,
+            pruned: 0,
+            error: None,
+            started_at: now - chrono::Duration::seconds(42),
+            finished_at: None,
+        };
+        // A run still in progress is not notified.
+        assert!(Notification::backup_run(&run, "r2").is_none());
+
+        run.status = "succeeded".into();
+        run.object_key = Some("p/volume-shop-data-1.tar.gz".into());
+        run.size_bytes = Some(3 * 1024 * 1024);
+        run.pruned = 2;
+        run.finished_at = Some(now);
+        let ok = Notification::backup_run(&run, "r2").unwrap();
+        assert_eq!(ok.event, "backup_succeeded");
+        assert!(!ok.urgent);
+        assert_eq!(
+            ok.title,
+            "Volume backup succeeded: shop/data Injected: line"
+        );
+        assert!(ok.body.contains("Size: 3.0 MiB"), "{}", ok.body);
+        assert!(ok.body.contains("Old backups pruned: 2"));
+        assert!(ok.body.contains("Duration: 42s"));
+        assert_eq!(ok.data["run"]["duration_seconds"], 42);
+
+        run.kind = "database_restore".into();
+        run.status = "failed".into();
+        run.error = Some("x".repeat(10_000));
+        let failed = Notification::backup_run(&run, "r2").unwrap();
+        assert_eq!(failed.event, "backup_failed");
+        assert!(failed.urgent);
+        assert!(failed.title.starts_with("Database restore failed"));
+        assert!(failed.body.len() < 1_000);
+        assert!(
+            failed.data["run"]["error_message"].as_str().unwrap().len()
+                <= MAX_DATA_ERROR_CHARS + TRUNCATION_MARKER.len()
+        );
+
+        let mut cleanup = db::observability::CleanupRun {
+            id: Uuid::new_v4(),
+            server_id: Uuid::nil(),
+            trigger: "schedule".into(),
+            status: "succeeded".into(),
+            older_than_hours: 168,
+            started_at: now,
+            finished_at: Some(now),
+            images_freed_bytes: 2 * 1024 * 1024 * 1024,
+            builder_freed_bytes: 512,
+            error_message: None,
+        };
+        let done = Notification::docker_cleanup(&cleanup, "edge-1").unwrap();
+        assert_eq!(done.event, "docker_cleanup_finished");
+        assert!(!done.urgent);
+        assert_eq!(done.title, "Docker cleanup on edge-1 freed 2.0 GiB");
+        assert!(done.body.contains("build cache 512 B"), "{}", done.body);
+        cleanup.status = "failed".into();
+        cleanup.error_message = Some("docker: daemon not running".into());
+        let failed = Notification::docker_cleanup(&cleanup, "edge-1").unwrap();
+        assert!(failed.urgent);
+        assert_eq!(failed.title, "Docker cleanup failed on edge-1");
+        assert!(!failed.body.contains("Freed"));
+        assert!(failed.body.contains("Error: docker: daemon not running"));
+        cleanup.status = "running".into();
+        assert!(Notification::docker_cleanup(&cleanup, "edge-1").is_none());
+        for event in [
+            "backup_succeeded",
+            "backup_failed",
+            "docker_cleanup_finished",
+        ] {
+            assert!(EVENTS.contains(&event));
+        }
+    }
 
     fn email(security: SmtpSecurity, host: &str, username: Option<&str>) -> ChannelConfig {
         ChannelConfig::Email {

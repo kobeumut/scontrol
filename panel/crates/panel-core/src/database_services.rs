@@ -444,9 +444,100 @@ impl DatabaseExposure {
     }
 }
 
+/// Prefix of the per-environment internal Docker network that database
+/// services join (with their slug as DNS alias) and that other services of
+/// the same environment join when they opt in.
+pub const SHARED_NETWORK_PREFIX: &str = "scontrol-env-";
+/// Key of the shared network in a generated Compose override.
+pub const SHARED_NETWORK_KEY: &str = "scontrol_shared";
+
+/// The shared network of an environment: `scontrol-env-<uuid, no dashes>`.
+pub fn shared_network_name(environment_id: uuid::Uuid) -> String {
+    format!("{SHARED_NETWORK_PREFIX}{}", environment_id.simple())
+}
+
+/// Only names [`shared_network_name`] produces are accepted by the agent, so
+/// a request can never attach a service to an arbitrary Docker network.
+pub fn is_valid_shared_network_name(name: &str) -> bool {
+    name.strip_prefix(SHARED_NETWORK_PREFIX).is_some_and(|id| {
+        id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Attach a deployment's containers to its environment's internal network.
+///
+/// Docker adds every service name as a DNS alias on every network the
+/// service joins, so joining is opt-in for ordinary services: two projects
+/// on one network that both define, say, `redis` could resolve each other.
+/// A database service always joins, with its project slug as `alias`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SharedNetwork {
+    pub name: String,
+    /// Extra DNS name of the project's service on the network (database
+    /// services: the project slug).
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+impl SharedNetwork {
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_valid_shared_network_name(&self.name) {
+            return Err(format!("invalid shared network name: {}", self.name));
+        }
+        if let Some(alias) = &self.alias {
+            if !crate::types::validate::is_valid_project_slug(alias) {
+                return Err(format!("invalid shared network alias: {alias}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_network_names_are_generated_and_strictly_checked() {
+        let id = uuid::Uuid::parse_str("6f1c2d3e-4a5b-4c6d-8e7f-001122334455").unwrap();
+        let name = shared_network_name(id);
+        assert_eq!(name, "scontrol-env-6f1c2d3e4a5b4c6d8e7f001122334455");
+        assert!(is_valid_shared_network_name(&name));
+        for bad in [
+            "bridge",
+            "host",
+            "scontrol-env-",
+            "scontrol-env-6F1C2D3E4A5B4C6D8E7F001122334455",
+            "scontrol-env-6f1c2d3e4a5b4c6d8e7f00112233445",
+            "scontrol-env-6f1c2d3e4a5b4c6d8e7f001122334455x",
+            "other_default",
+        ] {
+            assert!(!is_valid_shared_network_name(bad), "{bad}");
+        }
+        let ok = SharedNetwork {
+            name: name.clone(),
+            alias: Some("main-db".into()),
+        };
+        assert!(ok.validate().is_ok());
+        assert!(SharedNetwork {
+            name: name.clone(),
+            alias: None
+        }
+        .validate()
+        .is_ok());
+        assert!(SharedNetwork {
+            name: "bridge".into(),
+            alias: None
+        }
+        .validate()
+        .is_err());
+        assert!(SharedNetwork {
+            name,
+            alias: Some("-x".into())
+        }
+        .validate()
+        .is_err());
+    }
 
     fn spec(engine: ManagedDatabaseEngine) -> DatabaseServiceSpec {
         DatabaseServiceSpec {

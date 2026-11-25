@@ -856,3 +856,27 @@ pub async fn set_git_token_host(
     .await?;
     Ok(())
 }
+
+/// Whether the service joins its environment's shared database network
+/// (runtime query: the column is read and written only here).
+pub async fn joins_shared_network(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT join_shared_network FROM compose_projects WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(false))
+}
+
+pub async fn set_joins_shared_network(pool: &PgPool, id: Uuid, join: bool) -> sqlx::Result<bool> {
+    Ok(sqlx::query(
+        "UPDATE compose_projects SET join_shared_network = $2, updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(join)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
+}

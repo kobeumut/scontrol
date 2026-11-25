@@ -263,8 +263,11 @@ fn default_docker_volumes_root() -> PathBuf {
     PathBuf::from("/var/lib/docker/volumes")
 }
 
+/// Outside the 0750 data root, like the static releases: Nginx answers
+/// HTTP-01 challenges as its unprivileged worker user, which must be able to
+/// traverse every directory down to the webroot.
 fn default_acme_webroot() -> PathBuf {
-    PathBuf::from("/var/lib/scontrol/acme")
+    PathBuf::from("/srv/scontrol/acme")
 }
 
 fn default_letsencrypt_live_dir() -> PathBuf {

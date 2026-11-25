@@ -60,6 +60,7 @@ use panel_core::adapters::{
     DeploymentLogParams, FollowComposeLogsParams, LogLines, RemoveComposeProjectParams,
     WriteComposeEnvironmentParams, LOG_LINES_CAPACITY,
 };
+use panel_core::database_services::{SharedNetwork, SHARED_NETWORK_KEY};
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::previews::{ResourceLimits, PREVIEW_PIDS_LIMIT};
 use panel_core::types::{
@@ -313,22 +314,46 @@ async fn deploy_steps(
                 .collect()
         })
         .unwrap_or_default();
-    let override_body =
-        if params.domains.is_empty() && params.resource_limits.is_none() && !params.ephemeral {
-            let _ = tokio::fs::remove_file(&override_path).await;
-            None
-        } else {
-            let body = render_override(
-                &params.domains,
-                &service_names,
-                params.resource_limits.as_ref(),
-                params.ephemeral,
-            )?;
-            tokio::fs::write(&override_path, &body)
-                .await
-                .map_err(|e| CoreError::Io(format!("writing Compose override: {e}")))?;
-            Some(body)
-        };
+    let shared = match &params.shared_network {
+        Some(_) if params.ephemeral => {
+            return Err(CoreError::Validation(
+                "previews cannot join an environment network".into(),
+            ))
+        }
+        Some(network) => {
+            network.validate().map_err(CoreError::Validation)?;
+            let services = shared_network_targets(&compose)?;
+            if services.is_empty() {
+                None
+            } else {
+                log.step(&format!("attaching services to network {}", network.name))
+                    .await?;
+                ensure_shared_network(&network.name).await?;
+                Some(SharedOverride { network, services })
+            }
+        }
+        None => None,
+    };
+    let override_body = if params.domains.is_empty()
+        && params.resource_limits.is_none()
+        && !params.ephemeral
+        && shared.is_none()
+    {
+        let _ = tokio::fs::remove_file(&override_path).await;
+        None
+    } else {
+        let body = render_override(
+            &params.domains,
+            &service_names,
+            params.resource_limits.as_ref(),
+            params.ephemeral,
+            shared.as_ref(),
+        )?;
+        tokio::fs::write(&override_path, &body)
+            .await
+            .map_err(|e| CoreError::Io(format!("writing Compose override: {e}")))?;
+        Some(body)
+    };
 
     let paths = ProjectPaths {
         code_dir,
@@ -1453,6 +1478,7 @@ fn render_override(
     service_names: &[String],
     limits: Option<&ResourceLimits>,
     ephemeral: bool,
+    shared: Option<&SharedOverride<'_>>,
 ) -> CoreResult<String> {
     let mut services = serde_yaml::Mapping::new();
     if let Some(limits) = limits {
@@ -1521,9 +1547,134 @@ fn render_override(
         }
     }
     let mut document = serde_yaml::Mapping::new();
+    if let Some(shared) = shared {
+        for target in &shared.services {
+            if !validate::is_valid_service_name(&target.name) {
+                return Err(CoreError::Validation(format!(
+                    "invalid service name: {}",
+                    target.name
+                )));
+            }
+            let entry = services
+                .entry(Yaml::String(target.name.clone()))
+                .or_insert_with(|| Yaml::Mapping(serde_yaml::Mapping::new()));
+            let Some(service) = entry.as_mapping_mut() else {
+                continue;
+            };
+            let mut networks = serde_yaml::Mapping::new();
+            // A service without `networks` is on `default` only; listing the
+            // shared network alone would take it off `default`. A service
+            // with its own list keeps it: Compose merges the two.
+            if !target.declares_networks {
+                networks.insert("default".into(), Yaml::Mapping(serde_yaml::Mapping::new()));
+            }
+            let mut attachment = serde_yaml::Mapping::new();
+            if let Some(alias) = &shared.network.alias {
+                attachment.insert(
+                    "aliases".into(),
+                    Yaml::Sequence(vec![Yaml::String(alias.clone())]),
+                );
+            }
+            networks.insert(SHARED_NETWORK_KEY.into(), Yaml::Mapping(attachment));
+            service.insert("networks".into(), Yaml::Mapping(networks));
+        }
+        let mut network = serde_yaml::Mapping::new();
+        network.insert("name".into(), Yaml::String(shared.network.name.clone()));
+        network.insert("external".into(), Yaml::Bool(true));
+        let mut networks = serde_yaml::Mapping::new();
+        networks.insert(SHARED_NETWORK_KEY.into(), Yaml::Mapping(network));
+        document.insert("networks".into(), Yaml::Mapping(networks));
+    }
     document.insert("services".into(), Yaml::Mapping(services));
     serde_yaml::to_string(&Yaml::Mapping(document))
         .map_err(|e| CoreError::External(format!("rendering Compose override: {e}")))
+}
+
+/// An environment network to attach services to in the override.
+struct SharedOverride<'a> {
+    network: &'a SharedNetwork,
+    services: Vec<SharedTarget>,
+}
+
+#[derive(Debug, PartialEq)]
+struct SharedTarget {
+    name: String,
+    /// The Compose file lists the service's networks itself.
+    declares_networks: bool,
+}
+
+/// Services of a validated Compose file that can join the environment
+/// network: every service without `network_mode` (a service sharing another
+/// container's or the host's stack, or with networking off, has no networks
+/// of its own). A Compose file that defines a network under the reserved key
+/// is refused rather than silently redirected.
+fn shared_network_targets(compose: &Yaml) -> CoreResult<Vec<SharedTarget>> {
+    let compose = expand_merges(compose.clone())?;
+    if compose
+        .get("networks")
+        .and_then(Yaml::as_mapping)
+        .is_some_and(|networks| networks.contains_key(SHARED_NETWORK_KEY))
+    {
+        return Err(CoreError::Validation(format!(
+            "the network name {SHARED_NETWORK_KEY} is reserved for the environment network"
+        )));
+    }
+    let Some(services) = compose.get("services").and_then(Yaml::as_mapping) else {
+        return Ok(Vec::new());
+    };
+    Ok(services
+        .iter()
+        .filter_map(|(name, service)| {
+            let name = name.as_str()?;
+            if service
+                .get("network_mode")
+                .is_some_and(|mode| !mode.is_null())
+            {
+                return None;
+            }
+            Some(SharedTarget {
+                name: name.to_string(),
+                declares_networks: service
+                    .get("networks")
+                    .is_some_and(|networks| !networks.is_null()),
+            })
+        })
+        .collect())
+}
+
+/// Creates the environment's internal bridge network unless it exists.
+/// `--internal` keeps it off the outside world; containers keep their
+/// project network for egress and published ports. A concurrent deployment
+/// creating the same network first is not an error.
+async fn ensure_shared_network(name: &str) -> CoreResult<()> {
+    if !panel_core::database_services::is_valid_shared_network_name(name) {
+        return Err(CoreError::Validation(format!(
+            "invalid shared network name: {name}"
+        )));
+    }
+    let inspect = ["network", "inspect", "--format", "{{.Name}}", name];
+    let quick = Duration::from_secs(30);
+    if run_allow_nonzero_within("docker", &inspect, quick).await?.0 == 0 {
+        return Ok(());
+    }
+    let create = [
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--internal",
+        "--label",
+        "io.scontrol.network=environment",
+        name,
+    ];
+    let (code, _, stderr) = run_allow_nonzero_within("docker", &create, quick).await?;
+    if code == 0 || run_allow_nonzero_within("docker", &inspect, quick).await?.0 == 0 {
+        return Ok(());
+    }
+    let reason: String = stderr.trim().chars().take(300).collect();
+    Err(CoreError::External(format!(
+        "creating Docker network {name} failed: {reason}"
+    )))
 }
 
 fn tagged(tag: &str, value: Yaml) -> Yaml {
@@ -1851,6 +2002,15 @@ async fn apply_domains(
         tokio::fs::create_dir_all(&cfg.acme_webroot)
             .await
             .map_err(|e| CoreError::Io(format!("creating ACME webroot: {e}")))?;
+        if let Some(blocked) = nginx::untraversable_ancestor(&cfg.acme_webroot) {
+            log.step(&format!(
+                "warning: {} is not traversable by other users, so Nginx cannot serve \
+                 ACME challenges from {} (set acme_webroot to /srv/scontrol/acme)",
+                blocked.display(),
+                cfg.acme_webroot.display()
+            ))
+            .await?;
+        }
         let webroot = cfg.acme_webroot.to_string_lossy().into_owned();
         let args = certbot_webroot_args(&webroot, &binding.domain, email);
         let code = match run_streamed("certbot", &args, &[], log, CERTBOT_TIMEOUT).await {
@@ -4169,6 +4329,7 @@ mod tests {
             rollback: None,
             resource_limits: None,
             ephemeral: false,
+            shared_network: None,
         };
         let good = DatabaseDeployment {
             loopback_port: 25000,
@@ -4234,6 +4395,7 @@ mod tests {
             }),
             resource_limits: None,
             ephemeral: false,
+            shared_network: None,
         };
         let own = deployment_image_tag("shop", "web", target).unwrap();
         assert!(validate_project_params(&params(vec![pinned(own)])).is_ok());
@@ -4341,6 +4503,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
         )
         .unwrap();
         let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
@@ -4364,6 +4527,7 @@ mod tests {
             &["web".into(), "worker".into()],
             Some(&limits),
             true,
+            None,
         )
         .unwrap();
         let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
@@ -4394,9 +4558,89 @@ mod tests {
             memory_mb: 1,
             cpu_millis: 250,
         };
-        assert!(render_override(&[], &["web".into()], Some(&too_small), true).is_err());
-        assert!(render_override(&[], &["bad name".into()], Some(&limits), true).is_err());
-        assert!(render_override(&[], &["bad name".into()], None, true).is_err());
+        assert!(render_override(&[], &["web".into()], Some(&too_small), true, None).is_err());
+        assert!(render_override(&[], &["bad name".into()], Some(&limits), true, None).is_err());
+        assert!(render_override(&[], &["bad name".into()], None, true, None).is_err());
+    }
+
+    #[test]
+    fn override_attaches_services_to_the_environment_network() {
+        let compose: Yaml = serde_yaml::from_str(
+            "services:\n  web:\n    image: nginx\n  worker:\n    image: app\n    networks: [backend]\n  sidecar:\n    image: app\n    network_mode: service:web\nnetworks:\n  backend: {}\n",
+        )
+        .unwrap();
+        let services = shared_network_targets(&compose).unwrap();
+        assert_eq!(
+            services,
+            vec![
+                SharedTarget {
+                    name: "web".into(),
+                    declares_networks: false
+                },
+                SharedTarget {
+                    name: "worker".into(),
+                    declares_networks: true
+                },
+            ]
+        );
+        let network = SharedNetwork {
+            name: "scontrol-env-6f1c2d3e4a5b4c6d8e7f001122334455".into(),
+            alias: None,
+        };
+        let shared = SharedOverride {
+            network: &network,
+            services,
+        };
+        let rendered = render_override(
+            &[binding("a.example.com", "web", 40001, false)],
+            &[],
+            None,
+            false,
+            Some(&shared),
+        )
+        .unwrap();
+        let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
+        // `web` stays on its project network and keeps its domain port.
+        let web = &yaml["services"]["web"];
+        assert!(web["networks"]["default"].is_mapping());
+        assert!(web["networks"][SHARED_NETWORK_KEY].is_mapping());
+        assert_eq!(web["ports"][0], "127.0.0.1:40001:3000");
+        // `worker` lists its own networks, which Compose merges with ours.
+        let worker = &yaml["services"]["worker"];
+        assert!(worker["networks"].get("default").is_none());
+        assert!(worker["networks"][SHARED_NETWORK_KEY].is_mapping());
+        assert!(yaml["services"].get("sidecar").is_none());
+        assert_eq!(
+            yaml["networks"][SHARED_NETWORK_KEY]["name"],
+            "scontrol-env-6f1c2d3e4a5b4c6d8e7f001122334455"
+        );
+        assert_eq!(yaml["networks"][SHARED_NETWORK_KEY]["external"], true);
+
+        // A database service answers by its slug.
+        let network = SharedNetwork {
+            alias: Some("main-db".into()),
+            ..network
+        };
+        let shared = SharedOverride {
+            network: &network,
+            services: vec![SharedTarget {
+                name: DATABASE_SERVICE_NAME.into(),
+                declares_networks: false,
+            }],
+        };
+        let rendered = render_override(&[], &[], None, false, Some(&shared)).unwrap();
+        let yaml: Yaml = serde_yaml::from_str(&rendered).unwrap();
+        assert_eq!(
+            yaml["services"][DATABASE_SERVICE_NAME]["networks"][SHARED_NETWORK_KEY]["aliases"][0],
+            "main-db"
+        );
+
+        // The reserved key cannot be defined by the application.
+        let taken: Yaml = serde_yaml::from_str(
+            "services:\n  web:\n    image: nginx\nnetworks:\n  scontrol_shared: {}\n",
+        )
+        .unwrap();
+        assert!(shared_network_targets(&taken).is_err());
     }
 
     #[test]

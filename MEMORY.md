@@ -115,6 +115,14 @@ Durable project context that is not obvious from the code. Read it together with
 - **A log search counts matching lines, not scanned lines (decided 2026-11-05, GENE-85).** Docker's `--tail` applies before our filter, so a search over the last N lines missed older matches. The follower scans history up to an instant `T` and then follows `--since T`; splitting at one instant avoids both duplicates and gaps.
 - **Deleting a user removes what they own from the hosts first (decided 2026-11-22, GENE-230).** `sites`, `compose_projects`, and `projects` reference `users` with `ON DELETE CASCADE`, so deleting only the user would drop the panel rows while system resources (vhosts, containers, timers, crontabs, host databases) kept running unmanaged. The API refuses (409) unless `delete_resources=true`, which tears each resource down through its normal removal path before the user row is deleted; it never relies on the cascade for anything that exists on a host. Named Docker volumes and site system users are kept, matching manual removal.
 
+## Operational notifications and database networking (GENE-232)
+
+- **Database services share an internal network per environment; other services opt in (decided 2026-11-25).** Docker Compose registers every service name as a DNS alias on every network a service joins, including external ones (checked with Compose v5.0.1). Attaching every service of an environment automatically would let two projects that both define `redis` or `db` resolve each other, which Docker does not order reliably. Database services always join with their slug as alias; other services join only when the user turns it on.
+  - Why per environment, not per project or global: environments already separate production from staging, and a global network would let unrelated owners' containers reach each other's databases.
+  - Why `--internal`: the network only carries container-to-container traffic; containers keep their project network for egress and published ports.
+- **The ACME webroot lives under `/srv/scontrol/acme`, not the data root (decided 2026-11-25).** Opening the 0750 data root (`o+x`) would have exposed the traversal path to Docker project directories holding environment files; moving the webroot next to the static releases keeps the data root closed. The old path is kept as a symlink so renewal configs the installer misses still write where Nginx reads.
+- **Backup and cleanup runs notify after their row is finished (decided 2026-11-25).** The notification reads the stored row, so it carries exactly what the panel shows (already redacted) and is sent once per run.
+
 ## Open Items
 
 The full list is in `TASK.md`. The largest open items as of 2026-11-03 (after D0):

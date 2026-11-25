@@ -24,6 +24,8 @@ const KINDS: Record<Kind, { label: string; secret: string; secretRequired: boole
 const EVENT_LABELS: Record<string, string> = {
   deploy_succeeded: 'Deploy succeeded', deploy_failed: 'Deploy failed', deploy_cancelled: 'Deploy cancelled',
   job_failed: 'Scheduled job failed', metric_alert: 'Resource alert (CPU, memory, disk)', metric_resolved: 'Resource alert resolved',
+  backup_succeeded: 'Backup or restore succeeded', backup_failed: 'Backup or restore failed',
+  docker_cleanup_finished: 'Docker cleanup finished (freed space or failure)',
 };
 
 export function Notifications() {

@@ -14,6 +14,8 @@ type Credentials = {
   host: string; port: number; uri: string; external_uri: string | null;
 };
 
+/** Port each engine listens on inside its container (and on the environment network). */
+const ENGINE_PORTS: Record<DatabaseEngine, number> = { postgres: 5432, mysql: 3306, mariadb: 3306, mongo: 27017, redis: 6379 };
 const slugify = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
 
 export function Databases() {
@@ -151,6 +153,7 @@ function Detail({ service, onChanged, onRemoved }: { service: DatabaseService; o
     <p className="hint">{DATABASE_ENGINE_LABELS[service.spec.engine]} {service.spec.version} · listens on <span className="mono">127.0.0.1:{service.loopback_port}</span>
       {service.spec.engine !== 'redis' && <> · database <span className="mono">{service.spec.database_name}</span> · user <span className="mono">{service.spec.username}</span></>}.
       Deployment history, logs, and extra variables are under Compose projects ({project.slug}).</p>
+    <p className="hint">Containers of this environment&apos;s services that join its database network (Compose project → Database network) reach it at <span className="mono">{project.slug}:{ENGINE_PORTS[service.spec.engine]}</span>.</p>
     {message && <p className="state" role="status">{message}</p>}
 
     <h3>Connection</h3>
