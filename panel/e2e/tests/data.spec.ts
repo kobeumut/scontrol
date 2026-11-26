@@ -556,3 +556,72 @@ test('registries: form validation, presets, test typed login and duplicate name'
   await row(page, name).getByRole('button', { name: 'delete' }).click();
   await expect(row(page, name)).toHaveCount(0);
 });
+
+test('backups: schedule a database backup, run it now, pause, edit and delete it', async ({ page }) => {
+  const failures = watchForFailures(page);
+  await signIn(page);
+  const database = unique('sched-db');
+  await createDatabase(page, 'PostgreSQL', database);
+  const dest = unique('s3-sched');
+  await addDestination(page, dest, { prefix: 'e2e-sched' });
+
+  const section = page.locator('section', { has: page.getByRole('heading', { name: 'Scheduled backups' }) });
+  await section.getByRole('button', { name: 'Add schedule' }).click();
+  const form = section.locator('form');
+  const name = unique('nightly');
+  await form.getByLabel('Name', { exact: true }).fill(name);
+  const service = form.getByLabel('Database service');
+  const option = await service.locator('option', { hasText: database }).getAttribute('value');
+  await service.selectOption(option!);
+  await form.getByLabel('S3 destination').selectOption({ label: dest });
+  await form.getByLabel(/Backups to keep/).fill('3');
+  await form.getByLabel('Time zone').fill('UTC');
+
+  // The expression is checked as it is typed, and the next runs are shown.
+  await form.getByLabel(/Cron expression/).fill('0 3 * *');
+  await expect(form.getByText(/five fields/)).toBeVisible();
+  await form.getByLabel(/Cron expression/).fill('0 3 * * *');
+  await expect(form.getByText(/^Next runs:/)).toBeVisible();
+  await form.getByRole('button', { name: 'Create schedule' }).click();
+
+  const scheduleRow = section.locator('tr', { hasText: name });
+  await expect(scheduleRow).toContainText('0 3 * * *');
+  await expect(scheduleRow).toContainText(`${slugOf(database)} · postgres/app`);
+  await expect(scheduleRow).toContainText(dest);
+  await expect(scheduleRow).toContainText('never');
+
+  // Run now: the run uses the service's stored credentials and is listed as scheduled.
+  await scheduleRow.getByRole('button', { name: 'run now' }).click();
+  await expect(section.getByRole('status').filter({ hasText: `${name}: backup started.` })).toBeVisible();
+  const runs = section.locator('.card', { has: page.getByRole('heading', { name: `Runs of ${name}` }) });
+  await expect(runs.getByRole('row').nth(1)).toContainText('succeeded', { timeout: 30_000 });
+  await expect(runs.getByRole('row').nth(1)).toContainText(`e2e-sched/postgres-svc-${slugOf(database)}`);
+  await expect(scheduleRow).toContainText('succeeded', { timeout: 30_000 });
+  await runs.getByRole('button', { name: 'Close' }).click();
+
+  // Pause and resume.
+  await scheduleRow.getByRole('button', { name: 'pause' }).click();
+  await expect(scheduleRow).toContainText('paused');
+  await scheduleRow.getByRole('button', { name: 'resume' }).click();
+  await expect(scheduleRow.getByRole('button', { name: 'pause' })).toBeVisible();
+
+  // Edit the retention and the expression; the target stays fixed.
+  await scheduleRow.getByRole('button', { name: 'edit' }).click();
+  await expect(form.getByText(/fixed for the life of a schedule/)).toBeVisible();
+  await form.getByLabel(/Backups to keep/).fill('5');
+  await form.getByLabel(/Cron expression/).fill('30 2 * * 0');
+  await form.getByRole('button', { name: 'Save schedule' }).click();
+  await expect(scheduleRow).toContainText('30 2 * * 0');
+  const saved = (await (await page.request.get('/api/backups/schedules')).json()).find((s: { name: string }) => s.name === name);
+  expect(saved.retention_count).toBe(5);
+  expect(JSON.stringify(saved)).not.toMatch(/password|secret/i);
+
+  await scheduleRow.getByRole('button', { name: 'delete' }).click();
+  await expect(scheduleRow).toHaveCount(0);
+  await deleteDestination(page, dest);
+  await openTab(page, 'Databases');
+  await row(page, slugOf(database)).click();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(row(page, slugOf(database))).toHaveCount(0);
+  expect(failures).toEqual([]);
+});

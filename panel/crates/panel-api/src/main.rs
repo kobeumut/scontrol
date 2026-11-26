@@ -81,6 +81,12 @@ async fn main() -> anyhow::Result<()> {
         workers = config.deploy_workers,
         "deployment workers started"
     );
+    services::backup_schedules::start(services::backup_schedules::BackupContext {
+        db: state.db.clone(),
+        agents: state.agents.clone(),
+        notifier: state.notifier.clone(),
+        secret_box: state.secret_box.clone(),
+    });
     state.job_runs.start(
         state.db.clone(),
         state.agents.clone(),

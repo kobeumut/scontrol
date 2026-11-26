@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { api, formatTime, useApi } from './api';
+import { api, ComposeProject, formatTime, useApi } from './api';
 
 export type Destination = {
   id: string; name: string; endpoint: string; region: string; bucket: string; prefix: string;
@@ -9,7 +9,7 @@ export type Destination = {
 type Run = {
   id: string; destination_id: string; kind: string; source: string; status: string;
   object_key: string | null; size_bytes: number | null; pruned: number; error: string | null;
-  started_at: string; finished_at: string | null;
+  started_at: string; finished_at: string | null; trigger: 'manual' | 'schedule'; schedule_id: string | null;
 };
 
 type BackupObject = { key: string; size_bytes: number; last_modified: string };
@@ -89,6 +89,7 @@ export function Backups({ docker }: { docker: boolean }) {
           </tr>)}
         </tbody></table>)}
     </section>
+    {destinations.data && <ScheduledBackups destinations={destinations.data} docker={docker} />}
     {selected && <DestinationDetail key={selected.id} destination={selected} docker={docker} />}
   </>;
 }
@@ -186,7 +187,7 @@ function DestinationDetail({ destination, docker }: { destination: Destination; 
       : <table><thead><tr><th>Started</th><th>Kind</th><th>Source</th><th>Status</th><th>Size</th><th>Object</th></tr></thead><tbody>
         {runs.data.map((r) => <tr key={r.id}>
           <td className="small">{formatTime(r.started_at)}</td>
-          <td>{KIND_LABELS[r.kind] ?? r.kind}</td>
+          <td>{KIND_LABELS[r.kind] ?? r.kind}{r.trigger === 'schedule' ? <span className="muted small"> · scheduled</span> : null}</td>
           <td className="mono small">{r.source}</td>
           <td className={r.status === 'failed' ? 'error' : undefined} title={r.error ?? undefined}>
             {r.status}{r.error ? `: ${r.error}` : ''}{r.pruned > 0 ? ` (pruned ${r.pruned})` : ''}
@@ -300,5 +301,232 @@ function VolumeFields({ busy, label, onSubmit }: { busy: boolean; label: string;
       <label className="check"><input type="checkbox" checked={stop} onChange={(e) => setStop(e.target.checked)} /> Stop the service during the copy (restarted afterwards)</label>
     </div>
     <div className="toolbar"><button className="action" disabled={busy}>{label}</button></div>
+  </form>;
+}
+
+export type BackupSchedule = {
+  id: string; name: string; target_kind: 'database' | 'volume'; compose_project_id: string;
+  project_slug: string | null; project_name: string | null; server_id: string | null;
+  database_engine: string | null; database_name: string | null;
+  volume_name: string | null; service_name: string | null; stop_service: boolean;
+  s3_destination_id: string; destination_name: string | null;
+  cron_expression: string; timezone: string; retention_count: number; enabled: boolean;
+  next_run_at: string | null; last_run_at: string | null; last_run_id: string | null;
+  last_run_status: string | null; last_run_error: string | null;
+};
+
+type DatabaseServiceInfo = { project: ComposeProject; spec: { engine: string; database_name: string } };
+
+const BACKUP_CRON_PRESETS: [string, string][] = [
+  ['0 3 * * *', 'Daily at 03:00'], ['0 */6 * * *', 'Every 6 hours'], ['@hourly', 'Hourly'],
+  ['0 4 * * 0', 'Weekly (Sunday 04:00)'], ['0 5 1 * *', 'Monthly (1st, 05:00)'],
+];
+const browserZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+const zoneList = (): string[] => {
+  const intl = Intl as unknown as { supportedValuesOf?: (key: string) => string[] };
+  return ['UTC', ...(intl.supportedValuesOf?.('timeZone') ?? [])];
+};
+
+const describeTarget = (s: BackupSchedule) => s.target_kind === 'database'
+  ? `${s.project_slug ?? '(removed service)'} · ${s.database_engine ?? 'db'}/${s.database_name ?? '?'}`
+  : `${s.project_slug ?? '(removed service)'} · volume ${s.volume_name}${s.service_name ? ` (${s.service_name}${s.stop_service ? ', stopped' : ''})` : ''}`;
+
+function ScheduledBackups({ destinations, docker }: { destinations: Destination[]; docker: boolean }) {
+  const schedules = useApi<BackupSchedule[]>('/backups/schedules', 10000);
+  const [editing, setEditing] = useState<BackupSchedule | 'new' | null>(null);
+  const [history, setHistory] = useState<BackupSchedule>();
+  const [message, setMessage] = useState<string>();
+  const [busy, setBusy] = useState(false);
+
+  const act = async (action: () => Promise<string | undefined>) => {
+    setBusy(true); setMessage(undefined);
+    try { setMessage(await action()); schedules.reload(); } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+  };
+  const runNow = (s: BackupSchedule) => act(async () => {
+    await api(`/backups/schedules/${s.id}/run`, { method: 'POST' });
+    setHistory(s);
+    return `${s.name}: backup started.`;
+  });
+  const toggle = (s: BackupSchedule) => act(async () => {
+    await api(`/backups/schedules/${s.id}`, { method: 'PUT', body: { enabled: !s.enabled } });
+    return `${s.name}: ${s.enabled ? 'paused' : 'resumed'}.`;
+  });
+  const remove = (s: BackupSchedule) => {
+    if (!window.confirm(`Delete schedule ${s.name}? Past runs and backups in the bucket are kept.`)) return;
+    act(async () => {
+      await api(`/backups/schedules/${s.id}`, { method: 'DELETE' });
+      if (history?.id === s.id) setHistory(undefined);
+      return undefined;
+    });
+  };
+
+  return <section className="panel">
+    <div className="panel-title">
+      <h2>Scheduled backups</h2>
+      {editing === null && <button className="action" disabled={destinations.length === 0} onClick={() => setEditing('new')}>Add schedule</button>}
+    </div>
+    <p className="hint">The panel runs these on a cron schedule with the service's own stored credentials, then keeps only the newest backups of that service. A run whose previous one is still going is skipped.</p>
+    {destinations.length === 0 && <p className="state">Add an S3 destination first.</p>}
+    {editing !== null && <ScheduleForm schedule={editing === 'new' ? undefined : editing} destinations={destinations} docker={docker}
+      onDone={() => { setEditing(null); schedules.reload(); }} />}
+    {schedules.loading && !schedules.data && <p className="state">Loading…</p>}
+    {schedules.error && <p className="state error">{schedules.error}</p>}
+    {message && <p className="state" role="status">{message}</p>}
+    {schedules.data && (schedules.data.length === 0 ? <p className="state">No scheduled backups yet.</p>
+      : <table><thead><tr><th>Name</th><th>Target</th><th>Schedule</th><th>Destination</th><th>Keep</th><th>Next run</th><th>Last run</th><th /></tr></thead><tbody>
+        {schedules.data.map((s) => <tr key={s.id}>
+          <td>{s.name}</td>
+          <td className="mono small">{describeTarget(s)}</td>
+          <td><span className="mono">{s.cron_expression}</span><div className="muted small">{s.timezone}{s.enabled ? '' : ' · paused'}</div></td>
+          <td className="small">{s.destination_name ?? '—'}</td>
+          <td className="small">{s.retention_count === 0 ? 'all' : s.retention_count}</td>
+          <td className="small">{s.enabled ? formatTime(s.next_run_at) : 'paused'}</td>
+          <td className={`small${s.last_run_status === 'failed' ? ' error' : ''}`} title={s.last_run_error ?? undefined}>
+            {s.last_run_status ? `${s.last_run_status} · ${formatTime(s.last_run_at)}` : 'never'}
+          </td>
+          <td>
+            <button className="link" disabled={busy || s.last_run_status === 'running'} onClick={() => runNow(s)}>run now</button>{' '}
+            <button className="link" disabled={busy} onClick={() => setHistory(s)}>runs</button>{' '}
+            <button className="link" disabled={busy} onClick={() => toggle(s)}>{s.enabled ? 'pause' : 'resume'}</button>{' '}
+            <button className="link" disabled={busy} onClick={() => setEditing(s)}>edit</button>{' '}
+            <button className="link danger" disabled={busy} onClick={() => remove(s)}>delete</button>
+          </td>
+        </tr>)}
+      </tbody></table>)}
+    {history && <ScheduleRuns key={history.id} schedule={history} onClose={() => setHistory(undefined)} />}
+  </section>;
+}
+
+function ScheduleRuns({ schedule, onClose }: { schedule: BackupSchedule; onClose: () => void }) {
+  const runs = useApi<Run[]>(`/backups/runs?schedule_id=${schedule.id}`, 3000);
+  return <div className="card">
+    <div className="panel-title"><h3>Runs of {schedule.name}</h3><button className="ghost" onClick={onClose}>Close</button></div>
+    {runs.error && <p className="state error">{runs.error}</p>}
+    {runs.data && (runs.data.length === 0 ? <p className="state">No runs yet.</p>
+      : <table><thead><tr><th>Started</th><th>Status</th><th>Size</th><th>Object</th></tr></thead><tbody>
+        {runs.data.map((r) => <tr key={r.id}>
+          <td className="small">{formatTime(r.started_at)}</td>
+          <td className={r.status === 'failed' ? 'error' : undefined}>
+            {r.status}{r.error ? `: ${r.error}` : ''}{r.pruned > 0 ? ` (pruned ${r.pruned})` : ''}
+          </td>
+          <td className="small">{size(r.size_bytes)}</td>
+          <td className="mono small">{r.object_key ?? ''}</td>
+        </tr>)}
+      </tbody></table>)}
+  </div>;
+}
+
+function ScheduleForm({ schedule, destinations, docker, onDone }: { schedule?: BackupSchedule; destinations: Destination[]; docker: boolean; onDone: () => void }) {
+  const databases = useApi<DatabaseServiceInfo[]>(schedule ? null : '/database-services');
+  const projects = useApi<ComposeProject[]>(schedule || !docker ? null : '/compose-projects');
+  const [kind, setKind] = useState<'database' | 'volume'>(schedule?.target_kind ?? 'database');
+  const [name, setName] = useState(schedule?.name ?? 'nightly');
+  const [projectId, setProjectId] = useState(schedule?.compose_project_id ?? '');
+  const [volume, setVolume] = useState(schedule?.volume_name ?? '');
+  const [service, setService] = useState(schedule?.service_name ?? '');
+  const [stop, setStop] = useState(schedule?.stop_service ?? false);
+  const [destination, setDestination] = useState(schedule?.s3_destination_id ?? destinations[0]?.id ?? '');
+  const [cron, setCron] = useState(schedule?.cron_expression ?? '0 3 * * *');
+  const [timezone, setTimezone] = useState(schedule?.timezone ?? browserZone());
+  const [retention, setRetention] = useState(String(schedule?.retention_count ?? 7));
+  const [enabled, setEnabled] = useState(schedule?.enabled ?? true);
+  const [preview, setPreview] = useState<{ runs?: string[]; error?: string }>({});
+  const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  const [zones] = useState(zoneList);
+
+  const dumpable = (databases.data ?? []).filter((d) => d.spec.engine !== 'redis');
+  const volumeProjects = (projects.data ?? []).filter((p) => p.source.kind !== 'static');
+
+  // Show the next run times a moment after typing stops.
+  useEffect(() => {
+    if (!cron.trim()) { setPreview({}); return undefined; }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      api<{ next_runs: string[] }>('/backups/schedules/preview', { method: 'POST', body: { cron_expression: cron.trim(), timezone: timezone.trim() } })
+        .then((r) => active && setPreview({ runs: r.next_runs }))
+        .catch((e: Error) => active && setPreview({ error: e.message }));
+    }, 300);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [cron, timezone]);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true); setError(undefined);
+    const common = {
+      name: name.trim(), s3_destination_id: destination, cron_expression: cron.trim(),
+      timezone: timezone.trim(), retention_count: Number(retention), enabled,
+    };
+    const volumeFields = kind === 'volume'
+      ? { service_name: service.trim() || null, stop_service: stop && service.trim() !== '' } : {};
+    try {
+      if (schedule) {
+        await api(`/backups/schedules/${schedule.id}`, { method: 'PUT', body: { ...common, ...volumeFields } });
+      } else {
+        await api('/backups/schedules', {
+          method: 'POST',
+          body: { ...common, target_kind: kind, compose_project_id: projectId,
+            ...(kind === 'volume' ? { volume_name: volume.trim(), service_name: service.trim() || undefined, stop_service: stop && service.trim() !== '' } : {}) },
+        });
+      }
+      onDone();
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+
+  return <form className="card" onSubmit={submit}>
+    {schedule
+      ? <p className="hint">Target: <span className="mono">{describeTarget(schedule)}</span> (fixed for the life of a schedule).</p>
+      : <>
+        <div className="segmented" role="group" aria-label="Backup target">
+          <button type="button" className={kind === 'database' ? 'selected' : ''} onClick={() => { setKind('database'); setProjectId(''); }}>Database service</button>
+          <button type="button" className={kind === 'volume' ? 'selected' : ''} disabled={!docker} onClick={() => { setKind('volume'); setProjectId(''); }}>Volume</button>
+        </div>
+        {kind === 'database' && databases.error && <p className="state error">{databases.error}</p>}
+        {kind === 'database' && databases.data && dumpable.length === 0 && <p className="state">No managed PostgreSQL, MySQL, MariaDB or MongoDB service yet. Other databases can be backed up by their volume.</p>}
+        {kind === 'volume' && projects.error && <p className="state error">{projects.error}</p>}
+      </>}
+    <div className="grid2">
+      <label>Name<input required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} /></label>
+      {!schedule && kind === 'database' && <label>Database service<select required value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+        <option value="">Choose…</option>
+        {dumpable.map((d) => <option key={d.project.id} value={d.project.id}>{d.project.name} ({d.spec.engine}/{d.spec.database_name})</option>)}
+      </select></label>}
+      {!schedule && kind === 'volume' && <>
+        <label>Service<select required value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+          <option value="">Choose…</option>
+          {volumeProjects.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.slug})</option>)}
+        </select></label>
+        <label>Volume name<input required className="mono" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" value={volume} onChange={(e) => setVolume(e.target.value)} /></label>
+      </>}
+      {kind === 'volume' && <>
+        <label>Container using it (optional)<input className="mono" value={service} onChange={(e) => setService(e.target.value)} /></label>
+        <label className="check"><input type="checkbox" checked={stop} onChange={(e) => setStop(e.target.checked)} /> Stop that container during the copy</label>
+      </>}
+      <label>S3 destination<select required value={destination} onChange={(e) => setDestination(e.target.value)}>
+        {destinations.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+      </select></label>
+      <label>Backups to keep (0 = all)<input type="number" min={0} max={1000} required value={retention} onChange={(e) => setRetention(e.target.value)} /></label>
+    </div>
+    <fieldset><legend>Schedule</legend>
+      <div className="toolbar">
+        <select aria-label="Preset" value="" onChange={(e) => e.target.value && setCron(e.target.value)}>
+          <option value="">Presets…</option>
+          {BACKUP_CRON_PRESETS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+      </div>
+      <div className="grid2">
+        <label>Cron expression (minute hour day month weekday)<input required className="mono" value={cron} onChange={(e) => setCron(e.target.value)} /></label>
+        <label>Time zone<input required className="mono" list="backup-zones" value={timezone} onChange={(e) => setTimezone(e.target.value)} /></label>
+        <datalist id="backup-zones">{zones.map((z) => <option key={z} value={z} />)}</datalist>
+      </div>
+      {preview.error ? <p className="state error">{preview.error}</p>
+        : preview.runs && <p className="hint">Next runs: {preview.runs.map(formatTime).join(' · ')}</p>}
+      <label className="check"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> Enabled</label>
+    </fieldset>
+    {error && <p className="state error" role="alert">{error}</p>}
+    <div className="toolbar">
+      <button className="action" disabled={busy}>{schedule ? 'Save schedule' : 'Create schedule'}</button>
+      <button type="button" className="ghost" onClick={onDone}>Cancel</button>
+    </div>
   </form>;
 }

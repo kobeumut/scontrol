@@ -2,6 +2,7 @@ pub mod access;
 pub mod admin;
 pub mod api_keys;
 pub mod auth;
+pub mod backup_schedules;
 pub mod backups;
 pub mod compose_projects;
 pub mod cron;
