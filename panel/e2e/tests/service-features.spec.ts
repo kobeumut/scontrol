@@ -36,6 +36,23 @@ test.afterAll(async () => {
   await page.close();
 });
 
+test('a service opts in to its environment\'s database network', async () => {
+  await expect(section('Database network')).toBeVisible();
+  const join = page.getByLabel(/Join the environment's internal network scontrol-env-[0-9a-f]{32}/);
+  await expect(join).not.toBeChecked();
+  await join.check();
+  await expect(page.getByText('Saved. Redeploy to apply.')).toBeVisible();
+  await expect(join).toBeChecked();
+  const id = (await (await page.request.get('/api/compose-projects')).json())
+    .find((p: { slug: string }) => p.slug === slug).id;
+  const stored = await (await page.request.get(`/api/compose-projects/${id}/shared-network`)).json();
+  expect(stored).toMatchObject({ joined: true, always: false, supported: true });
+  expect(stored.network).toMatch(/^scontrol-env-[0-9a-f]{32}$/);
+  await join.uncheck();
+  await expect(join).not.toBeChecked();
+  expect((await (await page.request.get(`/api/compose-projects/${id}/shared-network`)).json()).joined).toBe(false);
+});
+
 const domainForm = () => page.locator('form.inline-form', { has: page.getByLabel('Domain', { exact: true }) });
 const addDomain = async (domain: string, opts: { service?: string; port?: string; https?: boolean } = {}) => {
   const form = domainForm();

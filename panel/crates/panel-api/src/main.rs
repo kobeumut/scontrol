@@ -97,7 +97,11 @@ async fn main() -> anyhow::Result<()> {
     if interrupted > 0 {
         tracing::warn!(interrupted, "marked interrupted docker cleanups as failed");
     }
-    services::observability::start(state.db.clone(), state.agents.clone());
+    services::observability::start(
+        state.db.clone(),
+        state.agents.clone(),
+        state.notifier.clone(),
+    );
 
     state.metrics.start(
         state.db.clone(),

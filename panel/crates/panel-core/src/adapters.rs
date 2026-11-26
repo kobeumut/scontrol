@@ -183,6 +183,10 @@ pub struct DeployComposeProjectParams {
     /// removed together with the project instead of surviving it.
     #[serde(default)]
     pub ephemeral: bool,
+    /// The environment's internal network to attach every container to (see
+    /// [`crate::database_services::SharedNetwork`]). Never set for previews.
+    #[serde(default)]
+    pub shared_network: Option<crate::database_services::SharedNetwork>,
 }
 
 /// Opens (`Some`) or closes (`None`) outside access to a database service:

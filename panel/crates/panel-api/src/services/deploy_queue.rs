@@ -39,6 +39,7 @@ use panel_core::adapters::{
     AdapterPort, DeployComposeProjectParams, DockerRegistryAuth, GitHttpCredentials,
     WriteComposeEnvironmentParams, WriteDockerConfigParams,
 };
+use panel_core::database_services::{shared_network_name, SharedNetwork};
 use panel_core::error::{CoreError, CoreResult};
 use panel_core::types::{
     ComposeDeployOutcome, ComposeDomainBinding, ComposeProject, ComposeSource, DeploymentInfo,
@@ -395,6 +396,9 @@ async fn execute(
         None
     };
     let (rollback, rollback_commit) = rollback.unzip();
+    let shared_network = shared_network_for(db, &project, preview.is_some())
+        .await
+        .map_err(|e| CoreError::External(format!("loading network settings: {e}")))?;
     let result = agent
         .deploy_compose_project(DeployComposeProjectParams {
             project_id: project.id,
@@ -420,6 +424,7 @@ async fn execute(
             rollback,
             resource_limits: preview.as_ref().map(|p| p.limits),
             ephemeral: preview.is_some(),
+            shared_network,
         })
         .await
         .map(|mut outcome| {
@@ -537,6 +542,30 @@ fn truncate(message: &str, max: usize) -> &str {
         Some((index, _)) => &message[..index],
         None => message,
     }
+}
+
+/// The environment network a deployment attaches to: always for database
+/// services (reachable by their slug), on opt-in for other container
+/// services, never for previews (unreviewed code) or static sites (no
+/// container).
+async fn shared_network_for(
+    db: &PgPool,
+    project: &ComposeProject,
+    preview: bool,
+) -> sqlx::Result<Option<SharedNetwork>> {
+    let name = shared_network_name(project.environment_id);
+    Ok(match &project.source {
+        _ if preview => None,
+        ComposeSource::Static(_) => None,
+        ComposeSource::Database(_) => Some(SharedNetwork {
+            name,
+            alias: Some(project.slug.clone()),
+        }),
+        _ if db::compose_projects::joins_shared_network(db, project.id).await? => {
+            Some(SharedNetwork { name, alias: None })
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]

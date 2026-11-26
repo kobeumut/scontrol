@@ -91,6 +91,7 @@ pub fn router() -> Router<AppState> {
         .merge(super::domain_options::router())
         .merge(super::terminal::router())
         .merge(super::previews::router())
+        .merge(super::shared_network::router())
 }
 
 async fn list(

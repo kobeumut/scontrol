@@ -17,6 +17,7 @@ use crate::db;
 use crate::db::observability::{CleanupRun, CleanupSettings, StartRun};
 use crate::error::{ApiError, ApiResult};
 use crate::services::agent_pool::AgentPool;
+use crate::services::notifications::Notifier;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use panel_core::adapters::{AdapterPort, PruneDockerParams, ReadNginxStatsParams};
 use panel_core::error::CoreError;
@@ -87,7 +88,7 @@ where
     }
 }
 
-pub fn start(db: PgPool, agents: AgentPool) {
+pub fn start(db: PgPool, agents: AgentPool, notifier: Notifier) {
     let (pool, stats_agents) = (db.clone(), agents.clone());
     tokio::spawn(async move {
         let mut polls = 0u32;
@@ -125,8 +126,8 @@ pub fn start(db: PgPool, agents: AgentPool) {
                 &agents,
                 "scheduled docker cleanup check",
                 |server, agent| {
-                    let db = &db;
-                    async move { scheduled_cleanup_tick(db, agent, server).await }
+                    let (db, notifier) = (&db, &notifier);
+                    async move { scheduled_cleanup_tick(db, agent, server, notifier).await }
                 },
             )
             .await;
@@ -181,6 +182,7 @@ pub async fn run_cleanup(
     server: Uuid,
     trigger: &str,
     older_than_hours: u32,
+    notifier: Option<Notifier>,
 ) -> ApiResult<CleanupRun> {
     let (_, task) = start_cleanup(
         db,
@@ -189,6 +191,7 @@ pub async fn run_cleanup(
         trigger,
         older_than_hours,
         CLEANUP_TIMEOUT,
+        notifier,
     )
     .await?;
     task.await
@@ -200,6 +203,8 @@ pub async fn run_cleanup(
 /// away (a closed HTTP request, the scheduler's per-server timeout) never
 /// leaves the row `running`, which would hold back every deployment on the
 /// server. An agent that gives no result within `timeout` fails the run.
+/// With a `notifier`, the finished run is sent to `docker_cleanup_finished`
+/// channels.
 async fn start_cleanup(
     db: &PgPool,
     agent: Arc<dyn AdapterPort>,
@@ -207,6 +212,7 @@ async fn start_cleanup(
     trigger: &str,
     older_than_hours: u32,
     timeout: Duration,
+    notifier: Option<Notifier>,
 ) -> ApiResult<(CleanupRun, tokio::task::JoinHandle<ApiResult<CleanupRun>>)> {
     panel_core::observability::prune_until_filter(older_than_hours)
         .map_err(|m| ApiError::Core(CoreError::Validation(m)))?;
@@ -245,6 +251,9 @@ async fn start_cleanup(
         .await?;
         let _ = db::observability::trim_runs(&db).await;
         tracing::info!(run_id = %id, status = %finished.status, "docker cleanup finished");
+        if let Some(notifier) = notifier {
+            notifier.docker_cleanup_finished(db.clone(), finished.clone());
+        }
         Ok(finished)
     });
     Ok((run, task))
@@ -270,6 +279,7 @@ async fn scheduled_cleanup_tick(
     db: &PgPool,
     agent: Arc<dyn AdapterPort>,
     server: Uuid,
+    notifier: &Notifier,
 ) -> ApiResult<()> {
     let settings = db::observability::cleanup_settings(db).await?;
     let last = db::observability::last_scheduled_start(db, server).await?;
@@ -281,6 +291,7 @@ async fn scheduled_cleanup_tick(
             "schedule",
             settings.older_than_hours as u32,
             CLEANUP_TIMEOUT,
+            Some(notifier.clone()),
         )
         .await
         {
@@ -517,7 +528,7 @@ mod tests {
             images_freed_bytes: 1000,
             builder_freed_bytes: 234,
         });
-        let run = run_cleanup(&pool, adapter.clone(), server, "manual", 168)
+        let run = run_cleanup(&pool, adapter.clone(), server, "manual", 168, None)
             .await
             .unwrap();
         assert_eq!(run.status, "succeeded");
@@ -528,16 +539,18 @@ mod tests {
         assert_eq!(adapter.prunes.lock().unwrap()[0].older_than_hours, 168);
 
         adapter.fail_next_call("prune_docker");
-        let failed = run_cleanup(&pool, adapter.clone(), server, "schedule", 24)
+        let failed = run_cleanup(&pool, adapter.clone(), server, "schedule", 24, None)
             .await
             .unwrap();
         assert_eq!(failed.status, "failed");
         assert!(failed.error_message.is_some());
 
         // Out-of-range ages never reach the agent.
-        assert!(run_cleanup(&pool, adapter.clone(), server, "manual", 0)
-            .await
-            .is_err());
+        assert!(
+            run_cleanup(&pool, adapter.clone(), server, "manual", 0, None)
+                .await
+                .is_err()
+        );
         assert_eq!(adapter.prunes.lock().unwrap().len(), 1);
 
         // A running row blocks another run.
@@ -548,7 +561,7 @@ mod tests {
             panic!("expected a started run");
         };
         assert!(matches!(
-            run_cleanup(&pool, adapter.clone(), server, "manual", 168).await,
+            run_cleanup(&pool, adapter.clone(), server, "manual", 168, None).await,
             Err(ApiError::Conflict(_))
         ));
         db::observability::finish_run(&pool, running.id, Ok((0, 0)))
@@ -570,12 +583,12 @@ mod tests {
 
         // A queued deployment holds back a cleanup of its server only.
         let queued = enqueue(&pool, web).await;
-        match run_cleanup(&pool, adapter.clone(), busy, "manual", 168).await {
+        match run_cleanup(&pool, adapter.clone(), busy, "manual", 168, None).await {
             Err(ApiError::Conflict(message)) => assert!(message.contains("deployment")),
             other => panic!("expected a conflict, got {other:?}"),
         }
         assert!(adapter.prunes.lock().unwrap().is_empty());
-        let elsewhere = run_cleanup(&pool, adapter.clone(), other, "manual", 168)
+        let elsewhere = run_cleanup(&pool, adapter.clone(), other, "manual", 168, None)
             .await
             .unwrap();
         assert_eq!(elsewhere.status, "succeeded");
@@ -587,7 +600,7 @@ mod tests {
             .unwrap();
         assert_eq!(job.id, queued);
         assert!(matches!(
-            run_cleanup(&pool, adapter.clone(), busy, "schedule", 168).await,
+            run_cleanup(&pool, adapter.clone(), busy, "schedule", 168, None).await,
             Err(ApiError::Conflict(_))
         ));
         assert_eq!(adapter.prunes.lock().unwrap().len(), 1);
@@ -596,10 +609,17 @@ mod tests {
         // While the cleanup runs, nothing is claimed on its server; other
         // servers keep deploying.
         *adapter.prune_delay.lock().unwrap() = Some(Duration::from_millis(400));
-        let (run, task) =
-            start_cleanup(&pool, adapter.clone(), busy, "manual", 168, CLEANUP_TIMEOUT)
-                .await
-                .unwrap();
+        let (run, task) = start_cleanup(
+            &pool,
+            adapter.clone(),
+            busy,
+            "manual",
+            168,
+            CLEANUP_TIMEOUT,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(run.status, "running");
         let blocked = enqueue(&pool, web).await;
         let free = enqueue(&pool, api).await;
@@ -639,7 +659,7 @@ mod tests {
         *adapter.prune_delay.lock().unwrap() = Some(Duration::from_millis(200));
         let dropped = tokio::time::timeout(
             Duration::from_millis(20),
-            run_cleanup(&pool, adapter.clone(), server, "manual", 168),
+            run_cleanup(&pool, adapter.clone(), server, "manual", 168, None),
         )
         .await;
         assert!(dropped.is_err());
@@ -656,6 +676,7 @@ mod tests {
             "schedule",
             168,
             Duration::from_millis(50),
+            None,
         )
         .await
         .unwrap();
@@ -690,9 +711,16 @@ mod tests {
         finish(&pool, queued).await;
 
         // The next start fails it and runs.
-        let run = run_cleanup(&pool, Arc::new(MockAdapter::new()), server, "manual", 168)
-            .await
-            .unwrap();
+        let run = run_cleanup(
+            &pool,
+            Arc::new(MockAdapter::new()),
+            server,
+            "manual",
+            168,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(run.status, "succeeded");
         let failed: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM docker_cleanup_runs WHERE server_id = $1 AND status = 'failed'",

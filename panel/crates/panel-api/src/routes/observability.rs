@@ -168,7 +168,15 @@ async fn run_now(
     };
     let server = body.server_id.unwrap_or(db::servers::LOCAL_SERVER_ID);
     let agent = state.agents.for_server_id(&state.db, server).await?;
-    let run = service::run_cleanup(&state.db, agent, server, "manual", age).await?;
+    let run = service::run_cleanup(
+        &state.db,
+        agent,
+        server,
+        "manual",
+        age,
+        Some(state.notifier.clone()),
+    )
+    .await?;
     db::audit::record(
         &state.db,
         Some(user.id),
@@ -337,6 +345,21 @@ mod tests {
             .await
             .unwrap();
 
+        // The finished run is sent to `docker_cleanup_finished` channels.
+        let (url, mut received) = test_support::http_receiver().await;
+        let (status, channel) = call(
+            &router,
+            &admin_cookie,
+            Method::POST,
+            "/api/notifications",
+            Some(
+                json!({ "name": format!("cleanup {}", uuid::Uuid::new_v4()), "kind": "webhook",
+                         "url": url, "events": ["docker_cleanup_finished"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+
         let (status, run) = call(
             &router,
             &admin_cookie,
@@ -349,6 +372,36 @@ mod tests {
         assert_eq!(run["status"], "succeeded");
         assert_eq!(run["images_freed_bytes"], 5000);
         assert_eq!(run["older_than_hours"], 72);
+
+        // Cleanups are serialized by QUEUE_TESTS, but skip any stragglers.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (headers, payload) = loop {
+            let (headers, body) = tokio::time::timeout_at(deadline, received.recv())
+                .await
+                .expect("docker_cleanup_finished notification")
+                .unwrap();
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            if payload["run"]["id"] == run["id"] {
+                break (headers, payload);
+            }
+        };
+        assert!(headers.contains("x-scontrol-event: docker_cleanup_finished"));
+        assert_eq!(payload["run"]["status"], "succeeded");
+        assert_eq!(payload["run"]["freed_bytes"], 5700);
+        assert_eq!(payload["server"]["id"], uuid::Uuid::nil().to_string());
+        assert!(
+            payload["title"].as_str().unwrap().contains("freed 5.6 KiB"),
+            "{payload}"
+        );
+        let (status, _) = call(
+            &router,
+            &admin_cookie,
+            Method::DELETE,
+            &format!("/api/notifications/{}", channel["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+        assert!(status.is_success());
 
         // Restore the shared singleton row.
         sqlx::query("UPDATE docker_cleanup_settings SET enabled = FALSE, interval_hours = 24, older_than_hours = 168")

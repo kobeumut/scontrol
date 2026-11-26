@@ -350,6 +350,25 @@ pub fn certificate_available(
     }
 }
 
+/// The first directory on the way to `path` (itself included) that other
+/// users cannot search (`o+x` missing), or `None` when the Nginx worker can
+/// reach it. Paths that do not exist yet are not reported.
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
+pub fn untraversable_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut current = std::path::PathBuf::new();
+    for part in path.components() {
+        current.push(part);
+        let Ok(meta) = std::fs::metadata(&current) else {
+            return None;
+        };
+        if meta.is_dir() && meta.permissions().mode() & 0o001 == 0 {
+            return Some(current);
+        }
+    }
+    None
+}
+
 /// Whether certbot has a live certificate for `domain`.
 #[cfg(feature = "docker")]
 pub fn certificate_exists(cfg: &AgentConfig, domain: &str) -> bool {
@@ -405,6 +424,36 @@ pub async fn remove_compose_vhost(cfg: &AgentConfig, domain: &str) -> CoreResult
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn untraversable_ancestors_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("scontrol-acme-{}", uuid::Uuid::new_v4()));
+        let data = base.join("data");
+        let webroot = data.join("acme");
+        std::fs::create_dir_all(&webroot).unwrap();
+        let mode = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(&base, 0o755);
+        mode(&data, 0o755);
+        // Whatever already blocks above the test directory comes first.
+        let outer = super::untraversable_ancestor(&base);
+        assert_eq!(super::untraversable_ancestor(&webroot), outer);
+        // The installer's 0750 data root blocks the Nginx worker.
+        mode(&data, 0o750);
+        assert_eq!(
+            super::untraversable_ancestor(&webroot),
+            outer.clone().or(Some(data.clone()))
+        );
+        // A webroot that does not exist yet is not reported.
+        mode(&data, 0o755);
+        assert_eq!(
+            super::untraversable_ancestor(&base.join("missing/acme")),
+            outer
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
     use super::*;
 
     #[test]

@@ -661,6 +661,7 @@ async fn spawn_run(
     .await
     .ok();
     let pool = state.db.clone();
+    let notifier = state.notifier.clone();
     let run_id = run.id;
     tokio::spawn(async move {
         let result = work.await.map_err(|e| {
@@ -670,8 +671,9 @@ async fn spawn_run(
             }
             text.chars().take(1000).collect::<String>()
         });
-        if let Err(e) = db::backups::finish_run(&pool, run_id, result).await {
-            tracing::error!(error = %e, %run_id, "recording backup run result");
+        match db::backups::finish_run(&pool, run_id, result).await {
+            Ok(()) => notifier.backup_run_finished(pool, run_id),
+            Err(e) => tracing::error!(error = %e, %run_id, "recording backup run result"),
         }
     });
     Ok((StatusCode::ACCEPTED, Json(run.into())))
@@ -806,6 +808,137 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("run never finished");
+    }
+
+    /// Waits for the webhook delivery about `run_id`; deliveries for runs of
+    /// tests running alongside are skipped.
+    async fn notification_for(
+        received: &mut tokio::sync::mpsc::Receiver<(String, String)>,
+        run_id: &str,
+    ) -> (String, Value) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (headers, body) = tokio::time::timeout_at(deadline, received.recv())
+                .await
+                .expect("backup notification")
+                .unwrap();
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            if payload["run"]["id"] == run_id {
+                return (headers, payload);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_backup_runs_are_notified_without_secrets() {
+        let pool = test_support::test_pool().await;
+        let adapter = Arc::new(MockAdapter::new());
+        let state = test_support::app_state(pool.clone(), adapter.clone());
+        let admin = test_support::user(&pool, true).await;
+        let cookie = test_support::session_cookie(&state, admin.id).await;
+        let router = crate::routes::build_router(state);
+        let secret = format!("sk-{}", uuid::Uuid::new_v4());
+        let name = format!("notify-{}", uuid::Uuid::new_v4());
+        let (status, body) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/backups/destinations",
+            Some(json!({
+                "name": name, "endpoint": "https://s3.example.com", "region": "auto",
+                "bucket": "my-backups", "prefix": "scontrol/n1", "retention_count": 3,
+                "access_key": "AKIANOTIFY", "secret_key": secret,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (url, mut received) = test_support::http_receiver().await;
+        let (status, channel) = call(
+            &router,
+            &cookie,
+            Method::POST,
+            "/api/notifications",
+            Some(
+                json!({ "name": format!("backups {id}"), "kind": "webhook", "url": url,
+                         "events": ["backup_succeeded", "backup_failed"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = serde_json::from_str::<Value>(&channel).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let db_password = format!("dbpw-{}", uuid::Uuid::new_v4());
+        let backup = json!({ "engine": "postgres", "host": "127.0.0.1", "port": 5432,
+            "database": "notified", "username": "appuser", "password": db_password });
+        let start = |body: Value| {
+            let (router, cookie, id) = (router.clone(), cookie.clone(), id.clone());
+            async move {
+                let (status, text) = call(
+                    &router,
+                    &cookie,
+                    Method::POST,
+                    &format!("/api/backups/destinations/{id}/database/backup"),
+                    Some(body),
+                )
+                .await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+                serde_json::from_str::<Value>(&text).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+
+        // A successful backup.
+        let run_id = start(backup.clone()).await;
+        let (headers, payload) = notification_for(&mut received, &run_id).await;
+        assert!(
+            headers.contains("x-scontrol-event: backup_succeeded"),
+            "{headers}"
+        );
+        assert_eq!(payload["run"]["status"], "succeeded");
+        assert_eq!(payload["run"]["kind"], "database_backup");
+        assert_eq!(payload["destination"]["name"], name);
+        assert!(payload["run"]["object_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("scontrol/n1/"));
+
+        // A failed backup: urgent event, error redacted, no credentials anywhere.
+        adapter.fail_next_call_with(
+            "backup_database",
+            CoreError::External(format!("pg_dump failed: bad password {db_password}")),
+        );
+        let run_id = start(backup).await;
+        let (headers, payload) = notification_for(&mut received, &run_id).await;
+        assert!(
+            headers.contains("x-scontrol-event: backup_failed"),
+            "{headers}"
+        );
+        assert_eq!(payload["run"]["status"], "failed");
+        let text = payload.to_string();
+        assert!(text.contains("pg_dump failed"), "{text}");
+        for leaked in [db_password.as_str(), secret.as_str(), "AKIANOTIFY"] {
+            assert!(!text.contains(leaked), "{text}");
+        }
+
+        let (status, _) = call(
+            &router,
+            &cookie,
+            Method::DELETE,
+            &format!("/api/notifications/{channel_id}"),
+            None,
+        )
+        .await;
+        assert!(status.is_success());
     }
 
     #[tokio::test]
