@@ -1,14 +1,12 @@
 import { FormEvent, useState } from 'react';
 import {
-  api, ComposeProject, DATABASE_ENGINE_LABELS, DatabaseEngine, DatabaseSpec, Deployment, formatTime, isActive, useApi,
+  api, DATABASE_ENGINE_LABELS, DatabaseEngine, DatabaseService, Deployment, formatTime, isActive, Project, useApi,
 } from './api';
 import { placement, ServerSelect } from './Servers';
 
 type EngineInfo = {
   engine: DatabaseEngine; versions: string[]; default_version: string; container_port: number; has_database_and_user: boolean;
 };
-type Exposure = { public_port: number; allow_from: string[] };
-type DatabaseService = { project: ComposeProject; spec: DatabaseSpec; loopback_port: number; exposure: Exposure | null };
 type Credentials = {
   username: string; password: string; root_password: string | null; database: string | null;
   host: string; port: number; uri: string; external_uri: string | null;
@@ -18,11 +16,21 @@ type Credentials = {
 const ENGINE_PORTS: Record<DatabaseEngine, number> = { postgres: 5432, mysql: 3306, mariadb: 3306, mongo: 27017, redis: 6379 };
 const slugify = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
 
-export function Databases() {
+export function Databases({ initialEnvironmentId, initialSelectedId }: {
+  /** Opens the "new database" form aimed at this environment. */
+  initialEnvironmentId?: string;
+  /** Database to show first, e.g. one picked on a project's page. */
+  initialSelectedId?: string;
+}) {
   const services = useApi<DatabaseService[]>('/database-services', 5000);
   const engines = useApi<EngineInfo[]>('/database-services/engines');
-  const [creating, setCreating] = useState(false);
-  const [selected, setSelected] = useState<string>();
+  const projects = useApi<Project[]>('/projects');
+  const [creating, setCreating] = useState(initialEnvironmentId !== undefined);
+  const [selected, setSelected] = useState<string | undefined>(initialSelectedId);
+  const environmentLabel = (id: string) => {
+    for (const p of projects.data ?? []) for (const e of p.environments) if (e.id === id) return `${p.name} / ${e.name}`;
+    return '—';
+  };
 
   const current = services.data?.find((s) => s.project.id === selected);
 
@@ -32,25 +40,30 @@ export function Databases() {
       {!creating && <button className="action" onClick={() => setCreating(true)}>New database</button>}
     </div>
     <p className="hint">PostgreSQL, MySQL, MariaDB, MongoDB, and Redis in their own containers. Each listens on <span className="mono">127.0.0.1</span> only and keeps its data in a named volume; credentials are generated and stored encrypted. Outside access is off until you open it for specific addresses.</p>
-    {creating && <CreateForm engines={engines.data} onDone={(id) => { setCreating(false); services.reload(); if (id) setSelected(id); }} />}
+    {creating && <CreateForm engines={engines.data} projects={projects.data} initialEnvironmentId={initialEnvironmentId} onDone={(id) => { setCreating(false); services.reload(); if (id) setSelected(id); }} />}
     {services.loading && <p className="state">Loading…</p>}
     {(services.error || engines.error) && <p className="state error">{services.error ?? engines.error}</p>}
-    {services.data && (services.data.length === 0 ? <p className="state">No databases yet.</p>
-      : <table><thead><tr><th>Name</th><th>Engine</th><th>Local address</th><th>Outside access</th><th>Status</th><th>Updated</th></tr></thead><tbody>
+    {services.data && (services.data.length === 0 ? <p className="state">No databases yet. Create one with “New database”; services of the same environment can then reach it by name.</p>
+      : <table className="stack-narrow"><thead><tr><th>Name</th><th>Engine</th><th>Project / environment</th><th>Local address</th><th>Outside access</th><th>Status</th><th>Updated</th></tr></thead><tbody>
         {services.data.map((s) => <tr key={s.project.id} className={`clickable ${s.project.id === selected ? 'selected-row' : ''}`} onClick={() => setSelected(s.project.id)}>
-          <td>{s.project.name}<div className="mono small muted">{s.project.slug}</div></td>
-          <td>{DATABASE_ENGINE_LABELS[s.spec.engine]} {s.spec.version}</td>
-          <td className="mono small">127.0.0.1:{s.loopback_port}</td>
-          <td className="small">{s.exposure ? <>port <span className="mono">{s.exposure.public_port}</span> · {s.exposure.allow_from.length ? s.exposure.allow_from.join(', ') : 'any address'}</> : 'closed'}</td>
-          <td><span className={`badge ${s.project.status}`}>{s.project.status}</span></td>
-          <td className="small">{formatTime(s.project.updated_at)}</td>
+          <td data-label="Name">{s.project.name}<div className="mono small muted">{s.project.slug}</div></td>
+          <td data-label="Engine">{DATABASE_ENGINE_LABELS[s.spec.engine]} {s.spec.version}</td>
+          <td data-label="Project / environment" className="small">{environmentLabel(s.project.environment_id)}</td>
+          <td data-label="Local address" className="mono small">127.0.0.1:{s.loopback_port}</td>
+          <td data-label="Outside access" className="small">{s.exposure ? <>port <span className="mono">{s.exposure.public_port}</span> · {s.exposure.allow_from.length ? s.exposure.allow_from.join(', ') : 'any address'}</> : 'closed'}</td>
+          <td data-label="Status"><span className={`badge ${s.project.status}`}>{s.project.status}</span></td>
+          <td data-label="Updated" className="small">{formatTime(s.project.updated_at)}</td>
         </tr>)}
       </tbody></table>)}
     {current && <Detail key={current.project.id} service={current} onChanged={services.reload} onRemoved={() => { setSelected(undefined); services.reload(); }} />}
   </section>;
 }
 
-function CreateForm({ engines, onDone }: { engines?: EngineInfo[]; onDone: (id?: string) => void }) {
+function CreateForm({ engines, projects, initialEnvironmentId, onDone }: {
+  engines?: EngineInfo[]; projects?: Project[]; initialEnvironmentId?: string; onDone: (id?: string) => void;
+}) {
+  // Empty: the owner's Default project, production environment.
+  const [environmentId, setEnvironmentId] = useState(initialEnvironmentId ?? '');
   const [engine, setEngine] = useState<DatabaseEngine>('postgres');
   const info = engines?.find((e) => e.engine === engine);
   const [version, setVersion] = useState('');
@@ -75,6 +88,7 @@ function CreateForm({ engines, onDone }: { engines?: EngineInfo[]; onDone: (id?:
           database_name: info?.has_database_and_user === false ? undefined : database,
           username: info?.has_database_and_user === false ? undefined : username,
           memory_limit_mb: memory ? Number(memory) : undefined,
+          environment_id: environmentId || undefined,
           ...placement(serverId),
         },
       });
@@ -98,6 +112,10 @@ function CreateForm({ engines, onDone }: { engines?: EngineInfo[]; onDone: (id?:
       <label>Memory limit (MiB) <span className="muted small">(optional)</span>
         <input type="number" min={64} value={memory} onChange={(e) => setMemory(e.target.value)} />
       </label>
+      <label>Project / environment<select value={environmentId} onChange={(e) => setEnvironmentId(e.target.value)}>
+        <option value="">Default / production</option>
+        {(projects ?? []).flatMap((p) => p.environments.map((e) => <option key={e.id} value={e.id}>{p.name} / {e.name}</option>))}
+      </select></label>
       <ServerSelect value={serverId} onChange={setServerId} />
       {info?.has_database_and_user !== false && <>
         <label>Database name<input required className="mono" pattern="[A-Za-z][A-Za-z0-9_]{0,62}" value={database} onChange={(e) => setDatabase(e.target.value)} /></label>
@@ -120,6 +138,7 @@ function Detail({ service, onChanged, onRemoved }: { service: DatabaseService; o
   const [message, setMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
   const running = isActive(project.status);
+  const [dropVolumes, setDropVolumes] = useState(false);
 
   const run = async (action: () => Promise<string | undefined>) => {
     setBusy(true); setMessage(undefined);
@@ -131,8 +150,11 @@ function Detail({ service, onChanged, onRemoved }: { service: DatabaseService; o
     return action === 'start' ? 'Start queued.' : action === 'stop' ? 'Stopped.' : 'Restarted.';
   });
   const remove = () => {
-    if (!window.confirm(`Delete ${project.name}? The containers and settings are removed. The data volume is kept on the host until you remove it there.`)) return;
-    run(async () => { await api(`/database-services/${project.id}`, { method: 'DELETE' }); onRemoved(); return undefined; });
+    const volumes = dropVolumes
+      ? 'The data volume is DELETED too; this cannot be undone.'
+      : 'The data volume is kept on the host, so a database created later with this slug starts on the old data.';
+    if (!window.confirm(`Delete ${project.name}? The containers and settings are removed. ${volumes}`)) return;
+    run(async () => { await api(`/database-services/${project.id}${dropVolumes ? '?volumes=true' : ''}`, { method: 'DELETE' }); onRemoved(); return undefined; });
   };
   const reveal = () => run(async () => {
     setCredentials(await api<Credentials>(`/database-services/${project.id}/credentials`, { method: 'POST' }));
@@ -147,13 +169,14 @@ function Detail({ service, onChanged, onRemoved }: { service: DatabaseService; o
         <button className="ghost" disabled={busy || running} onClick={() => lifecycle('start')}>Start</button>
         <button className="ghost" disabled={busy || running} onClick={() => lifecycle('restart')}>Restart</button>
         <button className="ghost" disabled={busy || running} onClick={() => lifecycle('stop')}>Stop</button>
+        <label className="check" title="Without this the data volume stays on the host and a later database with the same slug reuses it."><input type="checkbox" checked={dropVolumes} onChange={(e) => setDropVolumes(e.target.checked)} /> also delete data volume</label>
         <button className="ghost danger" disabled={busy || running} onClick={remove}>Delete</button>
       </div>
     </div>
     <p className="hint">{DATABASE_ENGINE_LABELS[service.spec.engine]} {service.spec.version} · listens on <span className="mono">127.0.0.1:{service.loopback_port}</span>
       {service.spec.engine !== 'redis' && <> · database <span className="mono">{service.spec.database_name}</span> · user <span className="mono">{service.spec.username}</span></>}.
-      Deployment history, logs, and extra variables are under Compose projects ({project.slug}).</p>
-    <p className="hint">Containers of this environment&apos;s services that join its database network (Compose project → Database network) reach it at <span className="mono">{project.slug}:{ENGINE_PORTS[service.spec.engine]}</span>.</p>
+      Deployment history, logs, and extra variables are under Services ({project.slug}).</p>
+    <p className="hint">Containers of this environment&apos;s services that join its database network (Services → the service → Database network) reach it at <span className="mono">{project.slug}:{ENGINE_PORTS[service.spec.engine]}</span>.</p>
     {message && <p className="state" role="status">{message}</p>}
 
     <h3>Connection</h3>

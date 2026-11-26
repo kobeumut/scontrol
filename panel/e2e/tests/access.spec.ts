@@ -291,7 +291,7 @@ test('a non-admin user sees only what their role allows and is refused clearly o
   await expect(nav.getByRole('button', { name: 'Servers', exact: true })).toHaveCount(0);
 
   // Every visible tab still renders without an error state.
-  for (const tab of ['Projects & environments', 'Compose projects', 'API keys']) {
+  for (const tab of ['Projects', 'Services', 'API keys']) {
     await openTab(page, tab);
     await expect(page.getByText('Loading…')).toHaveCount(0);
   }

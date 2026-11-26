@@ -20,8 +20,8 @@ test.beforeAll(async ({ browser }) => {
   await signIn(page);
   projectName = unique('svcfeat');
   slug = projectName;
-  await openTab(page, 'Compose projects');
-  await page.getByRole('button', { name: 'New project' }).click();
+  await openTab(page, 'Services');
+  await page.getByRole('button', { name: 'New service' }).click();
   await page.getByLabel('Name', { exact: true }).fill(projectName);
   await page.getByRole('radio', { name: 'Raw Compose' }).click();
   await page.getByLabel('Compose YAML').fill(COMPOSE);
@@ -478,8 +478,8 @@ test.describe('pull request previews', () => {
     git = await browser.newPage();
     await signIn(git);
     gitName = unique('svcprev');
-    await openTab(git, 'Compose projects');
-    await git.getByRole('button', { name: 'New project' }).click();
+    await openTab(git, 'Services');
+    await git.getByRole('button', { name: 'New service' }).click();
     await git.getByLabel('Name', { exact: true }).fill(gitName);
     await git.getByLabel('Repository URL').fill('https://github.com/example/app.git');
     await git.getByLabel('Compose path').fill('docker-compose.yml');
@@ -494,7 +494,7 @@ test.describe('pull request previews', () => {
   // A reload returns to the first tab, so navigate back to the project.
   const reopen = async () => {
     await git.reload();
-    await openTab(git, 'Compose projects');
+    await openTab(git, 'Services');
     await git.getByRole('button', { name: gitName, exact: true }).click();
     await expect(git.getByRole('heading', { name: gitName })).toBeVisible();
   };
@@ -619,7 +619,7 @@ test.describe('pull request previews', () => {
     // "open" navigates to the preview's own project.
     await preview.getByRole('button', { name: 'open' }).click();
     await expect(git.getByRole('heading', { name: `${gitName} PR #${number}` })).toBeVisible();
-    await git.getByRole('button', { name: '← All projects' }).click();
+    await git.getByRole('button', { name: '← All services' }).click();
     await git.getByRole('button', { name: gitName, exact: true }).click();
     await expect(git.getByRole('heading', { name: gitName }).filter({ hasNotText: 'PR #' })).toBeVisible();
 

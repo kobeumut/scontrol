@@ -9,7 +9,7 @@ const TEMPLATES = [
   { id: 'uptime-kuma', name: 'Uptime Kuma' },
 ];
 
-const PROJECTS = 'Projects & environments';
+const PROJECTS = 'Projects';
 
 async function createProject(page: Page, name: string, slug?: string) {
   await page.getByRole('button', { name: 'New project' }).click();
@@ -314,7 +314,7 @@ for (const template of TEMPLATES) {
     await expect(page.getByText(/the first deployment is queued/)).toContainText(name);
     expect(failures).toEqual([]);
 
-    await openTab(page, 'Compose projects');
+    await openTab(page, 'Services');
     const row = page.getByRole('row', { name: new RegExp(slug) });
     await expect(row).toBeVisible();
     await expect(row).toContainText(name);

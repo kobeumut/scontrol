@@ -21,7 +21,7 @@ test('a session survives a reload', async ({ page }) => {
 });
 
 const TABS = [
-  'Projects & environments', 'Compose projects', 'Templates', 'Databases', 'Backups', 'Observability',
+  'Projects', 'Services', 'Templates', 'Databases', 'Backups', 'Observability',
   'Registries', 'Monitoring', 'Hosted sites', 'GitHub Apps', 'Notifications', 'Servers', 'Access', 'API keys',
 ];
 

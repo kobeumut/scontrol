@@ -1,13 +1,13 @@
 import { expect, Page, test } from '@playwright/test';
 import { openTab, signIn, unique, watchForFailures } from './helpers';
 
-// Compose projects tab: creating services from every source kind, deploy
+// Services screen: creating services from every source kind, deploy
 // history, rollback, logs, variables, Git access and the push webhook.
 // The host agent is a mock that keeps pretend host state: a deployment lists
 // the project's services as running, writes a short log, and a raw Compose file
 // containing `# e2e: slow` keeps deploying (up to 30 s) until it is cancelled.
 
-const COMPOSE_TAB = 'Compose projects';
+const COMPOSE_TAB = 'Services';
 
 async function openList(page: Page) {
   await signIn(page);
@@ -20,7 +20,7 @@ const statusBadge = (page: Page) => page.locator('.panel-title .badge');
 const deploymentRows = (page: Page) => page.locator('table').filter({ hasText: 'Trigger' }).locator('tbody tr');
 
 async function openForm(page: Page, name: string, source: string) {
-  await page.getByRole('button', { name: 'New project' }).click();
+  await page.getByRole('button', { name: 'New service' }).click();
   await form(page).getByLabel('Name', { exact: true }).fill(name);
   await form(page).getByRole('radio', { name: source, exact: true }).click();
 }
@@ -38,14 +38,14 @@ async function expectDeployed(page: Page, name: string) {
 const logServiceOptions = (page: Page) => page.getByLabel('Service', { exact: true }).first().locator('option');
 
 async function backToList(page: Page) {
-  await page.getByRole('button', { name: '← All projects' }).click();
+  await page.getByRole('button', { name: '← All services' }).click();
 }
 
 /** Deletes the open project through the UI (the prompt wants the slug). */
 async function deleteOpenProject(page: Page, slug: string) {
   page.once('dialog', (dialog) => dialog.accept(slug));
   await page.getByRole('button', { name: 'Delete', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'New project' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'New service' })).toBeVisible();
 }
 
 async function removeFromList(page: Page, slug: string) {
@@ -58,7 +58,7 @@ test('lists projects and toggles the create form', async ({ page }) => {
   const failures = watchForFailures(page);
   await openList(page);
   await expect(page.getByRole('columnheader', { name: 'Environment' })).toBeVisible();
-  await page.getByRole('button', { name: 'New project' }).click();
+  await page.getByRole('button', { name: 'New service' }).click();
   await expect(form(page)).toBeVisible();
   await expect(form(page).getByRole('radio')).toHaveCount(6);
   await page.getByRole('button', { name: 'Close' }).click();
@@ -68,7 +68,7 @@ test('lists projects and toggles the create form', async ({ page }) => {
 
 test('create form: name derives the slug and the button follows the deploy checkbox', async ({ page }) => {
   await openList(page);
-  await page.getByRole('button', { name: 'New project' }).click();
+  await page.getByRole('button', { name: 'New service' }).click();
   await form(page).getByLabel('Name', { exact: true }).fill('My Cool_App 2');
   await expect(form(page).getByLabel('Slug')).toHaveValue('my-cool-app-2');
   await expect(form(page).getByRole('button', { name: 'Create' })).toBeVisible();
@@ -80,7 +80,7 @@ test('create form: name derives the slug and the button follows the deploy check
 
 test('create form: browser validation blocks empty and malformed fields', async ({ page }) => {
   await openList(page);
-  await page.getByRole('button', { name: 'New project' }).click();
+  await page.getByRole('button', { name: 'New service' }).click();
   await form(page).getByRole('radio', { name: 'Raw Compose' }).click();
   await submit(page);
   // Nothing was submitted: still on the form, name is required.
@@ -97,7 +97,7 @@ test('create form: browser validation blocks empty and malformed fields', async 
 
 test('create form: a too-short slug is blocked by the browser', async ({ page }) => {
   await openList(page);
-  await page.getByRole('button', { name: 'New project' }).click();
+  await page.getByRole('button', { name: 'New service' }).click();
   await form(page).getByLabel('Name', { exact: true }).fill('ab');
   const requests: string[] = [];
   page.on('request', (r) => { if (r.method() === 'POST' && r.url().includes('/api/')) requests.push(r.url()); });
@@ -161,7 +161,7 @@ test('create form: server rejects a duplicate slug', async ({ page }) => {
   await expect(page.getByRole('heading', { name: slug })).toBeVisible();
   await backToList(page);
 
-  await page.getByRole('button', { name: 'New project' }).click();
+  await page.getByRole('button', { name: 'New service' }).click();
   await form(page).getByLabel('Name', { exact: true }).fill(slug);
   await form(page).getByRole('radio', { name: 'Raw Compose' }).click();
   await form(page).getByLabel('deploy right away').uncheck();
@@ -226,7 +226,13 @@ test('raw Compose: create, deploy, redeploy, roll back, stop and delete', async 
   page.once('dialog', (dialog) => dialog.accept('wrong'));
   await page.getByRole('button', { name: 'Delete', exact: true }).click();
   await expect(page.getByRole('heading', { name: slug })).toBeVisible();
-  await deleteOpenProject(page, slug);
+  // Asking for the volumes too says so in the confirmation and in the request.
+  await page.getByLabel('also delete data volumes').check();
+  const removal = page.waitForRequest((request) => request.method() === 'DELETE' && request.url().endsWith('?volumes=true'));
+  page.once('dialog', (dialog) => { expect(dialog.message()).toContain('DELETED too'); dialog.accept(slug); });
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  expect(await (await (await removal).response())!.json()).toEqual({ deleted: true, volumes_removed: true });
+  await expect(page.getByRole('button', { name: 'New service' })).toBeVisible();
   await expect(page.getByRole('cell', { name: slug, exact: true })).toHaveCount(0);
   expect(failures).toEqual([]);
 });
@@ -536,7 +542,7 @@ test('registry panel: choose and clear a private registry for a project', async 
 test('create form: the server select appears only when several servers exist', async ({ page }) => {
   await openList(page);
   const servers: unknown[] = await (await page.request.get('/api/servers')).json();
-  await page.getByRole('button', { name: 'New project' }).click();
+  await page.getByRole('button', { name: 'New service' }).click();
   await expect(form(page).getByLabel('Private registry')).toBeVisible();
   await expect(form(page).getByLabel('Server', { exact: true })).toHaveCount(servers.length >= 2 ? 1 : 0);
   if (servers.length >= 2) {

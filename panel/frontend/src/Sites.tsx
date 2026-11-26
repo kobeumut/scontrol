@@ -49,7 +49,7 @@ export function Sites({ isAdmin }: { isAdmin: boolean }) {
         <h2>Hosted sites</h2>
         <button className="action" onClick={() => setCreating((c) => !c)}>{creating ? 'Close' : 'New site'}</button>
       </div>
-      <p className="hint">Sites run directly on the host behind Nginx, each under its own system user. For containers use Compose projects.</p>
+      <p className="hint">Sites run directly on the host behind Nginx, each under its own system user. For containers use Projects and Services.</p>
       {creating && <CreateSite onCreated={() => { setCreating(false); sites.reload(); }} />}
       <StateView state={sites} />
       <ErrorLine error={action.error} />
