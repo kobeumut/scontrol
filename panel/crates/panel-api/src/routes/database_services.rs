@@ -16,7 +16,7 @@ use crate::db::database_services::DatabaseServiceRow;
 use crate::error::{ApiError, ApiResult};
 use crate::services::database_services as credentials;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -452,12 +452,14 @@ async fn remove(
     }: ServiceAccess<perm::ServicesDelete>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<super::compose_projects::RemoveQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (project, _) = find(&state, id).await?;
     refuse_while_running(&project)?;
     // Closes outside access, removes the containers, and deletes the
-    // agent's files. The named data volume is kept (as for every service),
-    // so data survives an accidental removal; remove it on the host.
+    // agent's files. The named data volume is kept (as for every service)
+    // unless `?volumes=true` asks for it, so data survives an accidental
+    // removal.
     match state
         .agents
         .for_server_id(&state.db, project.server_id)
@@ -465,6 +467,7 @@ async fn remove(
         .remove_compose_project(RemoveComposeProjectParams {
             project_slug: project.slug.clone(),
             expected_project_id: Some(project.id),
+            remove_volumes: query.volumes,
         })
         .await
     {
@@ -473,7 +476,9 @@ async fn remove(
     }
     db::compose_projects::delete(&state.db, id).await?;
     audit(&state, &user, "remove_database_service", &project).await;
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "volumes_removed": query.volumes }),
+    ))
 }
 
 /// Opens (or changes) outside access: a host Nginx stream proxy on

@@ -10,8 +10,10 @@ services:
       DATABASE_URL: postgres://plausible:${DB_PASSWORD}@db:5432/plausible
       CLICKHOUSE_DATABASE_URL: http://events:8123/plausible_events_db
     depends_on:
-      - db
-      - events
+      db:
+        condition: service_healthy
+      events:
+        condition: service_healthy
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -21,15 +23,34 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - db_data:/var/lib/postgresql/data
+    healthcheck:
+      # TCP on purpose: the first-start initialisation server only listens
+      # on the socket.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "plausible", "-d", "plausible"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
   events:
     image: clickhouse/clickhouse-server:24.3-alpine
     restart: unless-stopped
+    environment:
+      # Keep the passwordless `default` user reachable from the project
+      # network (newer image builds restrict it to localhost otherwise).
+      # The service publishes no port.
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
     volumes:
       - event_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
 volumes:
   db_data:
   event_data:

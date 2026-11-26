@@ -291,6 +291,7 @@ async fn create(
             .remove_compose_project(RemoveComposeProjectParams {
                 project_slug: project.slug.clone(),
                 expected_project_id: Some(project.id),
+                remove_volumes: false,
             })
             .await?;
         db::compose_projects::delete(&state.db, project.id)
@@ -589,33 +590,49 @@ async fn stop(
     Ok(Json(serde_json::json!({ "stopped": true })))
 }
 
+#[derive(Deserialize, Default)]
+pub(crate) struct RemoveQuery {
+    /// `?volumes=true` also deletes the named volumes Compose created for
+    /// the service. Without it they stay on the host, and a later service
+    /// with the same slug starts on the old data.
+    #[serde(default)]
+    pub(crate) volumes: bool,
+}
+
 async fn remove(
     ServiceAccess {
         principal: user, ..
     }: ServiceAccess<perm::ServicesDelete>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<RemoveQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let project = find_project(&state, id).await?;
-    teardown(&state, &project).await?;
+    teardown(&state, &project, query.volumes).await?;
     db::audit::record(
         &state.db,
         Some(user.id),
         user.actor_kind(),
         "remove_compose_project",
         Some(&project.slug),
-        serde_json::json!({ "project_id": project.id }),
+        serde_json::json!({ "project_id": project.id, "volumes_removed": query.volumes }),
     )
     .await
     .ok();
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "volumes_removed": query.volumes }),
+    ))
 }
 
 /// Removes a service from its server and then from the panel: its previews,
 /// containers, scheduled-job timers, vhosts and agent files, then the row.
 /// Refused (409) while a deployment or a preview teardown is running. Used
 /// by service removal and by deleting the owning user.
-pub(crate) async fn teardown(state: &AppState, project: &ComposeProject) -> ApiResult<()> {
+pub(crate) async fn teardown(
+    state: &AppState,
+    project: &ComposeProject,
+    remove_volumes: bool,
+) -> ApiResult<()> {
     let id = project.id;
     if project.status == DeploymentStatus::Running {
         return Err(ApiError::Conflict(
@@ -644,6 +661,7 @@ pub(crate) async fn teardown(state: &AppState, project: &ComposeProject) -> ApiR
         .remove_compose_project(RemoveComposeProjectParams {
             project_slug: project.slug.clone(),
             expected_project_id: Some(project.id),
+            remove_volumes,
         })
         .await
     {

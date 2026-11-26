@@ -320,6 +320,12 @@ pub struct RemoveComposeProjectParams {
     /// Incarnation fence. Older clients may omit it; new panel calls must set it.
     #[serde(default)]
     pub expected_project_id: Option<Uuid>,
+    /// Also delete the named volumes Compose created for this project (its
+    /// label and `<slug>_` prefix). Off by default: data survives a removal.
+    /// Without it, a later project that reuses the slug inherits the old
+    /// volumes, and with them the old database passwords.
+    #[serde(default)]
+    pub remove_volumes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -883,6 +889,8 @@ pub mod mock {
         pub releases: Mutex<Vec<Uuid>>,
         /// Every `set_database_exposure` request.
         pub exposures: Mutex<Vec<SetDatabaseExposureParams>>,
+        /// Every `remove_compose_project` request.
+        pub removals: Mutex<Vec<RemoveComposeProjectParams>>,
         /// Every scheduled-job install request received.
         pub job_upserts: Mutex<Vec<UpsertScheduledJobParams>>,
         /// Runs `list_scheduled_job_runs` reports (filtered by job and
@@ -1140,9 +1148,11 @@ pub mod mock {
 
         async fn remove_compose_project(
             &self,
-            _params: RemoveComposeProjectParams,
+            params: RemoveComposeProjectParams,
         ) -> CoreResult<()> {
-            self.record("remove_compose_project")
+            self.record("remove_compose_project")?;
+            self.removals.lock().unwrap().push(params);
+            Ok(())
         }
 
         async fn list_compose_project_services(

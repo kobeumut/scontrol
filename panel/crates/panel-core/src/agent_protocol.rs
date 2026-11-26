@@ -326,6 +326,21 @@ mod tests {
     use crate::adapters::CreateSiteParams;
     use crate::types::Runtime;
 
+    /// A panel from before `remove_volumes` omits it: volumes are kept.
+    #[test]
+    fn removal_keeps_volumes_unless_asked() {
+        let req: AgentRequest = serde_json::from_str(
+            r#"{"op":"remove_compose_project","params":{"project_slug":"shop"}}"#,
+        )
+        .unwrap();
+        match req {
+            AgentRequest::RemoveComposeProject(params) => {
+                assert!(!params.remove_volumes && params.expected_project_id.is_none());
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
     #[test]
     fn request_round_trips_through_json() {
         let req = AgentRequest::CreateSite(CreateSiteParams {

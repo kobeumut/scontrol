@@ -332,6 +332,28 @@ default = "localhost"
         assert!(all.len() >= 5);
         let ids: BTreeSet<_> = all.iter().map(|t| t.meta.id.clone()).collect();
         assert_eq!(ids.len(), all.len());
+        for template in &all {
+            let id = &template.meta.id;
+            // The domain suggestion must name a service of the Compose file.
+            if let Some(domain) = &template.meta.suggested_domain {
+                assert!(
+                    template
+                        .compose_yaml
+                        .contains(&format!("\n  {}:\n", domain.service)),
+                    "{id}: suggested domain names no service"
+                );
+            }
+            // Images are pinned to a version, never `latest` or untagged.
+            for line in template.compose_yaml.lines() {
+                if let Some(image) = line.trim().strip_prefix("image: ") {
+                    let tag = image.rsplit_once(':').map(|(_, tag)| tag);
+                    assert!(
+                        tag.is_some_and(|tag| tag != "latest" && !tag.contains('/')),
+                        "{id}: image {image} is not pinned"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

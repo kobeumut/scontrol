@@ -852,6 +852,7 @@ pub async fn teardown(
         agent.remove_compose_project(RemoveComposeProjectParams {
             project_slug: row.slug.clone(),
             expected_project_id: Some(row.preview_project_id),
+            remove_volumes: false,
         }),
     )
     .await
