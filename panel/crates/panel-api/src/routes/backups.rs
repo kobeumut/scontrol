@@ -38,6 +38,7 @@ pub fn router() -> Router<AppState> {
         .route("/destinations/:id/volume/restore", post(restore_volume))
         .route("/runs", get(runs))
         .route("/runs/:id", get(run))
+        .nest("/schedules", super::backup_schedules::router())
 }
 
 #[derive(Serialize)]
@@ -85,6 +86,9 @@ struct RunView {
     error: Option<String>,
     started_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
+    /// `manual` or `schedule`.
+    trigger: String,
+    schedule_id: Option<Uuid>,
 }
 
 impl From<RunRow> for RunView {
@@ -101,6 +105,8 @@ impl From<RunRow> for RunView {
             error: r.error,
             started_at: r.started_at,
             finished_at: r.finished_at,
+            trigger: r.trigger,
+            schedule_id: r.schedule_id,
         }
     }
 }
@@ -676,6 +682,7 @@ async fn spawn_run(
 #[derive(Deserialize)]
 struct RunsQuery {
     destination_id: Option<Uuid>,
+    schedule_id: Option<Uuid>,
 }
 
 async fn runs(
@@ -683,7 +690,7 @@ async fn runs(
     State(state): State<AppState>,
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<Json<Vec<RunView>>> {
-    let rows = db::backups::list_runs(&state.db, q.destination_id).await?;
+    let rows = db::backups::list_runs(&state.db, q.destination_id, q.schedule_id).await?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
 

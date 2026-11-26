@@ -616,6 +616,28 @@ impl Notification {
             urgent: !succeeded,
         })
     }
+
+    /// A failed scheduled backup. The error is already redacted of the S3
+    /// keys and the database password.
+    pub fn backup_failed(
+        schedule_name: &str,
+        source: &str,
+        run_id: Uuid,
+        schedule_id: Uuid,
+        error: &str,
+    ) -> Self {
+        let short: String = error.chars().take(MAX_BODY_ERROR_CHARS).collect();
+        Self {
+            event: "backup_failed",
+            title: format!("Scheduled backup failed: {schedule_name}"),
+            body: format!("Source: {source}\nError: {short}"),
+            data: json!({
+                "schedule": { "id": schedule_id, "name": schedule_name },
+                "run": { "id": run_id, "source": source, "error": data_error(error) },
+            }),
+            urgent: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1018,6 +1040,8 @@ mod tests {
             error: None,
             started_at: now - chrono::Duration::seconds(42),
             finished_at: None,
+            trigger: "manual".into(),
+            schedule_id: None,
         };
         // A run still in progress is not notified.
         assert!(Notification::backup_run(&run, "r2").is_none());

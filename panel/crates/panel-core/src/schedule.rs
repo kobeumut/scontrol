@@ -351,15 +351,9 @@ fn render_weekdays(values: Values) -> Option<String> {
     Some(render_runs(&set, |d| NAMES[d as usize].to_string()))
 }
 
-/// Converts a five-field cron expression (minute, hour, day of month,
-/// month, day of week; names, ranges, steps, and lists allowed) or a macro
-/// (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`,
-/// `@annually`) to `OnCalendar=` expressions without a time zone.
-///
-/// Like Vixie cron, a schedule that restricts both day fields (neither
-/// starts with `*`) runs when either matches, so it becomes two
-/// expressions; otherwise both restrictions apply together.
-pub fn cron_to_on_calendar(expression: &str) -> Result<Vec<String>, String> {
+/// Expands a macro and splits a cron expression into its five fields,
+/// checking the character set and the field count.
+fn split_cron(expression: &str) -> Result<[String; 5], String> {
     let expression = expression.trim();
     let expanded = match expression.to_ascii_lowercase().as_str() {
         "@yearly" | "@annually" => "0 0 1 1 *",
@@ -385,6 +379,26 @@ pub fn cron_to_on_calendar(expression: &str) -> Result<Vec<String>, String> {
             "a cron expression has five fields: minute hour day-of-month month day-of-week".into(),
         );
     };
+    Ok([minute, hour, dom, month, dow].map(str::to_string))
+}
+
+/// Converts a five-field cron expression (minute, hour, day of month,
+/// month, day of week; names, ranges, steps, and lists allowed) or a macro
+/// (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`,
+/// `@annually`) to `OnCalendar=` expressions without a time zone.
+///
+/// Like Vixie cron, a schedule that restricts both day fields (neither
+/// starts with `*`) runs when either matches, so it becomes two
+/// expressions; otherwise both restrictions apply together.
+pub fn cron_to_on_calendar(expression: &str) -> Result<Vec<String>, String> {
+    let [minute, hour, dom, month, dow] = split_cron(expression)?;
+    let (minute, hour, dom, month, dow) = (
+        minute.as_str(),
+        hour.as_str(),
+        dom.as_str(),
+        month.as_str(),
+        dow.as_str(),
+    );
     let minutes = render_numeric(parse_field(&MINUTE, minute)?, 0, 59);
     let hours = render_numeric(parse_field(&HOUR, hour)?, 0, 23);
     let days = parse_field(&DAY_OF_MONTH, dom)?;
@@ -408,6 +422,120 @@ pub fn cron_to_on_calendar(expression: &str) -> Result<Vec<String>, String> {
         return Ok(both);
     }
     Ok(vec![line(weekdays, days)])
+}
+
+/// How far ahead [`CronSpec::next_after`] looks. `0 0 29 2 *` can wait
+/// eight years (2096 → 2104), so nine years covers every valid expression.
+const CRON_SEARCH_DAYS: i64 = 366 * 9;
+
+/// A cron expression evaluated by the panel itself, for schedules it runs
+/// without a systemd timer (scheduled backups, whose S3 keys and database
+/// passwords must stay sealed in panel-api). Day matching follows
+/// [`cron_to_on_calendar`], so a backup and a job with the same expression
+/// fire on the same days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CronSpec {
+    minutes: Values,
+    hours: Values,
+    days: Values,
+    months: Values,
+    /// Sunday is bit 0 (cron's 7 folded into it).
+    weekdays: Values,
+    /// Both day fields are restricted, so a day matches when either does.
+    either_day: bool,
+}
+
+impl CronSpec {
+    /// Parses a five-field expression or macro and checks that it ever runs
+    /// (`0 0 31 2 *` never does).
+    pub fn parse(expression: &str) -> Result<Self, String> {
+        let [minute, hour, dom, month, dow] = split_cron(expression)?;
+        let weekdays = parse_field(&DAY_OF_WEEK, &dow)?;
+        let weekdays = (weekdays & 0x7f) | u64::from(weekdays & 0x80 != 0);
+        let spec = CronSpec {
+            minutes: parse_field(&MINUTE, &minute)?,
+            hours: parse_field(&HOUR, &hour)?,
+            days: parse_field(&DAY_OF_MONTH, &dom)?,
+            months: parse_field(&MONTH, &month)?,
+            weekdays,
+            either_day: !dom.starts_with('*') && !dow.starts_with('*') && weekdays != 0x7f,
+        };
+        let probe = DateTime::<Utc>::from_timestamp(0, 0).expect("epoch");
+        if spec.next_after(probe, &Utc).is_none() {
+            return Err("this cron expression never runs".into());
+        }
+        Ok(spec)
+    }
+
+    fn day_matches(&self, date: chrono::NaiveDate) -> bool {
+        use chrono::Datelike;
+        if self.months & (1 << date.month()) == 0 {
+            return false;
+        }
+        let dom = self.days & (1 << date.day()) != 0;
+        let dow = self.weekdays & (1 << date.weekday().num_days_from_sunday()) != 0;
+        if self.either_day {
+            dom || dow
+        } else {
+            dom && dow
+        }
+    }
+
+    /// The first run strictly after `after`, reading the expression in
+    /// `tz`. A wall-clock time skipped by a DST change runs an hour later
+    /// (02:30 → 03:30); a repeated one runs only at its first occurrence.
+    pub fn next_after<Tz: chrono::TimeZone>(
+        &self,
+        after: DateTime<Utc>,
+        tz: &Tz,
+    ) -> Option<DateTime<Utc>> {
+        use chrono::LocalResult;
+        let resolve = |naive: chrono::NaiveDateTime| match tz.from_local_datetime(&naive) {
+            LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.with_timezone(&Utc)),
+            LocalResult::None => None,
+        };
+        let first_day = after.with_timezone(tz).date_naive();
+        for offset in 0..CRON_SEARCH_DAYS {
+            let date = first_day + chrono::Duration::days(offset);
+            if !self.day_matches(date) {
+                continue;
+            }
+            for hour in (0..24u32).filter(|h| self.hours & (1 << h) != 0) {
+                for minute in (0..60u32).filter(|m| self.minutes & (1 << m) != 0) {
+                    let naive = date.and_hms_opt(hour, minute, 0)?;
+                    let instant =
+                        resolve(naive).or_else(|| resolve(naive + chrono::Duration::hours(1)));
+                    match instant {
+                        Some(t) if t > after => return Some(t),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The next run of `expression` in the IANA zone `timezone` after `after`.
+pub fn next_cron_run(
+    expression: &str,
+    timezone: &str,
+    after: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
+    let spec = CronSpec::parse(expression)?;
+    let tz = parse_timezone(timezone)?;
+    spec.next_after(after, &tz)
+        .ok_or_else(|| "this cron expression never runs".into())
+}
+
+/// An IANA time zone known to the panel's tz database.
+pub fn parse_timezone(timezone: &str) -> Result<chrono_tz::Tz, String> {
+    if !is_valid_timezone(timezone) {
+        return Err("invalid time zone (use an IANA name such as Europe/Istanbul)".into());
+    }
+    timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| format!("unknown time zone {timezone:?}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -519,6 +647,80 @@ pub struct ScheduledJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn cron_next_run_follows_fields_macros_and_zones() {
+        let next = |e: &str, tz: &str, after: &str| next_cron_run(e, tz, at(after)).unwrap();
+        assert_eq!(
+            next("*/15 * * * *", "UTC", "2026-01-01T10:07:30Z"),
+            at("2026-01-01T10:15:00Z")
+        );
+        // Strictly after: a run at exactly `after` is not repeated.
+        assert_eq!(
+            next("@daily", "UTC", "2026-01-01T00:00:00Z"),
+            at("2026-01-02T00:00:00Z")
+        );
+        // 03:00 in Istanbul (UTC+3) is midnight UTC.
+        assert_eq!(
+            next("0 3 * * *", "Europe/Istanbul", "2026-03-10T12:00:00Z"),
+            at("2026-03-11T00:00:00Z")
+        );
+        // Sunday as 0 and as 7; 2026-01-04 is a Sunday.
+        for e in ["30 4 * * 0", "30 4 * * 7", "30 4 * * sun"] {
+            assert_eq!(
+                next(e, "UTC", "2026-01-01T00:00:00Z"),
+                at("2026-01-04T04:30:00Z"),
+                "{e}"
+            );
+        }
+        // Both day fields restricted: either matches (the 1st, or a Monday).
+        assert_eq!(
+            next("0 0 1 * mon", "UTC", "2026-01-02T00:00:00Z"),
+            at("2026-01-05T00:00:00Z")
+        );
+        assert_eq!(
+            next("0 0 29 2 *", "UTC", "2026-03-01T00:00:00Z"),
+            at("2028-02-29T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn cron_next_run_handles_dst_changes_once() {
+        // Berlin springs forward 2026-03-29 02:00 → 03:00: 02:30 runs at 03:30.
+        assert_eq!(
+            next_cron_run("30 2 * * *", "Europe/Berlin", at("2026-03-28T12:00:00Z")).unwrap(),
+            at("2026-03-29T01:30:00Z")
+        );
+        // Falls back 2026-10-25 03:00 → 02:00: 02:30 runs only the first time.
+        let first =
+            next_cron_run("30 2 * * *", "Europe/Berlin", at("2026-10-24T12:00:00Z")).unwrap();
+        assert_eq!(first, at("2026-10-25T00:30:00Z"));
+        let after = next_cron_run("30 2 * * *", "Europe/Berlin", first).unwrap();
+        assert_eq!(after, at("2026-10-26T01:30:00Z"));
+    }
+
+    #[test]
+    fn cron_spec_rejects_bad_expressions_and_zones() {
+        let now = at("2026-01-01T00:00:00Z");
+        for bad in [
+            "",
+            "* * * *",
+            "61 * * * *",
+            "0 0 31 2 *",
+            "@reboot",
+            "0 0 * * * ; rm",
+        ] {
+            assert!(next_cron_run(bad, "UTC", now).is_err(), "{bad}");
+        }
+        for zone in ["Mars/Olympus", "../etc", "Europe/Istanbul\n"] {
+            assert!(next_cron_run("@daily", zone, now).is_err(), "{zone}");
+        }
+        assert!(parse_timezone("America/Argentina/Buenos_Aires").is_ok());
+    }
 
     fn cron(expression: &str) -> Vec<String> {
         cron_to_on_calendar(expression).unwrap_or_else(|e| panic!("{expression}: {e}"))
