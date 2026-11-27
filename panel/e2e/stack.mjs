@@ -81,13 +81,18 @@ export async function startStack() {
   };
 
   try {
-    const data = join(dir, 'pg');
-    const passwordFile = join(dir, 'pgpass');
-    writeFileSync(passwordFile, 'scontrol\n', { mode: 0o600 });
-    execFileSync(postgresBin('initdb'), ['-D', data, '-U', 'scontrol', '-A', 'scram-sha-256', '--pwfile', passwordFile, '-E', 'UTF8'], { stdio: 'ignore' });
-    run('postgres', postgresBin('postgres'), ['-D', data, '-p', String(PORTS.postgres), '-c', 'listen_addresses=127.0.0.1', '-k', dir, '-c', 'fsync=off']);
-    await waitForPort(PORTS.postgres, 'PostgreSQL');
-    const databaseUrl = `postgres://scontrol:scontrol@127.0.0.1:${PORTS.postgres}/postgres`;
+    // E2E_DATABASE_URL: use an existing, empty PostgreSQL database (for
+    // example one in Docker) on a machine without the server binaries.
+    let databaseUrl = process.env.E2E_DATABASE_URL;
+    if (!databaseUrl) {
+      const data = join(dir, 'pg');
+      const passwordFile = join(dir, 'pgpass');
+      writeFileSync(passwordFile, 'scontrol\n', { mode: 0o600 });
+      execFileSync(postgresBin('initdb'), ['-D', data, '-U', 'scontrol', '-A', 'scram-sha-256', '--pwfile', passwordFile, '-E', 'UTF8'], { stdio: 'ignore' });
+      run('postgres', postgresBin('postgres'), ['-D', data, '-p', String(PORTS.postgres), '-c', 'listen_addresses=127.0.0.1', '-k', dir, '-c', 'fsync=off']);
+      await waitForPort(PORTS.postgres, 'PostgreSQL');
+      databaseUrl = `postgres://scontrol:scontrol@127.0.0.1:${PORTS.postgres}/postgres`;
+    }
 
     const socket = join(dir, 'agent.sock');
     run('agent', findBinary('scontrol-mock-agent'), [socket]);

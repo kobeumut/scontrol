@@ -17,7 +17,8 @@ services:
     volumes:
       - uploads:/directus/uploads
     depends_on:
-      - db
+      db:
+        condition: service_healthy
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -27,6 +28,14 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - db_data:/var/lib/postgresql/data
+    healthcheck:
+      # TCP on purpose: the first-start initialisation server only listens
+      # on the socket.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "directus", "-d", "directus"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
 volumes:
   uploads:
   db_data:

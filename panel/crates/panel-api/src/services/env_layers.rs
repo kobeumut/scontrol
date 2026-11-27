@@ -349,8 +349,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows.len(), 5);
+        // Whole values, not their `-111` suffixes: a row also carries random
+        // UUIDs, which contain such a fragment every few dozen runs.
         for row in &rows {
-            assert!(!row.contains("-111") && !row.contains("-222") && !row.contains("-333"));
+            for value in [
+                "proj-db-111",
+                "eu-111",
+                "env-db-222",
+                "debug-222",
+                "svc-db-333",
+            ] {
+                assert!(!row.contains(value), "plaintext {value} stored");
+            }
         }
     }
 

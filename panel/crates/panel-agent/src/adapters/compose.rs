@@ -569,6 +569,9 @@ pub(crate) async fn resolved_environment_secrets(
     let mut secrets = environment_secrets(root).await?;
     let environment = private_compose_config(slug, paths, envs, &["--environment"]).await?;
     for line in environment.lines() {
+        if is_agent_process_variable(line) {
+            continue;
+        }
         // Continuations of multiline values have no key; retain them too.
         secrets.push(
             line.split_once('=')
@@ -596,7 +599,59 @@ pub(crate) async fn resolved_environment_secrets(
             }
         }
     }
+    let identifiers = structural_identifiers(slug, &model);
+    secrets.retain(|secret| !identifiers.contains(secret.as_str()));
     Ok(maskable_secrets(secrets))
+}
+
+/// Whether a `NAME=value` line of `docker compose config --environment` is
+/// only the agent's own process environment showing through: that listing
+/// is everything Compose can interpolate, so it also carries `PATH`, `HOME`
+/// and the variables the Docker CLI sets for its plugins
+/// (`DOCKER_CLI_PLUGIN_ORIGINAL_CLI_COMMAND=docker`). Masking those turns
+/// `docker compose` into `******** compose` in every log. A variable the
+/// project's environment file sets is never skipped here (its value differs
+/// from the process value, or `environment_secrets` already holds it), and a
+/// process variable that a service really uses is still collected from the
+/// resolved service environment.
+fn is_agent_process_variable(line: &str) -> bool {
+    let Some((name, value)) = line.split_once('=') else {
+        return false;
+    };
+    name.starts_with("DOCKER_CLI_PLUGIN_")
+        || matches!(name, "COMPOSE_PROJECT_NAME" | "DOCKER_CONFIG")
+        || std::env::var(name).is_ok_and(|own| own == value)
+}
+
+/// Names Docker prints in every line about the project: its slug, its
+/// service names, and the repository names of its images. They are part of
+/// the Compose file's structure, not confidential, so a value that merely
+/// equals one (`WORDPRESS_DB_USER: wordpress` next to a service called
+/// `wordpress`) must not blank the name out of `Container shop-wordpress-1
+/// Started` or of the `wordpress-1  |` prefix of the container logs.
+fn structural_identifiers(
+    slug: &str,
+    model: &serde_json::Value,
+) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    names.insert(slug.to_string());
+    if let Some(services) = model.get("services").and_then(serde_json::Value::as_object) {
+        for (name, service) in services {
+            names.insert(name.clone());
+            let Some(image) = service.get("image").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            // `registry:5000/team/app:tag@sha256:…` → `registry:5000/team/app`.
+            let repository = image.split('@').next().unwrap_or(image);
+            let repository = match repository.rsplit_once(':') {
+                Some((head, tag)) if !tag.contains('/') => head,
+                _ => repository,
+            };
+            names.insert(repository.to_string());
+            names.extend(repository.split('/').map(str::to_string));
+        }
+    }
+    names
 }
 
 async fn private_compose_config(
@@ -756,12 +811,28 @@ pub async fn remove(cfg: &AgentConfig, params: RemoveComposeProjectParams) -> Co
         }
         Err(error) => return Err(error),
     };
+    let remove_volumes = params.remove_volumes || root.join(EPHEMERAL_MARKER).is_file();
+    if remove_volumes {
+        // `down` leaves the anonymous volumes of the containers behind (an
+        // image's own `VOLUME`, e.g. a database data directory the Compose
+        // file mounts nothing over). They carry no project label, so once
+        // their containers are gone nothing can find them again.
+        let args = compose_rm_args(&params.project_slug, &paths);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, _, _) = run_allow_nonzero("docker", &refs).await?;
+        if code != 0 {
+            return Err(CoreError::External(format!(
+                "removing the project's containers failed (exit code {code})"
+            )));
+        }
+    }
     let mut args = compose_args(&params.project_slug, &paths);
     // Never pass `--volumes`: persistent named volumes survive a project
-    // removal unless an operator explicitly removes them outside the panel,
-    // and `--volumes` would also delete explicitly named volumes another
-    // project shares. A pull request preview is temporary by definition, so
-    // the volumes it owns (by label and name prefix) are removed below.
+    // removal unless the request asks for their removal, and `--volumes`
+    // would also delete explicitly named volumes another project shares. A
+    // pull request preview is temporary by definition. In both cases only
+    // the volumes the project owns (by label and name prefix) are removed
+    // below.
     args.extend(["down".into(), "--remove-orphans".into()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_allow_nonzero("docker", &refs).await?;
@@ -771,7 +842,7 @@ pub async fn remove(cfg: &AgentConfig, params: RemoveComposeProjectParams) -> Co
             "docker compose removal failed (exit code {code})"
         )));
     }
-    if root.join(EPHEMERAL_MARKER).is_file() {
+    if remove_volumes {
         remove_owned_volumes(&params.project_slug).await?;
     }
     let owned = read_owned_domains(&root).await;
@@ -1809,14 +1880,14 @@ async fn remove_owned_volumes(slug: &str) -> CoreResult<()> {
         run_allow_nonzero("docker", &["volume", "ls", "--quiet", "--filter", &filter]).await?;
     if code != 0 {
         return Err(CoreError::External(
-            "listing the preview's volumes failed".into(),
+            "listing the project's volumes failed".into(),
         ));
     }
     for volume in owned_volume_names(slug, &stdout) {
         let (code, _, _) = run_allow_nonzero("docker", &["volume", "rm", volume]).await?;
         if code != 0 {
             return Err(CoreError::External(format!(
-                "removing preview volume {volume} failed"
+                "removing volume {volume} failed"
             )));
         }
     }
@@ -3615,6 +3686,20 @@ fn compose_up_args(
     args
 }
 
+/// `docker compose ... rm --stop --force --volumes`: stops and removes the
+/// project's containers together with their anonymous volumes. Named
+/// volumes are not touched by it.
+fn compose_rm_args(slug: &str, paths: &ProjectPaths) -> Vec<String> {
+    let mut args = compose_args(slug, paths);
+    args.extend([
+        "rm".into(),
+        "--stop".into(),
+        "--force".into(),
+        "--volumes".into(),
+    ]);
+    args
+}
+
 /// `docker compose ... exec -T -e <marker>... <service> <argv...>` for a
 /// scheduled job. Compose stops parsing its own options at the service
 /// name, and the command never starts with `-` (see
@@ -3910,6 +3995,69 @@ mod tests {
         }
     }
 
+    /// Every shipped template must deploy as it is: accepted by the Compose
+    /// policy, exposing the service its suggested domain names, and ordered
+    /// so that no application starts before its database answers.
+    #[tokio::test]
+    async fn shipped_templates_pass_the_policy_and_wait_for_their_dependencies() {
+        let base =
+            std::env::temp_dir().join(format!("scontrol-templates-{}", uuid::Uuid::new_v4()));
+        for template in panel_core::templates::catalogue() {
+            let id = &template.meta.id;
+            let code = base.join(id);
+            std::fs::create_dir_all(&code).unwrap();
+            let path = code.join("docker-compose.yml");
+            std::fs::write(&path, &template.compose_yaml).unwrap();
+            let yaml = validate_compose_file(&path, &code, &[])
+                .await
+                .unwrap_or_else(|error| panic!("template {id}: {error}"));
+            let services = yaml.get("services").and_then(Yaml::as_mapping).unwrap();
+            if let Some(domain) = &template.meta.suggested_domain {
+                assert!(
+                    services.contains_key(domain.service.as_str()),
+                    "template {id}: suggested domain names no service"
+                );
+            }
+            // A template installs with no domain; it must not publish a
+            // host port on its own.
+            for (name, service) in services {
+                let name = name.as_str().unwrap();
+                assert!(
+                    service.get("ports").is_none(),
+                    "template {id}: {name} publishes a port"
+                );
+                assert_eq!(
+                    service.get("restart").and_then(Yaml::as_str),
+                    Some("unless-stopped"),
+                    "template {id}: {name} restart policy"
+                );
+                let Some(depends_on) = service.get("depends_on") else {
+                    continue;
+                };
+                let depends_on = depends_on.as_mapping().unwrap_or_else(|| {
+                    panic!("template {id}: {name} must use the long depends_on form")
+                });
+                for (dependency, settings) in depends_on {
+                    let dependency = dependency.as_str().unwrap();
+                    assert_eq!(
+                        settings.get("condition").and_then(Yaml::as_str),
+                        Some("service_healthy"),
+                        "template {id}: {name} does not wait for {dependency}"
+                    );
+                    assert!(
+                        services
+                            .get(dependency)
+                            .and_then(|s| s.get("healthcheck"))
+                            .and_then(|h| h.get("test"))
+                            .is_some(),
+                        "template {id}: {dependency} has no health check"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn renders_application_into_a_policy_clean_compose_file() {
         let root = Path::new("/var/lib/scontrol/docker/shop");
@@ -4180,6 +4328,7 @@ mod tests {
             RemoveComposeProjectParams {
                 project_slug: "site".into(),
                 expected_project_id: None,
+                remove_volumes: false,
             },
         )
         .await
@@ -4887,6 +5036,7 @@ mod tests {
             RemoveComposeProjectParams {
                 project_slug: "preview".into(),
                 expected_project_id: Some(old),
+                remove_volumes: false,
             },
         )
         .await
@@ -5406,6 +5556,11 @@ mod tests {
             "first-secret-8371",
             "last-secret-8371",
         ];
+        // Neither Docker's own plugin variables nor names Docker prints in
+        // every line (project, service, image) are masked.
+        for value in ["docker", "mask-test", "alpine"] {
+            assert!(!secrets.iter().any(|s| s == value), "masked: {value:?}");
+        }
         let id = uuid::Uuid::new_v4();
         let mut log = DeployLog::create(
             &base.join("logs"),
@@ -5468,6 +5623,71 @@ mod tests {
             .contains("cannot resolve Compose environment safely"));
         assert!(!error.message().contains("required-secret-8371"));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn removing_volumes_takes_anonymous_ones_with_the_containers() {
+        let paths = ProjectPaths {
+            code_dir: PathBuf::from("/srv/p/code"),
+            compose: PathBuf::from("/srv/p/code/docker-compose.yml"),
+            env: Some(PathBuf::from("/srv/p/env")),
+            override_file: None,
+        };
+        let args = compose_rm_args("shop", &paths);
+        assert_eq!(
+            args,
+            [
+                "compose",
+                "-p",
+                "shop",
+                "--project-directory",
+                "/srv/p/code",
+                "--env-file",
+                "/srv/p/env",
+                "-f",
+                "/srv/p/code/docker-compose.yml",
+                "rm",
+                "--stop",
+                "--force",
+                "--volumes",
+            ]
+        );
+    }
+
+    #[test]
+    fn structural_names_and_the_agents_own_environment_are_not_masked() {
+        let model = serde_json::json!({ "services": {
+            "wordpress": { "image": "wordpress:6-apache" },
+            "db": { "image": "registry.example.com:5000/team/mariadb:11@sha256:abc" },
+            "built": { "build": { "context": "." } },
+        }});
+        let names = structural_identifiers("shop", &model);
+        for name in [
+            "shop",
+            "wordpress",
+            "db",
+            "built",
+            "mariadb",
+            "team",
+            "registry.example.com:5000/team/mariadb",
+        ] {
+            assert!(names.contains(name), "{name}");
+        }
+        // Tags, digests and anything else stay maskable.
+        assert!(!names.contains("6-apache") && !names.contains("11"));
+
+        assert!(is_agent_process_variable(
+            "DOCKER_CLI_PLUGIN_ORIGINAL_CLI_COMMAND=docker"
+        ));
+        assert!(is_agent_process_variable("COMPOSE_PROJECT_NAME=shop"));
+        let path = std::env::var("PATH").unwrap();
+        assert!(is_agent_process_variable(&format!("PATH={path}")));
+        // The same name with another value comes from the project.
+        assert!(!is_agent_process_variable("PATH=project-secret-value"));
+        assert!(!is_agent_process_variable("DB_PASSWORD=hunter2-hunter2"));
+        assert!(!is_agent_process_variable(
+            "continuation of a multiline value"
+        ));
     }
 
     #[tokio::test]

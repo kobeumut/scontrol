@@ -7,10 +7,15 @@ type Installed = { project: ComposeProject; deployment: Deployment | null; sugge
 const slugify = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
 
 /** Vetted application catalogue: one-click install with generated secrets. */
-export function Templates({ onInstalled }: { onInstalled?: (projectId: string) => void }) {
+export function Templates({ initialEnvironmentId, onOpenService }: {
+  /** Environment the install form starts on, e.g. the one picked on a project's page. */
+  initialEnvironmentId?: string;
+  onOpenService?: (serviceId: string) => void;
+}) {
   const catalogue = useApi<TemplateInfo[]>('/templates');
   const projects = useApi<Project[]>('/projects');
-  const [environmentId, setEnvironmentId] = useState('');
+  const [environmentId, setEnvironmentId] = useState(initialEnvironmentId ?? '');
+  const target = (projects.data ?? []).flatMap((p) => p.environments.map((e) => ({ id: e.id, label: `${p.name} / ${e.name}` }))).find((e) => e.id === initialEnvironmentId);
   const [chosen, setChosen] = useState<TemplateInfo>();
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
@@ -31,26 +36,29 @@ export function Templates({ onInstalled }: { onInstalled?: (projectId: string) =
         method: 'POST', body: { name: name.trim(), slug, inputs, environment_id: environmentId || undefined },
       });
       setDone(result);
-      onInstalled?.(result.project.id);
     });
   };
 
   return <section className="panel">
     <div className="panel-title"><h2>Template catalogue</h2></div>
     <p className="hint">Vetted applications that ship with the panel. Passwords and keys are generated at install and stored write-only in the project's environment.</p>
+    {target && <p className="state" role="status">Installing into <strong>{target.label}</strong>. Pick an application below.</p>}
     <StateView state={catalogue} />
+    {catalogue.data?.length === 0 && <p className="state">The catalogue is empty on this installation.</p>}
     <div className="cards">
       {catalogue.data?.map((t) => <article key={t.id} className={`card${chosen?.id === t.id ? ' selected' : ''}`}>
         <h3>{t.name}</h3>
-        <p className="muted small">{t.category}</p>
-        <p>{t.description}</p>
+        <p className="muted small category">{t.category}</p>
+        <p className="description">{t.description}</p>
         <button className="action" onClick={() => choose(t)}>Install…</button>
       </article>)}
     </div>
     {chosen && <form className="card" onSubmit={install}>
       <h3>Install {chosen.name}</h3>
-      <label>Project name<input required value={name} onChange={(e) => setName(e.target.value)} /></label>
-      <label>Slug<input required className="mono" pattern="[a-z0-9][a-z0-9\-]{0,39}" value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
+      <div className="grid2">
+        <label>Project name<input required value={name} onChange={(e) => setName(e.target.value)} /></label>
+        <label>Slug<input required className="mono" pattern="[a-z0-9][a-z0-9\-]{0,39}" value={slug} onChange={(e) => setSlug(e.target.value)} /></label>
+      </div>
       <label>Project / environment<select value={environmentId} onChange={(e) => setEnvironmentId(e.target.value)}>
         <option value="">Default / production</option>
         {(projects.data ?? []).flatMap((p) => p.environments.map((e) => <option key={e.id} value={e.id}>{p.name} / {e.name}</option>))}
@@ -65,6 +73,7 @@ export function Templates({ onInstalled }: { onInstalled?: (projectId: string) =
     {done && <p className="state">
       Installed <strong>{done.project.name}</strong>; the first deployment is queued.
       {done.suggested_domain && <> Next, bind a domain to service <span className="mono">{done.suggested_domain.service}</span> port <span className="mono">{done.suggested_domain.port}</span> in the project's Domains section.</>}
+      {onOpenService && <> <button className="link" onClick={() => onOpenService(done.project.id)}>Open {done.project.name}</button></>}
     </p>}
   </section>;
 }

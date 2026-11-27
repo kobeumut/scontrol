@@ -86,7 +86,7 @@ pub async fn purge(state: &AppState, user_id: Uuid, actor: Uuid) -> ApiResult<Pu
         )));
     }
     for project in projects {
-        teardown(state, &project).await?;
+        teardown(state, &project, false).await?;
         audit(
             state,
             actor,

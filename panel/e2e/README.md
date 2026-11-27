@@ -9,7 +9,7 @@ So these tests cover the UI, the API, the database, and the agent protocol. They
 
 ## Run
 
-Needs Node 20+, the PostgreSQL server binaries (`initdb`, `postgres`), and Chromium.
+Needs Node 20+, the PostgreSQL server binaries (`initdb`, `postgres`; or an existing database, see `E2E_DATABASE_URL`), and Chromium.
 
 ```bash
 cd panel
@@ -30,6 +30,7 @@ Rebuild the binaries and the frontend after changing them; the stack runs what i
 |----------|---------|
 | `E2E_CHROMIUM` | Path of the Chromium to use. `/usr/bin/chromium` is picked automatically on Alpine, where Playwright's own build does not run. |
 | `E2E_PG_BIN` | Directory with `initdb` and `postgres`, when they are not found automatically. |
+| `E2E_DATABASE_URL` | Use this existing, empty PostgreSQL database instead of starting a throwaway cluster, for a machine without `initdb`/`postgres`. The suite expects a fresh database (it bootstraps the admin), so recreate it for every full run, e.g. `docker run -d --rm -e POSTGRES_USER=scontrol -e POSTGRES_PASSWORD=scontrol -p 127.0.0.1:55432:5432 postgres:16-alpine` with `E2E_DATABASE_URL=postgres://scontrol:scontrol@127.0.0.1:55432/postgres`. |
 | `E2E_PG_PORT`, `E2E_API_PORT`, `E2E_WEB_PORT` | Ports (defaults 55432, 18080, 14173). |
 | `E2E_REUSE_STACK=1` | Test against a stack that is already running (see below) instead of starting one. |
 | `E2E_KEEP_DIR=1` | Keep the temporary directory (database, logs) after the stack stops. |

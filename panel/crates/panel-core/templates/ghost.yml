@@ -12,7 +12,8 @@ services:
     volumes:
       - ghost_content:/var/lib/ghost/content
     depends_on:
-      - db
+      db:
+        condition: service_healthy
   db:
     image: mysql:8.4
     restart: unless-stopped
@@ -23,6 +24,14 @@ services:
       MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - db_data:/var/lib/mysql
+    healthcheck:
+      # TCP on purpose: the first-start initialisation server only listens
+      # on the socket, so this turns healthy when the real server is up.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
 volumes:
   ghost_content:
   db_data:

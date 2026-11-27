@@ -144,6 +144,38 @@ fn ids(list: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Removing a service keeps its named volumes unless `?volumes=true` asks
+/// the agent to delete them, and the answer says which happened.
+#[tokio::test]
+async fn removing_a_service_deletes_volumes_only_on_request() {
+    let w = world().await;
+    let admin = test_support::user(&w.state.db, true).await;
+    let cookie = test_support::session_cookie(&w.state, admin.id).await;
+
+    for (service, query, expected) in [
+        (w.svc_prod, "", false),
+        (w.svc_staging, "?volumes=false", false),
+        (w.svc_q, "?volumes=true", true),
+    ] {
+        let (status, body) = call(
+            &w.router,
+            Auth::Cookie(&cookie),
+            Method::DELETE,
+            &format!("/api/compose-projects/{service}{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted"], json!(true));
+        assert_eq!(body["volumes_removed"], json!(expected));
+        let removals = w.local.removals.lock().unwrap();
+        let sent = removals.last().unwrap();
+        assert_eq!(sent.expected_project_id, Some(service));
+        assert_eq!(sent.remove_volumes, expected);
+    }
+    assert_eq!(w.local.removals.lock().unwrap().len(), 3);
+}
+
 #[tokio::test]
 async fn a_user_without_bindings_gets_nothing() {
     let w = world().await;

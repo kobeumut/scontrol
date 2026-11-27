@@ -237,6 +237,22 @@ Research basis: Dokploy source `d64ebed` (2026-11-02), inspected 2026-11-03. Ear
   - Domains: a "Redeploy now when domains change" switch (on by default) for adding and removing domains, and a "Redeploy now" option in the domain options form; with it off the change is only saved (`redeploy: false`) and the screen says it takes effect with the next deployment.
   - Tests: API integration tests for both deletions and the resource teardown (`routes/admin_tests.rs`), `ufw` argv unit test, and 7 new browser tests (153 in total).
 - [ ] MCP tools for deleting users and firewall rules (only `apply_firewall_rule` exists).
+- [x] Navigation and project overview (GENE-253, 2026-11-26):
+  - The 15-tab row overflowed every screen sideways (1472 px of content in a 1440 px window, 1312 px in 1024 px). It is now a grouped sidebar (Deploy / Operate / Hosting / Settings / You) that collapses behind a "Menu" button at 900 px and below; the screen is kept in the URL hash. "Projects & environments" is now "Projects" and "Compose projects" is "Services". The Docker/Mail/Antivirus/Agent tiles are compact chips.
+  - A project opens on its environments; each shows what runs in it: services (type and source, last deployment, containers, domains, server) and database services, with "Add service", "Install template" and "Add database" preselecting that environment. Lists restack as cards at 680 px and below.
+  - The database form can pick the project/environment (the API already took `environment_id`); template cards are compact and link to the installed service.
+  - `panel/e2e/tests/layout.spec.ts`: no sideways scroll on any screen at 1440/1024/768/390, the mobile menu, and the project flow. `E2E_DATABASE_URL` runs the suite against an existing PostgreSQL where `initdb` is not installed.
+  - [ ] A template install is stored as plain raw Compose; the "Template" label is inferred from the first deployment's trigger. A `template_id` on the service would make it reliable.
+  - [ ] The project page asks containers, domains and deployments per service (three requests each); a per-environment summary endpoint is the fix for large projects.
+- [x] Templates on real Docker (GENE-253, 2026-11-26), with the real `panel-agent` run unprivileged against the local daemon:
+  - WordPress and Uptime Kuma installed through the API and answered HTTP (WordPress: installer completed, front page showed the title set, title read back from MariaDB; redeploy and rollback kept the data).
+  - Fixed: WordPress served "Database Error" right after a succeeded deployment (no health check; templates now wait with `depends_on: condition: service_healthy`, enforced by a unit test over the whole catalogue); logs masked the slug, service and image names and the word `docker` (the agent's own process environment and Docker's plugin variables were collected as secrets); deleting a service kept its named volumes with no way to drop them, so reinstalling a template under the same slug met the old database with new passwords. `DELETE /api/compose-projects/:id?volumes=true` and `DELETE /api/database-services/:id?volumes=true` remove the project's own volumes (anonymous ones included); the default still keeps them. Both delete buttons have the option.
+  - `panel/e2e/real-docker/smoke.mjs` repeats the check (see its README).
+  - [ ] Ghost, Directus and Plausible were not run end to end (the test machine had under 1 GB of free disk). Their image tags exist, `docker compose config` accepts them, they pass the Compose policy, and the PostgreSQL 16 / MySQL 8.4 health checks they use were seen healthy; the ClickHouse health check and `CLICKHOUSE_SKIP_USER_SETUP` follow upstream's Compose file and are unverified. `smoke.mjs` passed for Uptime Kuma in an earlier version; its WordPress path mirrors the manual run but has not completed through the script.
+  - [ ] The `scontrol-env-<id>` network is never removed (one bridge network per environment stays behind).
+  - [ ] `docker compose up -d` runs without `--wait`: `succeeded` means started, not healthy.
+  - [ ] A host tool failing for lack of privilege (systemctl, ufw) reaches the client as a generic 500; the reason is only in the API log.
+  - [ ] Ghost, Directus and Plausible default their public URL to `http://localhost:<port>`; after binding a domain the variable must be changed by hand.
 
 ## Validation
 

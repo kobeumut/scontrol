@@ -121,7 +121,10 @@ test('database: a duplicate slug is rejected with a message', async ({ page }) =
   await expect(page.getByRole('alert')).toContainText('already exists');
   await page.getByRole('button', { name: 'Cancel' }).click();
   await expect(detailHeading(page, name).locator('.badge')).toHaveText('succeeded', { timeout: 30_000 });
+  await page.getByLabel('also delete data volume').check();
+  const removal = page.waitForRequest((request) => request.method() === 'DELETE' && request.url().endsWith('?volumes=true'));
   await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  expect(await (await (await removal).response())!.json()).toEqual({ deleted: true, volumes_removed: true });
   await expect(row(page, slugOf(name))).toHaveCount(0);
 });
 

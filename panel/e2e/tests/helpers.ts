@@ -16,9 +16,21 @@ export async function signIn(page: Page, user: { username: string; password: str
   await expect(page.getByRole('navigation', { name: 'Primary content' })).toBeVisible();
 }
 
+/**
+ * Opens a screen from the sidebar by its exact label. On a narrow viewport
+ * the sidebar is behind the "Menu" button, which is opened first.
+ */
 export async function openTab(page: Page, name: string) {
+  const menu = page.getByRole('button', { name: 'Menu', exact: true });
+  if (await menu.isVisible() && (await menu.getAttribute('aria-expanded')) !== 'true') await menu.click();
   await page.getByRole('navigation', { name: 'Primary content' }).getByRole('button', { name, exact: true }).click();
 }
+
+/** Labels of the sidebar entries an administrator sees, in order. */
+export const NAV_ENTRIES = [
+  'Projects', 'Services', 'Templates', 'Databases', 'Monitoring', 'Observability', 'Backups', 'Hosted sites',
+  'Registries', 'GitHub Apps', 'Notifications', 'Servers', 'Access', 'API keys', 'Account',
+];
 
 /**
  * Collects what a user would never see but a test must not miss: API

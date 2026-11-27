@@ -1,11 +1,11 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
+import { FormEvent, RefObject, useEffect, useRef, useState } from 'react';
 import { RegistrySelect } from './Registries';
 import { placement, ServerSelect } from './Servers';
 import {
   api, ApplicationBuild, ApplicationSpec, BUILD_TOOL_LABELS, BuildTool, ComposeProject, ComposeSource,
   DATABASE_ENGINE_LABELS,
   Deployment, DeploymentSnapshot, Domain, duration, formatTime, GitAccess, gitCheckout, GitHubApp, gitTransport, isActive, isGitHubHttps,
-  LogChunk, Project, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
+  kindLabel, LOCAL_SERVER_ID, LogChunk, Project, Server, RestartPolicy, ServiceInfo, sourceLabel, StaticSiteSpec, useApi,
 } from './api';
 import { ScheduledJobs } from './ScheduledJobs';
 import { DomainOptions } from './DomainOptions';
@@ -37,11 +37,22 @@ function EnvEditor({ rows, onChange }: { rows: EnvRow[]; onChange: (rows: EnvRow
 
 const toPairs = (rows: EnvRow[]) => rows.filter((r) => r.key.trim()).map((r) => [r.key.trim(), r.value]);
 
-/** Builders the agent reports as installed; `undefined` while unknown. */
-export function ComposeProjects({ buildTools }: { buildTools?: BuildTool[] }) {
-  const [openId, setOpenId] = useState<string | null>(null);
-  if (openId) return <ProjectDetail key={openId} id={openId} onBack={() => setOpenId(null)} onOpen={setOpenId} />;
-  return <ProjectList onOpen={setOpenId} buildTools={buildTools} />;
+/**
+ * Services: every deployable unit (Compose project, application, static site,
+ * database) across all projects. `buildTools` are the builders the agent
+ * reports as installed; `undefined` while unknown.
+ */
+export function ComposeProjects({ buildTools, initialOpenId, initialEnvironmentId, onOpenProject }: {
+  buildTools?: BuildTool[];
+  /** Service to show first, e.g. one picked on a project's page. */
+  initialOpenId?: string;
+  /** Opens the "new service" form aimed at this environment. */
+  initialEnvironmentId?: string;
+  onOpenProject?: (projectId: string) => void;
+}) {
+  const [openId, setOpenId] = useState<string | null>(initialOpenId ?? null);
+  if (openId) return <ProjectDetail key={openId} id={openId} onBack={() => setOpenId(null)} onOpen={setOpenId} onOpenProject={onOpenProject} />;
+  return <ProjectList onOpen={setOpenId} buildTools={buildTools} initialEnvironmentId={initialEnvironmentId} />;
 }
 
 /** `Project / environment` label of every environment, by environment id. */
@@ -51,29 +62,40 @@ function environmentLabels(projects?: Project[]): Map<string, string> {
   return labels;
 }
 
-function ProjectList({ onOpen, buildTools }: { onOpen: (id: string) => void; buildTools?: BuildTool[] }) {
+function ProjectList({ onOpen, buildTools, initialEnvironmentId }: {
+  onOpen: (id: string) => void; buildTools?: BuildTool[]; initialEnvironmentId?: string;
+}) {
   const projects = useApi<ComposeProject[]>('/compose-projects', 5000);
   const groups = useApi<Project[]>('/projects');
   const labels = environmentLabels(groups.data);
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(initialEnvironmentId !== undefined);
+  const [filter, setFilter] = useState('');
+  const shown = projects.data?.filter((p) => !filter || (groups.data?.find((g) => g.id === filter)?.environments.some((e) => e.id === p.environment_id) ?? false));
 
   return <section className="panel">
     <div className="panel-title">
-      <h2>Compose projects</h2>
-      <button className="action" onClick={() => setCreating((c) => !c)}>{creating ? 'Close' : 'New project'}</button>
+      <h2>Services</h2>
+      <button className="action" onClick={() => setCreating((c) => !c)}>{creating ? 'Close' : 'New service'}</button>
     </div>
-    <p className="hint">Compose projects (Git or raw), single-service applications (image, Dockerfile, or an automatic builder) and static sites served by Nginx, with a durable queue, write-only environment and streamed logs.</p>
-    {creating && <CreateProjectForm projects={groups.data} buildTools={buildTools} onCreated={(id) => { setCreating(false); onOpen(id); }} />}
+    <p className="hint">Everything the panel deploys, across all projects: Compose projects (Git or raw), single-service applications (image, Dockerfile, or an automatic builder), static sites served by Nginx, and databases. Each one lives in an environment of a project.</p>
+    {creating && <CreateProjectForm projects={groups.data} buildTools={buildTools} initialEnvironmentId={initialEnvironmentId}
+      onCreated={(id) => { setCreating(false); onOpen(id); }} />}
+    {(groups.data?.length ?? 0) > 1 && <div className="toolbar">
+      <label className="inline">Show<select aria-label="Filter by project" value={filter} onChange={(e) => setFilter(e.target.value)}>
+        <option value="">all projects</option>
+        {groups.data?.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+      </select></label>
+    </div>}
     <StateView state={projects} />
-    {projects.data && <table><thead><tr><th>Project</th><th>Slug</th><th>Environment</th><th>Source</th><th>Status</th></tr></thead><tbody>
-      {projects.data.length === 0
-        ? <tr><td colSpan={5} className="empty">No Compose projects yet.</td></tr>
-        : projects.data.map((project) => <tr key={project.id} className="clickable" onClick={() => onOpen(project.id)}>
-          <td><button className="link strong" onClick={() => onOpen(project.id)}>{project.name}</button></td>
-          <td className="mono">{project.slug}</td>
-          <td>{labels.get(project.environment_id) ?? '—'}</td>
-          <td>{sourceLabel(project.source)}</td>
-          <td><span className={`badge ${project.status}`}>{project.status}</span></td>
+    {shown && <table className="stack-narrow"><thead><tr><th>Service</th><th>Slug</th><th>Project / environment</th><th>Type</th><th>Status</th></tr></thead><tbody>
+      {shown.length === 0
+        ? <tr><td colSpan={5} className="empty">{projects.data?.length ? 'No services in this project yet.' : 'No services yet. Create one with “New service”, or install an application from Templates.'}</td></tr>
+        : shown.map((project) => <tr key={project.id} className="clickable" onClick={() => onOpen(project.id)}>
+          <td data-label="Service"><button className="link strong" onClick={() => onOpen(project.id)}>{project.name}</button></td>
+          <td data-label="Slug" className="mono">{project.slug}</td>
+          <td data-label="Project / environment">{labels.get(project.environment_id) ?? '—'}</td>
+          <td data-label="Type">{sourceLabel(project.source)}</td>
+          <td data-label="Status"><span className={`badge ${project.status}`}>{project.status}</span></td>
         </tr>)}
     </tbody></table>}
   </section>;
@@ -81,10 +103,12 @@ function ProjectList({ onOpen, buildTools }: { onOpen: (id: string) => void; bui
 
 const SAMPLE_COMPOSE = 'services:\n  web:\n    image: traefik/whoami:v1.10\n';
 
-function CreateProjectForm({ projects, buildTools, onCreated }: { projects?: Project[]; buildTools?: BuildTool[]; onCreated: (id: string) => void }) {
+function CreateProjectForm({ projects, buildTools, initialEnvironmentId, onCreated }: {
+  projects?: Project[]; buildTools?: BuildTool[]; initialEnvironmentId?: string; onCreated: (id: string) => void;
+}) {
   const [name, setName] = useState('');
   // Empty: the owner's Default project, production environment.
-  const [environmentId, setEnvironmentId] = useState('');
+  const [environmentId, setEnvironmentId] = useState(initialEnvironmentId ?? '');
   const [slug, setSlug] = useState('');
   const [kind, setKind] = useState<SourceChoice>('git');
   const [repo, setRepo] = useState('');
@@ -234,7 +258,7 @@ function GitHubAppPicker({ app, installation, onApp, onInstallation }: {
   return <fieldset><legend>GitHub App (optional)</legend>
     <StateView state={apps} />
     {apps.data && (apps.data.length === 0
-      ? <p className="hint">No GitHub App registered. Add one under the GitHub Apps tab to deploy private repositories with short-lived tokens.</p>
+      ? <p className="hint">No GitHub App registered. Add one under GitHub Apps to deploy private repositories with short-lived tokens.</p>
       : <div className="grid2">
         <label>App<select value={app} onChange={(e) => onApp(e.target.value)}>
           <option value="">none (public repository or a stored token)</option>
@@ -368,11 +392,18 @@ function SourceSummary({ source }: { source: ComposeSource }) {
     {' · '}{limits}</>;
 }
 
-function ProjectDetail({ id, onBack, onOpen }: { id: string; onBack: () => void; onOpen: (id: string) => void }) {
+function ProjectDetail({ id, onBack, onOpen, onOpenProject }: {
+  id: string; onBack: () => void; onOpen: (id: string) => void; onOpenProject?: (projectId: string) => void;
+}) {
   const project = useApi<ComposeProject>(`/compose-projects/${id}`, 3000);
+  const groups = useApi<Project[]>('/projects');
+  // Needs `servers:read`; the name is left out without it.
+  const servers = useApi<Server[]>('/servers');
+  const sections = useRef<HTMLDivElement>(null);
   const deployments = useApi<Deployment[]>(`/compose-projects/${id}/deployments`, 3000);
   const [selected, setSelected] = useState<string | null>(null);
   const [pull, setPull] = useState(false);
+  const [dropVolumes, setDropVolumes] = useState(false);
   const action = useAction();
 
   const latest = deployments.data?.[0];
@@ -389,28 +420,46 @@ function ProjectDetail({ id, onBack, onOpen }: { id: string; onBack: () => void;
     project.reload();
   });
   const remove = () => {
-    if (!project.data || window.prompt(`Type ${project.data.slug} to delete this project. Named volumes are kept.`) !== project.data.slug) return;
-    action.run(async () => { await api(`/compose-projects/${id}`, { method: 'DELETE' }); onBack(); });
+    const volumes = dropVolumes
+      ? 'Its data volumes are DELETED too; this cannot be undone.'
+      : 'Named volumes are kept, so a service created later with this slug starts on the old data.';
+    if (!project.data || window.prompt(`Type ${project.data.slug} to delete this service. ${volumes}`) !== project.data.slug) return;
+    action.run(async () => { await api(`/compose-projects/${id}${dropVolumes ? '?volumes=true' : ''}`, { method: 'DELETE' }); onBack(); });
   };
 
+  const owner = groups.data?.find((g) => g.environments.some((e) => e.id === project.data?.environment_id));
+  const environment = owner?.environments.find((e) => e.id === project.data?.environment_id);
+  const serverId = project.data?.server_id;
+  const serverName = !serverId || serverId === LOCAL_SERVER_ID ? 'this host' : servers.data?.find((s) => s.id === serverId)?.name ?? 'remote server';
+
   return <section className="panel">
-    <button className="link" onClick={onBack}>← All projects</button>
+    <button className="link" onClick={onBack}>← All services</button>
     <StateView state={project} />
     {project.data && <>
       <div className="panel-title">
         <h2>{project.data.name} <span className="mono muted">{project.data.slug}</span></h2>
         <span className={`badge ${project.data.status}`}>{project.data.status}</span>
       </div>
-      <p className="hint"><SourceSummary source={project.data.source} /></p>
+      <dl className="facts">
+        <div><dt>Project</dt><dd>{owner
+          ? <>{onOpenProject ? <button className="link" onClick={() => onOpenProject(owner.id)}>{owner.name}</button> : owner.name} / {environment?.name}</>
+          : '—'}</dd></div>
+        <div><dt>Type</dt><dd>{kindLabel(project.data.source)}</dd></div>
+        <div><dt>Server</dt><dd>{serverName}</dd></div>
+        <div className="wide"><dt>Source</dt><dd><SourceSummary source={project.data.source} /></dd></div>
+      </dl>
       <div className="toolbar">
         <button className="action" disabled={action.busy} onClick={deploy}>Deploy</button>
         {!isStatic && <label className="check"><input type="checkbox" checked={pull} onChange={(e) => setPull(e.target.checked)} /> pull images</label>}
         <span className="spacer" />
         {!isStatic && <button className="ghost" disabled={action.busy || project.data.status === 'running'} onClick={stop}>Stop</button>}
+        {!isStatic && <label className="check" title="Without this the named volumes stay on the host and a later service with the same slug reuses them."><input type="checkbox" checked={dropVolumes} onChange={(e) => setDropVolumes(e.target.checked)} /> also delete data volumes</label>}
         <button className="ghost danger" disabled={action.busy || project.data.status === 'running'} onClick={remove}>Delete</button>
       </div>
       <ErrorLine error={action.error} />
 
+      <SectionNav container={sections} />
+      <div className="sections" ref={sections}>
       <h3>Deployments</h3>
       <StateView state={deployments} />
       {deployments.data && <DeploymentTable projectId={id} deployments={deployments.data} selectedId={shown?.id}
@@ -429,8 +478,39 @@ function ProjectDetail({ id, onBack, onOpen }: { id: string; onBack: () => void;
       {gitCheckout(project.data.source) && <GitAccessPanel projectId={id} />}
       {gitCheckout(project.data.source) && <Webhook projectId={id} />}
       {gitCheckout(project.data.source) && <Previews projectId={id} onOpenProject={onOpen} />}
+      </div>
     </>}
   </section>;
+}
+
+/**
+ * Jump links to the sections of a long detail page. The list is read from the
+ * headings that are actually rendered, so optional sections need no bookkeeping.
+ */
+function SectionNav({ container }: { container: RefObject<HTMLElement | null> }) {
+  const [titles, setTitles] = useState<string[]>([]);
+  const headings = () => Array.from(container.current?.querySelectorAll('h3') ?? [])
+    .filter((h) => !h.closest('.card, .modal, form, fieldset'));
+  useEffect(() => {
+    const element = container.current;
+    if (!element) return;
+    const read = () => {
+      const next = headings().map((h) => (h.textContent ?? '').trim());
+      setTitles((previous) => (previous.join('\n') === next.join('\n') ? previous : next));
+    };
+    read();
+    const observer = new MutationObserver(read);
+    observer.observe(element, { childList: true, subtree: true });
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [container]);
+  if (titles.length < 3) return null;
+  return <nav className="section-nav" aria-label="Sections of this service">
+    {titles.map((title, index) => <a key={title + index} href={`#section-${index}`} onClick={(e) => {
+      e.preventDefault();
+      headings()[index]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }}>{title}</a>)}
+  </nav>;
 }
 
 function DeploymentTable({ projectId, deployments, selectedId, onSelect, onChanged }: {

@@ -72,6 +72,29 @@ export function sourceLabel(source: ComposeSource): string {
   return source.build.type === 'image' ? 'app · image' : `app · Dockerfile · ${source.build.branch}`;
 }
 
+/** What kind of thing a service is, in two or three words. */
+export function kindLabel(source: ComposeSource): string {
+  if (source.kind === 'git') return 'Compose · Git';
+  if (source.kind === 'raw') return 'Compose · raw';
+  if (source.kind === 'static') return 'Static site';
+  if (source.kind === 'database') return 'Database';
+  if (source.build.type === 'builder') return `App · ${BUILD_TOOL_LABELS[source.build.builder]}`;
+  return source.build.type === 'image' ? 'App · image' : 'App · Dockerfile';
+}
+
+/** Where a service's code or image comes from, short enough for a table cell. */
+export function sourceDetail(source: ComposeSource): string {
+  if (source.kind === 'raw') return 'Compose file kept in the panel';
+  if (source.kind === 'database') return `${DATABASE_ENGINE_LABELS[source.engine]} ${source.version}`;
+  if (source.kind === 'application' && source.build.type === 'image') return source.build.image;
+  const git = gitCheckout(source);
+  return git ? `${git.repository_url.replace(/^https?:\/\//, '').replace(/\.git$/, '')} @ ${git.branch}` : '';
+}
+
+/** A managed database service as `/database-services` returns it. */
+export type DatabaseExposure = { public_port: number; allow_from: string[] };
+export type DatabaseService = { project: ComposeProject; spec: DatabaseSpec; loopback_port: number; exposure: DatabaseExposure | null };
+
 export type DeploymentStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'stopped' | 'cancelled';
 
 export type ComposeProject = {
@@ -284,6 +307,16 @@ export const isActive = (status: DeploymentStatus) => status === 'queued' || sta
 
 export function formatTime(value: string | null): string {
   return value ? new Date(value).toLocaleString() : '—';
+}
+
+/** "3 min ago" for a timestamp; the exact time belongs in a `title`. */
+export function timeAgo(value: string | null): string {
+  if (!value) return '—';
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
+  if (seconds < 60) return 'just now';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
+  return `${Math.floor(seconds / 86400)} d ago`;
 }
 
 export function duration(start: string | null, end: string | null): string {
